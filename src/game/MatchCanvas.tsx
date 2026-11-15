@@ -281,7 +281,8 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
 
     let playersState: PlayerRuntimeState[] = [];
     const playerRigs = new Map<string, HumanRig>();
-    let controlledPlayerId = 'home_1'; // Yuri starts selected
+    let controlledPlayerId =
+      propsRef.current.onlineControlledCharacterId || 'home_1';
     let celebratingPlayerId: string | null = null;
 
     // Active speech bubbles per player
@@ -462,10 +463,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         p.hasBall = false;
       });
       controlledPlayerId =
-        propsRef.current.activeRoom &&
-        propsRef.current.onlineControlledCharacterId
-          ? propsRef.current.onlineControlledCharacterId
-          : 'home_1';
+        propsRef.current.onlineControlledCharacterId || 'home_1';
     };
 
     const resetFullMatch = () => {
@@ -520,11 +518,20 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       if (!container) return;
       const w = container.clientWidth || window.innerWidth;
       const h = container.clientHeight || window.innerHeight;
+      if (w <= 0 || h <= 0) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     };
     window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    const resizeObserver =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => onResize())
+        : null;
+    if (resizeObserver) {
+      resizeObserver.observe(container);
+    }
 
     // Helper to execute a pass or shot from a player
     const executeBallStrike = (
@@ -839,11 +846,15 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         }
 
         // Auto-switch to teammate if a teammate gains possession of the ball (offline mode)
+        const currentControlledPlayer = playersState.find(
+          (p) => p.id === controlledPlayerId
+        );
+        const userTeam = currentControlledPlayer?.team || 'home';
         if (
           !isOnlineMatch &&
           currentProps.screenState === 'playing' &&
           ballState.ownerId &&
-          ballState.ownerId.startsWith('home_') &&
+          ballState.ownerId.startsWith(`${userTeam}_`) &&
           ballState.ownerId !== controlledPlayerId
         ) {
           controlledPlayerId = ballState.ownerId;
@@ -1586,6 +1597,10 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       clearTimeout(frameId);
       audioEngine.stopAmbientLoop();
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+      }
       renderer.dispose();
     };
   }, [inputManager]);
@@ -1605,7 +1620,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       />
 
       {/* 3D Projected Player Name Labels & Voice Callout Bubbles (Pointer-events: none) */}
-      <div className="pointer-events-none fixed inset-0 overflow-hidden z-10">
+      <div className="pointer-events-none absolute inset-0 overflow-hidden z-10">
         {allConfigs.map((p) => (
           <div
             key={p.id}
@@ -1623,15 +1638,16 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
               style={{ opacity: 0 }}
               className="mb-1 px-2 py-0.5 rounded-full bg-amber-400 text-stone-950 font-extrabold text-[10px] tracking-wide whitespace-nowrap shadow-lg transition-opacity duration-150"
             />
-            {/* Player Name Badge */}
+            {/* Player Name Badge in UPPERCASE (BODE, JOSUÉ, CARECA, ISMAEL, etc.) */}
             <div
-              className={`px-2 py-0.5 rounded text-xs font-bold tracking-wide whitespace-nowrap shadow-md ${
+              data-testid={`player-label-${p.name.toLowerCase()}`}
+              className={`px-2 py-0.5 rounded text-[11px] font-extrabold tracking-wider uppercase whitespace-nowrap shadow-md ${
                 p.team === 'home'
-                  ? 'bg-stone-950/85 text-amber-300 border border-amber-500/40'
-                  : 'bg-stone-950/80 text-stone-200 border border-red-500/40'
+                  ? 'bg-stone-950/88 text-amber-300 border border-amber-500/50'
+                  : 'bg-stone-950/85 text-stone-100 border border-red-500/50'
               }`}
             >
-              {p.name}
+              {p.name.toUpperCase()}
             </div>
           </div>
         ))}

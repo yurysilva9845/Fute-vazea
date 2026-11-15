@@ -106,54 +106,144 @@ export function buildVarzeaEnvironment(
     sceneGroup.add(pMesh);
   }
 
-  // 3. Small Proportional 4v4 Várzea Goals with Nets ("Duas traves pequenas com redes")
+  // 3. Travinhas de Mini Campo ("Travinhas baixas e compactas de futebol de rua/várzea 4x4")
   const postMat = new THREE.MeshStandardMaterial({
-    color: 0xd6cfc7, // weathered white/rustic painted wood/iron post
-    roughness: 0.68,
-    metalness: 0.22,
+    color: 0xe2ddd5, // cano de ferro/PVC pintado de branco desgastado pela terra
+    roughness: 0.58,
+    metalness: 0.28,
+  });
+  const jointMat = new THREE.MeshStandardMaterial({
+    color: 0x9ca3af, // conexões / soldas nos cantos da travinha
+    roughness: 0.65,
+    metalness: 0.45,
   });
   const netMat = new THREE.MeshBasicMaterial({
-    color: 0xe7e5e4,
+    color: 0xf5f5f4,
     wireframe: true,
     transparent: true,
-    opacity: 0.42,
+    opacity: 0.52,
   });
 
   const buildVarzeaGoal = (signX: -1 | 1) => {
     const goalGroup = new THREE.Group();
     const gx = signX * (DEFAULT_PITCH.width / 2);
     const halfZ = DEFAULT_PITCH.goalWidth / 2;
-    const h = DEFAULT_PITCH.goalHeight;
-    const d = DEFAULT_PITCH.goalDepth;
+    const h = DEFAULT_PITCH.goalHeight; // 1.15m (travinha baixa)
+    const d = DEFAULT_PITCH.goalDepth;  // 0.95m (profundidade compacta)
+    const tubeRadius = 0.045;
 
-    // Left & Right upright posts
-    const postGeo = new THREE.CylinderGeometry(0.065, 0.07, h, 10);
+    // Front Left & Right upright posts + corner joints + ground base bars + rear angled struts
+    const postGeo = new THREE.CylinderGeometry(tubeRadius, tubeRadius, h, 12);
+    const groundSideGeo = new THREE.CylinderGeometry(
+      tubeRadius * 0.85,
+      tubeRadius * 0.85,
+      d,
+      10
+    );
+    groundSideGeo.rotateZ(Math.PI / 2);
+
+    const strutLen = Math.hypot(h, d);
+    const strutGeo = new THREE.CylinderGeometry(
+      tubeRadius * 0.78,
+      tubeRadius * 0.78,
+      strutLen,
+      10
+    );
+
     for (const sz of [-1, 1]) {
+      // Front upright post
       const post = new THREE.Mesh(postGeo, postMat);
       post.position.set(gx, h / 2, sz * halfZ);
       post.castShadow = !isSoftwareGl;
       goalGroup.add(post);
 
-      // Back support stanchion
-      const backSupport = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.04, 0.045, Math.hypot(h, d), 8),
-        postMat
+      // Top corner elbow joint
+      const elbow = new THREE.Mesh(
+        new THREE.SphereGeometry(tubeRadius * 1.28, 10, 10),
+        jointMat
       );
+      elbow.position.set(gx, h, sz * halfZ);
+      goalGroup.add(elbow);
+
+      // Ground side base tube extending backward
+      const sideBase = new THREE.Mesh(groundSideGeo, postMat);
+      sideBase.position.set(
+        gx + signX * (d / 2),
+        tubeRadius * 0.9,
+        sz * halfZ
+      );
+      goalGroup.add(sideBase);
+
+      // Angled rear support strut (from top corner down to rear ground corner)
+      const backSupport = new THREE.Mesh(strutGeo, postMat);
       backSupport.position.set(gx + signX * (d * 0.5), h * 0.5, sz * halfZ);
       backSupport.rotation.z = signX * Math.atan2(d, h);
+      backSupport.castShadow = !isSoftwareGl;
       goalGroup.add(backSupport);
     }
 
-    // Crossbar
-    const crossbarGeo = new THREE.CylinderGeometry(0.065, 0.065, DEFAULT_PITCH.goalWidth + 0.14, 10);
+    // Front Crossbar ("travessão baixo da travinha")
+    const crossbarGeo = new THREE.CylinderGeometry(
+      tubeRadius,
+      tubeRadius,
+      DEFAULT_PITCH.goalWidth + tubeRadius * 1.5,
+      12
+    );
     crossbarGeo.rotateX(Math.PI / 2);
     const crossbar = new THREE.Mesh(crossbarGeo, postMat);
     crossbar.position.set(gx, h, 0);
     crossbar.castShadow = !isSoftwareGl;
     goalGroup.add(crossbar);
 
-    // 3D Net box (open front)
-    const netGeo = new THREE.BoxGeometry(d, h, DEFAULT_PITCH.goalWidth, 6, 8, 12);
+    // Rear ground base crossbar ("barra traseira no chão segurando a rede")
+    const backGroundBarGeo = new THREE.CylinderGeometry(
+      tubeRadius * 0.85,
+      tubeRadius * 0.85,
+      DEFAULT_PITCH.goalWidth + tubeRadius,
+      10
+    );
+    backGroundBarGeo.rotateX(Math.PI / 2);
+    const backGroundBar = new THREE.Mesh(backGroundBarGeo, jointMat);
+    backGroundBar.position.set(gx + signX * d, tubeRadius * 0.9, 0);
+    goalGroup.add(backGroundBar);
+
+    // Sculpted 3D Net with natural sag/drape matching the sloped travinha profile
+    const netGeo = new THREE.BoxGeometry(
+      d,
+      h,
+      DEFAULT_PITCH.goalWidth,
+      8,
+      8,
+      14
+    );
+    const netPos = netGeo.attributes.position;
+    for (let i = 0; i < netPos.count; i++) {
+      const lx = netPos.getX(i); // -d/2 to +d/2
+      const ly = netPos.getY(i); // -h/2 to +h/2
+      const lz = netPos.getZ(i); // -goalWidth/2 to +goalWidth/2
+
+      // Progress from front of goal (0) to back of goal (1)
+      const backProgress = THREE.MathUtils.clamp(
+        (lx * signX + d / 2) / d,
+        0,
+        1
+      );
+      const heightRatio = THREE.MathUtils.clamp((ly + h / 2) / h, 0, 1);
+
+      // Taper the back of the net along the angled rear struts + natural cloth sag
+      const maxAllowedY = h * (1 - backProgress * 0.62) - h / 2;
+      if (ly > maxAllowedY && backProgress > 0.15) {
+        netPos.setY(i, THREE.MathUtils.lerp(ly, maxAllowedY, 0.85));
+      }
+
+      // Natural inward sag on the net mesh
+      const centerZFactor = 1 - Math.pow(lz / halfZ, 2);
+      const sagY =
+        -0.06 * backProgress * (1 - backProgress) * centerZFactor * heightRatio;
+      netPos.setY(i, netPos.getY(i) + sagY);
+    }
+    netGeo.computeVertexNormals();
+
     const netMesh = new THREE.Mesh(netGeo, netMat);
     netMesh.position.set(gx + signX * (d / 2), h / 2, 0);
     goalGroup.add(netMesh);

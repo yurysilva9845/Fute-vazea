@@ -12,10 +12,12 @@ export type PlayerRole = 'goleiro' | 'fixo' | 'ala' | 'pivo';
 
 export type HairStyle =
   | 'bald'
+  | 'receding_careca'
   | 'short_fade'
   | 'curly'
   | 'afro'
   | 'buzz'
+  | 'bucket_hat_josue'
   | 'cap_orange'
   | 'cap_black';
 
@@ -26,9 +28,25 @@ export type ShirtStyle =
   | 'shirtless'
   | 'tank_top';
 
-export type BodyBuild = 'slim' | 'athletic' | 'stocky' | 'compact';
+export type BodyBuild = 'slim' | 'athletic' | 'stocky' | 'compact' | 'tall_lean';
 
-export type CelebrationStyle = 'yuri' | 'josue' | 'careca' | 'bode' | 'rival';
+export type CelebrationStyle =
+  | 'yuri'
+  | 'josue'
+  | 'careca'
+  | 'bode'
+  | 'ismael'
+  | 'rival';
+
+export type PhotoSkinId =
+  | 'josue'
+  | 'careca'
+  | 'bode'
+  | 'ismael'
+  | 'yuri'
+  | 'primo'
+  | 'bicudo'
+  | 'felipe';
 
 export type PlayerAnimState =
   | 'idle'
@@ -56,6 +74,9 @@ export interface PlayerCustomization {
   barefoot: boolean;
   bootColor: string;
   bodyBuild?: BodyBuild;
+  photoSkinId?: PhotoSkinId;
+  outfitDescription?: string;
+  lockAuthenticOutfit?: boolean;
   personality?: string;
   celebrationStyle?: CelebrationStyle;
   speedStat: number;   // 0.85 - 1.15
