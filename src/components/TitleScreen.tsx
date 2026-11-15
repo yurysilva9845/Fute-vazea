@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   CameraMode,
   GameSettings,
   HairStyle,
+  MultiplayerRoomState,
   PlayerCustomization,
   ShirtStyle,
   TeamConfig,
@@ -13,8 +14,12 @@ interface TitleScreenProps {
   homeTeam: TeamConfig;
   awayTeam: TeamConfig;
   homePlayers: PlayerCustomization[];
+  awayPlayers: PlayerCustomization[];
   settings: GameSettings;
+  activeRoom: MultiplayerRoomState | null;
   onStartMatch: () => void;
+  onStartFullscreenMatch: () => void;
+  onOpenMultiplayer: (tab: 'lobby' | 'friends' | 'diagnostic') => void;
   onSelectHomeTeam: (team: TeamConfig) => void;
   onSelectAwayTeam: (team: TeamConfig) => void;
   onUpdatePlayer: (index: number, updated: PlayerCustomization) => void;
@@ -47,15 +52,28 @@ const SKIN_TONES = [
   '#a66e4a',
   '#8d5837',
   '#78472a',
-  '#5c3319',
+  '#4a2c18',
 ];
+
+function detectMobileViewport(): boolean {
+  if (typeof window === 'undefined') return false;
+  return (
+    window.innerWidth <= 920 ||
+    (typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches)
+  );
+}
 
 export const TitleScreen: React.FC<TitleScreenProps> = ({
   homeTeam,
   awayTeam,
   homePlayers,
+  awayPlayers,
   settings,
+  activeRoom,
   onStartMatch,
+  onStartFullscreenMatch,
+  onOpenMultiplayer,
   onSelectHomeTeam,
   onSelectAwayTeam,
   onUpdatePlayer,
@@ -63,33 +81,58 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
 }) => {
   const [activeModal, setActiveModal] = useState<ActiveSubModal>('none');
   const [selectedPlayerIdx, setSelectedPlayerIdx] = useState(0);
+  const [isMobile, setIsMobile] = useState<boolean>(() =>
+    detectMobileViewport()
+  );
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(detectMobileViewport());
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   const selectedPlayer = homePlayers[selectedPlayerIdx] || homePlayers[0];
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-20 flex flex-col justify-between p-5 md:p-10">
+    <div className="pointer-events-none fixed inset-0 z-20 flex flex-col justify-between p-4 md:p-8 overflow-y-auto">
       {/* Measured left-only scrim for 4.5:1 text contrast while keeping the 3D Várzea campinho bright and clear */}
       <div
         className="pointer-events-none fixed inset-0 -z-10"
         style={{
           background:
-            'linear-gradient(90deg, rgba(12, 10, 9, 0.76) 0%, rgba(12, 10, 9, 0.42) 38%, rgba(12, 10, 9, 0.0) 68%)',
+            'linear-gradient(90deg, rgba(12, 10, 9, 0.78) 0%, rgba(12, 10, 9, 0.45) 42%, rgba(12, 10, 9, 0.0) 70%)',
         }}
       />
 
+      {/* Mobile Landscape & Fullscreen Banner */}
+      {isMobile && (
+        <div className="pointer-events-auto w-full max-w-2xl mx-auto mb-3 bg-stone-950/95 border-2 border-amber-500 rounded-xl p-3 flex flex-col sm:flex-row items-center justify-between gap-2.5 shadow-2xl">
+          <p className="text-xs font-bold text-amber-200 text-center sm:text-left">
+            Vire seu celular para jogar na horizontal e toque para entrar em
+            tela cheia.
+          </p>
+          <button
+            type="button"
+            onClick={onStartFullscreenMatch}
+            className="w-full sm:w-auto px-4 py-2 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold text-xs rounded-lg shadow-lg cursor-pointer whitespace-nowrap"
+          >
+            JOGAR EM TELA CHEIA
+          </button>
+        </div>
+      )}
+
       {/* Top Row: Custom SVG Title Lockup & Main Menu Actions */}
-      <div className="flex flex-col lg:flex-row items-start justify-between gap-8 w-full max-w-7xl mx-auto my-auto">
+      <div className="flex flex-col lg:flex-row items-start justify-between gap-6 w-full max-w-7xl mx-auto my-auto">
         {/* Left Negative-Space Column: Bespoke SVG Emblem + Roster + Menu CTAs */}
         <div className="pointer-events-auto flex flex-col items-start max-w-lg w-full">
           {/* Bespoke Inline SVG Title Emblem */}
-          <div className="mb-4 w-full">
+          <div className="mb-3 w-full">
             <svg
               viewBox="0 0 460 128"
-              className="w-full max-w-[430px] h-auto drop-shadow-[0_6px_16px_rgba(0,0,0,0.85)]"
+              className="w-full max-w-[410px] h-auto drop-shadow-[0_6px_16px_rgba(0,0,0,0.85)]"
               role="img"
               aria-label="Várzea Raiz 4x4"
             >
-              {/* Rustic Terracotta Plaque Backing */}
               <path
                 d="M12 20 L438 12 L448 92 L20 104 Z"
                 fill="#1c1917"
@@ -102,13 +145,25 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                 stroke="#78350f"
                 strokeWidth="1.5"
               />
-              {/* Emblem Soccer Ball + Dirt Splash Icon */}
               <g transform="translate(54, 58)">
-                <circle cx="0" cy="0" r="26" fill="#e7e5e4" stroke="#1c1917" strokeWidth="2.5" />
-                <polygon points="0,-12 11,-4 7,9 -7,9 -11,-4" fill="#1c1917" />
-                <path d="M0,-12 L0,-25 M11,-4 L23,-8 M7,9 L17,20 M-7,9 L-17,20 M-11,-4 L-23,-8" stroke="#1c1917" strokeWidth="2.5" />
+                <circle
+                  cx="0"
+                  cy="0"
+                  r="26"
+                  fill="#e7e5e4"
+                  stroke="#1c1917"
+                  strokeWidth="2.5"
+                />
+                <polygon
+                  points="0,-12 11,-4 7,9 -7,9 -11,-4"
+                  fill="#1c1917"
+                />
+                <path
+                  d="M0,-12 L0,-25 M11,-4 L23,-8 M7,9 L17,20 M-7,9 L-17,20 M-11,-4 L-23,-8"
+                  stroke="#1c1917"
+                  strokeWidth="2.5"
+                />
               </g>
-              {/* Main Display Typography */}
               <text
                 x="96"
                 y="62"
@@ -121,8 +176,14 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
               >
                 VÁRZEA RAIZ
               </text>
-              {/* 4x4 Stamp */}
-              <rect x="352" y="24" rx="6" width="74" height="44" fill="#d97706" />
+              <rect
+                x="352"
+                y="24"
+                rx="6"
+                width="74"
+                height="44"
+                fill="#d97706"
+              />
               <text
                 x="389"
                 y="55"
@@ -134,117 +195,152 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
               >
                 4x4
               </text>
-              {/* Subtitle Kicker */}
               <text
                 x="98"
                 y="84"
                 fill="#fbbf24"
                 fontFamily="'Plus Jakarta Sans', sans-serif"
                 fontWeight="700"
-                fontSize="12.5"
-                letterSpacing="2.8"
+                fontSize="12"
+                letterSpacing="2.2"
               >
-                FUTEBOL DE TERRA BATIDA · LAMA &amp; RAÇA
+                TERRA BATIDA · PC &amp; MOBILE ONLINE
               </text>
             </svg>
           </div>
 
-          <p className="text-stone-300 text-sm md:text-base leading-relaxed mb-5 max-w-md">
-            O campinho de barro real com poças d&apos;água, muros de tijolo, cerca de
-            madeira e disputa 4 contra 4 sem frescura.
+          <p className="text-stone-300 text-xs sm:text-sm leading-relaxed mb-4 max-w-md">
+            O campinho de barro real com poças d&apos;água, muros de tijolo,
+            comemorações personalizadas, vozes da várzea e multiplayer online!
           </p>
 
-          {/* Team 1 Squad Roster Summary (Yuri, Josué, Careca, Bode) */}
-          <div className="w-full bg-stone-950/90 border border-stone-800 rounded-xl p-3.5 mb-6 shadow-xl">
-            <div className="flex items-center justify-between text-xs text-stone-400 mb-2.5 pb-2 border-b border-stone-800/80">
-              <span className="font-semibold text-amber-400 uppercase tracking-wider">
-                Nosso Time: {homeTeam.name}
-              </span>
-              <span>Titulares 4x4</span>
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              {homePlayers.map((player, idx) => (
-                <button
-                  key={player.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedPlayerIdx(idx);
-                    setActiveModal('players');
-                  }}
-                  className="group flex flex-col items-center p-2 rounded-lg bg-stone-900/90 hover:bg-stone-800 border border-stone-800 hover:border-amber-500/50 transition-colors text-left"
-                >
-                  <div className="flex items-center gap-1.5 mb-1">
-                    <span
-                      className="w-3 h-3 rounded-full border border-white/20 shrink-0"
-                      style={{
-                        backgroundColor:
-                          player.shirtStyle === 'shirtless'
-                            ? player.skinColor
-                            : player.shirtPrimary,
-                      }}
-                    />
-                    <span className="text-xs font-mono font-bold text-stone-400 tabular-nums">
-                      #{player.number}
+          {/* Team 1 & Team 2 Squad Roster Summary */}
+          <div className="w-full bg-stone-950/90 border border-stone-800 rounded-xl p-3 mb-4 shadow-xl space-y-2.5">
+            <div>
+              <div className="flex items-center justify-between text-xs text-stone-400 mb-1.5">
+                <span className="font-bold text-amber-400 uppercase tracking-wider">
+                  Time 1: {homeTeam.name}
+                </span>
+                <span className="text-[11px] text-stone-400">
+                  Adversários: {awayPlayers.map((a) => a.name).join(', ')}
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-2">
+                {homePlayers.map((player, idx) => (
+                  <button
+                    key={player.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedPlayerIdx(idx);
+                      setActiveModal('players');
+                    }}
+                    className="group flex flex-col items-center p-2 rounded-lg bg-stone-900/90 hover:bg-stone-800 border border-stone-800 hover:border-amber-500/50 transition-colors text-left cursor-pointer"
+                  >
+                    <div className="flex items-center gap-1.5 mb-0.5">
+                      <span
+                        className="w-2.5 h-2.5 rounded-full border border-white/20 shrink-0"
+                        style={{
+                          backgroundColor: player.skinColor,
+                        }}
+                      />
+                      <span className="text-[11px] font-mono font-bold text-stone-400 tabular-nums">
+                        #{player.number}
+                      </span>
+                    </div>
+                    <span className="text-xs sm:text-sm font-bold text-stone-100 group-hover:text-amber-300 truncate w-full text-center">
+                      {player.name}
                     </span>
-                  </div>
-                  <span className="text-sm font-bold text-stone-100 group-hover:text-amber-300 truncate w-full text-center">
-                    {player.name}
-                  </span>
-                  <span className="text-[11px] text-stone-400 uppercase tracking-tight">
-                    {player.role}
-                  </span>
-                </button>
-              ))}
+                    <span className="text-[10px] text-stone-400 uppercase tracking-tight">
+                      {player.role}
+                    </span>
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 
-          {/* 4 Required Menu Buttons: JOGAR, ESCOLHER TIME, PERSONALIZAR JOGADORES, CONFIGURAÇÕES */}
-          <div className="flex flex-col sm:flex-row flex-wrap gap-3 w-full">
+          {/* Primary Play & Fullscreen Buttons */}
+          <div className="flex flex-col sm:flex-row gap-2.5 w-full">
             <button
               type="button"
               data-start="true"
               onClick={onStartMatch}
-              className="w-full sm:w-auto flex-1 py-3.5 px-7 bg-amber-500 hover:bg-amber-400 active:translate-y-0.5 text-stone-950 font-extrabold text-lg tracking-wide rounded-xl shadow-lg transition-all cursor-pointer whitespace-nowrap"
+              className="flex-1 py-3.5 px-6 bg-amber-500 hover:bg-amber-400 active:translate-y-0.5 text-stone-950 font-extrabold text-base sm:text-lg tracking-wide rounded-xl shadow-lg transition-all cursor-pointer whitespace-nowrap"
             >
-              JOGAR
+              JOGAR AGORA
             </button>
 
+            <button
+              type="button"
+              onClick={onStartFullscreenMatch}
+              className="py-3.5 px-5 bg-stone-900/95 hover:bg-stone-800 text-amber-400 border-2 border-amber-500/80 font-extrabold text-xs sm:text-sm tracking-wide rounded-xl shadow-lg transition-all cursor-pointer whitespace-nowrap"
+            >
+              JOGAR EM TELA CHEIA
+            </button>
+          </div>
+
+          {/* Online Multiplayer & Friends Row */}
+          <div className="grid grid-cols-2 gap-2.5 w-full mt-2.5">
+            <button
+              type="button"
+              onClick={() => onOpenMultiplayer('lobby')}
+              className="py-3 px-4 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs sm:text-sm rounded-xl shadow-md transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+            >
+              <span className="w-2 h-2 rounded-full bg-emerald-200 animate-pulse" />
+              <span>
+                {activeRoom
+                  ? `SALA ${activeRoom.roomCode}`
+                  : 'MULTIPLAYER ONLINE'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => onOpenMultiplayer('friends')}
+              className="py-3 px-4 bg-sky-700 hover:bg-sky-600 text-white font-extrabold text-xs sm:text-sm rounded-xl shadow-md transition-colors cursor-pointer"
+            >
+              JOGAR COM AMIGOS
+            </button>
+          </div>
+
+          {/* Secondary Customization, Teams, Settings & Firebase Diagnostic Row */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 w-full mt-2.5">
             <button
               type="button"
               onClick={() =>
                 setActiveModal(activeModal === 'teams' ? 'none' : 'teams')
               }
-              className={`py-3 px-4 font-bold text-sm rounded-xl border transition-colors cursor-pointer whitespace-nowrap ${
+              className={`py-2.5 px-2 font-bold text-[11px] rounded-xl border transition-colors cursor-pointer whitespace-nowrap ${
                 activeModal === 'teams'
                   ? 'bg-stone-800 text-amber-300 border-amber-500'
-                  : 'bg-stone-900/95 hover:bg-stone-800 text-stone-200 border-stone-700'
+                  : 'bg-stone-900/95 hover:bg-stone-800 text-stone-200 border-stone-800'
               }`}
             >
               ESCOLHER TIME
             </button>
-          </div>
 
-          <div className="grid grid-cols-2 gap-3 w-full mt-3">
             <button
               type="button"
               onClick={() =>
                 setActiveModal(activeModal === 'players' ? 'none' : 'players')
               }
-              className={`py-2.5 px-4 font-semibold text-xs sm:text-sm rounded-xl border transition-colors cursor-pointer whitespace-nowrap truncate ${
+              className={`py-2.5 px-2 font-bold text-[11px] rounded-xl border transition-colors cursor-pointer whitespace-nowrap ${
                 activeModal === 'players'
                   ? 'bg-stone-800 text-amber-300 border-amber-500'
                   : 'bg-stone-900/95 hover:bg-stone-800 text-stone-200 border-stone-800'
               }`}
             >
-              PERSONALIZAR JOGADORES
+              JOGADORES
             </button>
 
             <button
               type="button"
               onClick={() =>
-                setActiveModal(activeModal === 'settings' ? 'none' : 'settings')
+                setActiveModal(
+                  activeModal === 'settings' ? 'none' : 'settings'
+                )
               }
-              className={`py-2.5 px-4 font-semibold text-xs sm:text-sm rounded-xl border transition-colors cursor-pointer whitespace-nowrap truncate ${
+              className={`py-2.5 px-2 font-bold text-[11px] rounded-xl border transition-colors cursor-pointer whitespace-nowrap ${
                 activeModal === 'settings'
                   ? 'bg-stone-800 text-amber-300 border-amber-500'
                   : 'bg-stone-900/95 hover:bg-stone-800 text-stone-200 border-stone-800'
@@ -252,10 +348,18 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
             >
               CONFIGURAÇÕES
             </button>
+
+            <button
+              type="button"
+              onClick={() => onOpenMultiplayer('diagnostic')}
+              className="py-2.5 px-2 font-bold text-[11px] rounded-xl border bg-stone-900/95 hover:bg-stone-800 text-amber-300 border-stone-800 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              STATUS ONLINE
+            </button>
           </div>
         </div>
 
-        {/* Right Side Panel: Active Sub-Modal (Escolher Time / Personalizar Jogadores / Configurações) */}
+        {/* Right Side Panel: Active Sub-Modal (Escolher Time / Personalizar Jogadores / Configurações de Áudio) */}
         {activeModal !== 'none' && (
           <div className="pointer-events-auto w-full max-w-md bg-stone-950/95 border border-stone-800 rounded-2xl p-5 shadow-2xl text-stone-100 self-center">
             {activeModal === 'teams' && (
@@ -315,7 +419,9 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                 </div>
 
                 <div className="pt-3 border-t border-stone-800 flex items-center justify-between text-xs text-stone-400">
-                  <span>Adversário: {awayTeam.name}</span>
+                  <span>
+                    Adversário: {awayTeam.name} (Primo, Bicudo, Ismael, Felipe)
+                  </span>
                   <button
                     type="button"
                     onClick={() => {
@@ -491,7 +597,9 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                           : 'bg-stone-800 text-stone-300'
                       }`}
                     >
-                      {selectedPlayer.barefoot ? 'Descalço (Raiz)' : 'De Chuteira'}
+                      {selectedPlayer.barefoot
+                        ? 'Descalço (Raiz)'
+                        : 'De Chuteira'}
                     </button>
                   </div>
                 </div>
@@ -502,7 +610,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
               <div>
                 <div className="flex items-center justify-between pb-3 mb-4 border-b border-stone-800">
                   <h2 className="text-lg font-bold text-amber-400">
-                    Configurações da Partida
+                    Configurações &amp; Volumes
                   </h2>
                   <button
                     type="button"
@@ -513,7 +621,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                   </button>
                 </div>
 
-                <div className="space-y-4 text-xs">
+                <div className="space-y-3.5 text-xs">
                   <div className="flex items-center justify-between">
                     <span className="text-stone-300 font-medium">
                       Câmera da Partida
@@ -529,7 +637,9 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                         <button
                           key={mode}
                           type="button"
-                          onClick={() => onUpdateSettings({ cameraMode: mode })}
+                          onClick={() =>
+                            onUpdateSettings({ cameraMode: mode })
+                          }
                           className={`px-2.5 py-1.5 rounded-md font-semibold transition-colors ${
                             settings.cameraMode === mode
                               ? 'bg-amber-500 text-stone-950'
@@ -572,74 +682,128 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between">
-                    <span className="text-stone-300 font-medium">
-                      Duração de Cada Tempo
-                    </span>
-                    <div className="flex gap-1 bg-stone-900 p-1 rounded-lg">
-                      {[
-                        [180, '3 min'],
-                        [300, '5 min (Padrão)'],
-                      ].map(([secs, label]) => (
-                        <button
-                          key={secs}
-                          type="button"
-                          onClick={() =>
-                            onUpdateSettings({
-                              halfDurationSeconds: Number(secs),
-                            })
-                          }
-                          className={`px-2.5 py-1.5 rounded-md font-semibold transition-colors ${
-                            settings.halfDurationSeconds === secs
-                              ? 'bg-amber-500 text-stone-950'
-                              : 'text-stone-400 hover:text-white'
-                          }`}
-                        >
-                          {label}
-                        </button>
-                      ))}
+                  {/* 4 Independent Volume Sliders: Efeitos Sonoros, Vozes, Ambiente, Música */}
+                  <div className="pt-2 border-t border-stone-800 space-y-2.5">
+                    <div>
+                      <div className="flex justify-between mb-1">
+                        <span className="text-stone-300 font-medium">
+                          Volume: Efeitos Sonoros (Bola, Terra, Apito)
+                        </span>
+                        <span className="font-mono text-amber-400">
+                          {Math.round((settings.sfxVolume ?? 0.85) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={settings.sfxVolume ?? 0.85}
+                        onChange={(e) =>
+                          onUpdateSettings({
+                            sfxVolume: Number(e.target.value),
+                          })
+                        }
+                        className="w-full accent-amber-500"
+                      />
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between mb-1">
+                        <span className="text-stone-300 font-medium">
+                          Volume: Vozes dos Jogadores (Falas na Partida)
+                        </span>
+                        <span className="font-mono text-amber-400">
+                          {Math.round((settings.voiceVolume ?? 0.9) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={settings.voiceVolume ?? 0.9}
+                        onChange={(e) =>
+                          onUpdateSettings({
+                            voiceVolume: Number(e.target.value),
+                          })
+                        }
+                        className="w-full accent-amber-500"
+                      />
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between mb-1">
+                        <span className="text-stone-300 font-medium">
+                          Volume: Ambiente da Várzea (Torcida e Campinho)
+                        </span>
+                        <span className="font-mono text-amber-400">
+                          {Math.round((settings.ambientVolume ?? 0.65) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={settings.ambientVolume ?? 0.65}
+                        onChange={(e) =>
+                          onUpdateSettings({
+                            ambientVolume: Number(e.target.value),
+                          })
+                        }
+                        className="w-full accent-amber-500"
+                      />
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between mb-1">
+                        <span className="text-stone-300 font-medium">
+                          Volume: Música / Batucada do Menu
+                        </span>
+                        <span className="font-mono text-amber-400">
+                          {Math.round((settings.musicVolume ?? 0.5) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={settings.musicVolume ?? 0.5}
+                        onChange={(e) =>
+                          onUpdateSettings({
+                            musicVolume: Number(e.target.value),
+                            musicEnabled: Number(e.target.value) > 0,
+                          })
+                        }
+                        className="w-full accent-amber-500"
+                      />
                     </div>
                   </div>
 
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between pt-2 border-t border-stone-800">
                     <span className="text-stone-300 font-medium">
-                      Efeitos Sonoros (Terra, Bola, Apito)
+                      Vibração no Celular (Chutes e Gols)
                     </span>
                     <button
                       type="button"
                       onClick={() =>
                         onUpdateSettings({
-                          soundEnabled: !settings.soundEnabled,
+                          vibrationEnabled: !(
+                            settings.vibrationEnabled ?? true
+                          ),
                         })
                       }
                       className={`px-3 py-1.5 rounded-lg font-bold ${
-                        settings.soundEnabled
+                        settings.vibrationEnabled ?? true
                           ? 'bg-emerald-600 text-white'
                           : 'bg-stone-800 text-stone-400'
                       }`}
                     >
-                      {settings.soundEnabled ? 'Ativado' : 'Mudo'}
-                    </button>
-                  </div>
-
-                  <div className="flex items-center justify-between">
-                    <span className="text-stone-300 font-medium">
-                      Batucada no Menu Inicial
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onUpdateSettings({
-                          musicEnabled: !settings.musicEnabled,
-                        })
-                      }
-                      className={`px-3 py-1.5 rounded-lg font-bold ${
-                        settings.musicEnabled
-                          ? 'bg-amber-500 text-stone-950'
-                          : 'bg-stone-800 text-stone-400'
-                      }`}
-                    >
-                      {settings.musicEnabled ? 'Ligada' : 'Desligada'}
+                      {settings.vibrationEnabled ?? true
+                        ? 'Ativada'
+                        : 'Desativada'}
                     </button>
                   </div>
                 </div>
@@ -650,12 +814,13 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
       </div>
 
       {/* Bottom Safe Margin: Single Flat Borderless Control Hint Line */}
-      <div className="w-full max-w-7xl mx-auto pt-4 flex flex-wrap items-center justify-between gap-4 text-xs text-stone-300/90">
+      <div className="w-full max-w-7xl mx-auto pt-3 flex flex-wrap items-center justify-between gap-4 text-xs text-stone-300/90">
         <span>
-          WASD Movimentar · Shift Correr · Espaço Chutar · E Passe · F Carrinho · Q Trocar Jogador · P Pausar
+          PC: WASD Movimentar · Shift Correr · Espaço Chutar · E Passe · F
+          Carrinho · Q Trocar Jogador · P Pausar
         </span>
         <span className="text-stone-400">
-          Celular: Joystick Virtual + Botões de Toque Adaptativos
+          Celular: Tela Horizontal + Controles Virtuais Automáticos
         </span>
       </div>
     </div>

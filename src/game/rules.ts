@@ -17,9 +17,7 @@ export const DEFAULT_PITCH: PitchDimensions = {
   goalDepth: 1.35,
 };
 
-// Reproducing the exact puddles and mud patches from the reference photos
 export const VARZEA_PUDDLES: PuddleZone[] = [
-  // Large main puddle in upper-left/center-back of the pitch (seen clearly in photos 1, 2, 4)
   {
     id: 'puddle_main_back',
     x: -3.5,
@@ -29,7 +27,6 @@ export const VARZEA_PUDDLES: PuddleZone[] = [
     rotation: 0.12,
     waterDrag: 0.58,
   },
-  // Secondary puddle on the left-center side (seen in photo 1 & bottom-left collage)
   {
     id: 'puddle_left_mid',
     x: -7.8,
@@ -39,7 +36,6 @@ export const VARZEA_PUDDLES: PuddleZone[] = [
     rotation: -0.18,
     waterDrag: 0.52,
   },
-  // Shallow puddle near back-right trees
   {
     id: 'puddle_right_back',
     x: 4.2,
@@ -52,18 +48,14 @@ export const VARZEA_PUDDLES: PuddleZone[] = [
 ];
 
 export const VARZEA_MUD_ZONES: MudZone[] = [
-  // Dark mud zone in center-foreground (seen in photos 1, 2, 4)
   { id: 'mud_center_front', x: -2.2, z: 3.2, radius: 3.4, speedMultiplier: 0.78 },
-  // Wet mud surrounding the main back puddle
   { id: 'mud_around_puddle', x: -3.5, z: -5.0, radius: 5.5, speedMultiplier: 0.74 },
-  // Muddy goalmouth left
   { id: 'mud_goal_left', x: -15.2, z: 0.2, radius: 2.6, speedMultiplier: 0.82 },
-  // Muddy goalmouth right
   { id: 'mud_goal_right', x: 15.2, z: -0.3, radius: 2.6, speedMultiplier: 0.82 },
 ];
 
 export const VARZEA_BUMPS: TerrainBump[] = [
-  { x: -2.2, z: 3.2, radius: 2.4, height: -0.09 }, // Foreground rut/depression in photo
+  { x: -2.2, z: 3.2, radius: 2.4, height: -0.09 },
   { x: 3.8, z: 1.5, radius: 2.1, height: 0.07 },
   { x: -6.5, z: 4.5, radius: 1.9, height: -0.06 },
   { x: 6.0, z: -2.8, radius: 2.5, height: 0.08 },
@@ -72,13 +64,17 @@ export const VARZEA_BUMPS: TerrainBump[] = [
   { x: 10.2, z: 3.4, radius: 2.0, height: -0.06 },
 ];
 
+/**
+ * TIME PRINCIPAL (Time 1): Yuri, Josué, Careca e Bode
+ * Cada um com aparência física, personalidade e comemoração exclusiva!
+ */
 export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
   {
     id: 'home_1',
     name: 'Yuri',
     role: 'pivo',
     number: 9,
-    skinColor: '#a66e4a',
+    skinColor: '#a66e4a', // Pele morena
     hairColor: '#1a1615',
     hairStyle: 'short_fade',
     shirtStyle: 'patterned',
@@ -87,6 +83,9 @@ export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
     shortsColor: '#5c2c16',
     barefoot: true,
     bootColor: '#1f2937',
+    bodyBuild: 'athletic',
+    personality: 'Descontraído · Artilheiro da Várzea',
+    celebrationStyle: 'yuri',
     speedStat: 1.08,
     kickStat: 1.12,
     tackleStat: 0.95,
@@ -96,7 +95,7 @@ export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
     name: 'Josué',
     role: 'ala',
     number: 10,
-    skinColor: '#8d5837',
+    skinColor: '#8d5837', // Pele morena
     hairColor: '#181413',
     hairStyle: 'curly',
     shirtStyle: 'solid',
@@ -105,6 +104,9 @@ export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
     shortsColor: '#334155',
     barefoot: true,
     bootColor: '#111827',
+    bodyBuild: 'compact',
+    personality: 'Brincalhão · Rei do Drible Curto',
+    celebrationStyle: 'josue',
     speedStat: 1.12,
     kickStat: 1.04,
     tackleStat: 1.0,
@@ -114,16 +116,19 @@ export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
     name: 'Careca',
     role: 'fixo',
     number: 4,
-    skinColor: '#b57c56',
-    hairColor: '#1c1917',
-    hairStyle: 'bald',
-    shirtStyle: 'shirtless',
-    shirtPrimary: '#b57c56',
-    shirtSecondary: '#111827',
+    skinColor: '#4a2c18', // Pele negra
+    hairColor: '#14110f',
+    hairStyle: 'bald', // Cabeça raspada
+    shirtStyle: 'solid',
+    shirtPrimary: '#d97706',
+    shirtSecondary: '#fef3c7',
     shortsColor: '#18181b',
     barefoot: true,
     bootColor: '#18181b',
-    speedStat: 1.0,
+    bodyBuild: 'slim', // Corpo magro e esguio
+    personality: 'Engraçado e Descontraído · Xerife Esguio',
+    celebrationStyle: 'careca',
+    speedStat: 1.04,
     kickStat: 1.02,
     tackleStat: 1.15,
   },
@@ -132,7 +137,7 @@ export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
     name: 'Bode',
     role: 'goleiro',
     number: 1,
-    skinColor: '#78472a',
+    skinColor: '#78472a', // Pele morena
     hairColor: '#141210',
     hairStyle: 'afro',
     shirtStyle: 'solid',
@@ -141,19 +146,25 @@ export const INITIAL_HOME_PLAYERS: PlayerCustomization[] = [
     shortsColor: '#44403c',
     barefoot: false,
     bootColor: '#0f172a',
+    bodyBuild: 'stocky',
+    personality: 'Irreverente · Paredão do Terreirão',
+    celebrationStyle: 'bode',
     speedStat: 0.96,
     kickStat: 1.05,
     tackleStat: 1.1,
   },
 ];
 
+/**
+ * TIME ADVERSÁRIO (Time 2): Primo, Bicudo, Ismael e Felipe
+ */
 export const INITIAL_AWAY_PLAYERS: PlayerCustomization[] = [
   {
     id: 'away_1',
-    name: 'Alemão',
+    name: 'Primo',
     role: 'pivo',
     number: 11,
-    skinColor: '#c68b63',
+    skinColor: '#b57c56',
     hairColor: '#292018',
     hairStyle: 'buzz',
     shirtStyle: 'striped',
@@ -162,13 +173,16 @@ export const INITIAL_AWAY_PLAYERS: PlayerCustomization[] = [
     shortsColor: '#111827',
     barefoot: false,
     bootColor: '#dc2626',
-    speedStat: 1.04,
-    kickStat: 1.06,
+    bodyBuild: 'athletic',
+    personality: 'Atacante Fominha',
+    celebrationStyle: 'rival',
+    speedStat: 1.05,
+    kickStat: 1.08,
     tackleStat: 0.98,
   },
   {
     id: 'away_2',
-    name: 'Neguinho',
+    name: 'Bicudo',
     role: 'ala',
     number: 7,
     skinColor: '#6b3e23',
@@ -178,15 +192,18 @@ export const INITIAL_AWAY_PLAYERS: PlayerCustomization[] = [
     shirtPrimary: '#b91c1c',
     shirtSecondary: '#111827',
     shortsColor: '#111827',
-    barefoot: true,
-    bootColor: '#18181b',
+    barefoot: false,
+    bootColor: '#facc15',
+    bodyBuild: 'compact',
+    personality: 'Rei do Chute de Bico na Lama',
+    celebrationStyle: 'rival',
     speedStat: 1.09,
-    kickStat: 1.0,
-    tackleStat: 1.02,
+    kickStat: 1.1,
+    tackleStat: 1.0,
   },
   {
     id: 'away_3',
-    name: 'Ceará',
+    name: 'Ismael',
     role: 'fixo',
     number: 3,
     skinColor: '#9c6644',
@@ -196,15 +213,18 @@ export const INITIAL_AWAY_PLAYERS: PlayerCustomization[] = [
     shirtPrimary: '#b91c1c',
     shirtSecondary: '#111827',
     shortsColor: '#18181b',
-    barefoot: false,
+    barefoot: true,
     bootColor: '#27272a',
+    bodyBuild: 'stocky',
+    personality: 'Zagueiro de Carrinho Forte',
+    celebrationStyle: 'rival',
     speedStat: 0.98,
     kickStat: 0.98,
-    tackleStat: 1.1,
+    tackleStat: 1.12,
   },
   {
     id: 'away_4',
-    name: 'Muralha',
+    name: 'Felipe',
     role: 'goleiro',
     number: 12,
     skinColor: '#845234',
@@ -216,7 +236,10 @@ export const INITIAL_AWAY_PLAYERS: PlayerCustomization[] = [
     shortsColor: '#1e293b',
     barefoot: false,
     bootColor: '#1e293b',
-    speedStat: 0.95,
+    bodyBuild: 'slim',
+    personality: 'Goleiro Elástico',
+    celebrationStyle: 'rival',
+    speedStat: 0.97,
     kickStat: 1.02,
     tackleStat: 1.08,
   },
@@ -246,9 +269,9 @@ export const AVAILABLE_TEAMS: TeamConfig[] = [
     name: 'Rubro-Negro do Beco',
     shortName: 'RNB',
     primaryColor: '#dc2626',
-    secondaryColor: '#18181b',
+    secondaryColor: '#181827',
     shortsColor: '#18181b',
-    description: 'Raça pura, carrinho na poça de lama e chute forte do meio da terra.',
+    description: 'Primo, Bicudo, Ismael e Felipe prontos para o clássico na terra batida.',
   },
   {
     id: 'alvinegro_terreirao',
@@ -261,15 +284,24 @@ export const AVAILABLE_TEAMS: TeamConfig[] = [
   },
 ];
 
-/**
- * Computes terrain height at (x, z) including ruts, shallow holes, and mounds.
- */
+export const VARZEA_VOICE_PHRASES = {
+  callForPass: ['Toca a bola!', 'Aqui!', 'Passa, passa!'],
+  passRequest: ['Toca a bola!', 'Aqui!', 'Passa, passa!'],
+  attacking: ['Vai, vai!', 'Chuta!', 'Bora!'],
+  sprintCall: ['Vai, vai!', 'Bora!', 'Corre!'],
+  shootCall: ['Chuta!', 'Solta a bomba!', 'Bate pro gol!'],
+  defending: ['Marca ele!', 'Fecha o meio!', 'Tira daí!'],
+  defendCall: ['Marca ele!', 'Fecha o meio!', 'Tira daí!'],
+  goodPlay: ['Boa!', 'Aí sim!', 'Jogou muito!'],
+  goalScored: ['Que golaço!', 'Foi gol!', 'É caixa na várzea!'],
+  goalShout: ['Que golaço!', 'Foi gol!', 'É caixa na várzea!'],
+};
+
 export function getTerrainHeightAt(
   x: number,
   z: number,
   bumps: TerrainBump[] = VARZEA_BUMPS
 ): number {
-  // Base organic micro-undulation
   let h =
     Math.sin(x * 0.35) * Math.cos(z * 0.42) * 0.025 +
     Math.sin(x * 0.9 + z * 0.7) * 0.012;
@@ -288,10 +320,6 @@ export function getTerrainHeightAt(
   return h;
 }
 
-/**
- * Checks if position (x, z) is inside any puddle zone.
- * Returns the puddle zone if inside, or null.
- */
 export function getPuddleAt(
   x: number,
   z: number,
@@ -313,9 +341,6 @@ export function getPuddleAt(
   return null;
 }
 
-/**
- * Checks if position (x, z) is inside any mud zone and returns speed multiplier.
- */
 export function getMudSpeedMultiplier(
   x: number,
   z: number,
@@ -342,10 +367,6 @@ export function getMudSpeedMultiplier(
   return { multiplier: minMult, inMud, inPuddle: false };
 }
 
-/**
- * Checks if the ball has completely entered either the left (home) or right (away) goal.
- * Requirement: "A bola precisa entrar completamente na pequena trave para contabilizar o gol."
- */
 export function checkGoalScored(
   ball: BallState,
   pitch: PitchDimensions = DEFAULT_PITCH
@@ -353,7 +374,6 @@ export function checkGoalScored(
   const halfW = pitch.width / 2;
   const halfGoalZ = pitch.goalWidth / 2;
 
-  // Ball must be within the goalposts in Z and below the crossbar in Y
   const insideGoalZ = Math.abs(ball.z) <= halfGoalZ - ball.radius * 0.35;
   const belowCrossbar = ball.y + ball.radius * 0.5 <= pitch.goalHeight;
 
@@ -361,12 +381,10 @@ export function checkGoalScored(
     return null;
   }
 
-  // Right goal (+X) is defended by Away -> Home scores when ball completely crosses +halfW + ball.radius
   if (ball.x - ball.radius >= halfW && ball.x <= halfW + pitch.goalDepth + ball.radius) {
     return 'home';
   }
 
-  // Left goal (-X) is defended by Home -> Away scores when ball completely crosses -halfW - ball.radius
   if (ball.x + ball.radius <= -halfW && ball.x >= -halfW - pitch.goalDepth - ball.radius) {
     return 'away';
   }
@@ -381,9 +399,6 @@ export interface OutOfBoundsEvent {
   awardedTeam: 'home' | 'away';
 }
 
-/**
- * Checks if the ball went out of the dirt pitch lines (when not inside a goal).
- */
 export function checkOutOfBounds(
   ball: BallState,
   pitch: PitchDimensions = DEFAULT_PITCH
@@ -392,7 +407,6 @@ export function checkOutOfBounds(
   const halfD = pitch.depth / 2;
   const halfGoalZ = pitch.goalWidth / 2;
 
-  // Sidelines (Z axis) -> Cobrança de lateral
   if (Math.abs(ball.z) > halfD + ball.radius * 1.2) {
     const signZ = ball.z > 0 ? 1 : -1;
     const clampedX = Math.max(-halfW + 1.5, Math.min(halfW - 1.5, ball.x));
@@ -406,7 +420,6 @@ export function checkOutOfBounds(
     };
   }
 
-  // Goal lines (X axis) outside the goal mouth
   const inGoalMouthZ = Math.abs(ball.z) <= halfGoalZ;
   const belowCrossbar = ball.y <= pitch.goalHeight;
 
@@ -415,7 +428,6 @@ export function checkOutOfBounds(
     const awardedTeam: 'home' | 'away' =
       ball.lastTouchTeam === 'home' ? 'away' : 'home';
 
-    // In 4v4 várzea, endline out restarts from the goalkeeper or corner spot
     if (
       (signX > 0 && awardedTeam === 'away') ||
       (signX < 0 && awardedTeam === 'home')
@@ -448,11 +460,6 @@ export interface BallStepEvents {
   outOfBounds: OutOfBoundsEvent | null;
 }
 
-/**
- * Advances independent ball physics for one clamped frame step (dt).
- * Implements gravity, air drag, dirt friction, puddle water resistance,
- * irregular terrain bounce on bumps/holes, and goalpost/wall rebounds.
- */
 export function stepBallPhysics(
   ball: BallState,
   dt: number,
@@ -472,32 +479,27 @@ export function stepBallPhysics(
   const puddle = getPuddleAt(ball.x, ball.z);
   ball.inPuddle = Boolean(puddle) && ball.y <= groundY + 0.15;
 
-  // Apply gravity when airborne
   if (ball.y > groundY + 0.005 || ball.vy > 0) {
     ball.vy -= gravity * dt;
   }
 
-  // Integrate position
   ball.x += ball.vx * dt;
   ball.y += ball.vy * dt;
   ball.z += ball.vz * dt;
 
   const newGroundY = getTerrainHeightAt(ball.x, ball.z) + ball.radius;
 
-  // Ground collision & irregular dirt bounce
   if (ball.y <= newGroundY) {
     ball.y = newGroundY;
 
     if (ball.vy < -1.1) {
       const inWater = Boolean(getPuddleAt(ball.x, ball.z));
       if (inWater) {
-        // Puddle absorbs almost all vertical bounce and slows horizontal speed
         ball.vy = -ball.vy * 0.18;
         ball.vx *= 0.62;
         ball.vz *= 0.62;
         events.splashedInPuddle = true;
       } else {
-        // Irregular bounce on uneven dirt terrain
         const restitution = 0.56;
         ball.vy = -ball.vy * restitution;
         const speedHoriz = Math.hypot(ball.vx, ball.vz);
@@ -516,7 +518,6 @@ export function stepBallPhysics(
       ball.vy = 0;
     }
 
-    // Rolling friction on dirt vs puddle
     const activePuddle = getPuddleAt(ball.x, ball.z);
     if (activePuddle) {
       const waterDamp = Math.exp(-3.8 * activePuddle.waterDrag * dt * 2.2);
@@ -533,19 +534,16 @@ export function stepBallPhysics(
       ball.vz *= damp;
     }
   } else {
-    // Air drag
     const airDamp = Math.exp(-0.25 * dt);
     ball.vx *= airDamp;
     ball.vz *= airDamp;
   }
 
-  // Stop micro-crawl
   if (Math.hypot(ball.vx, ball.vz) < 0.06 && Math.abs(ball.vy) < 0.06) {
     ball.vx = 0;
     ball.vz = 0;
   }
 
-  // Goalpost & Crossbar collisions (Left and Right goals)
   const halfW = pitch.width / 2;
   const halfGoalZ = pitch.goalWidth / 2;
   const postRadius = 0.08;
@@ -579,7 +577,6 @@ export function stepBallPhysics(
     }
   }
 
-  // Crossbar collision
   if (
     Math.abs(Math.abs(ball.x) - halfW) < ball.radius + postRadius &&
     Math.abs(ball.z) <= halfGoalZ &&
@@ -590,7 +587,6 @@ export function stepBallPhysics(
     events.hitGoalpost = true;
   }
 
-  // Goal net back & side containment when ball is inside the goal mouth
   for (const signX of [-1, 1]) {
     const goalFrontX = signX * halfW;
     const goalBackX = signX * (halfW + pitch.goalDepth);
@@ -600,7 +596,6 @@ export function stepBallPhysics(
         : ball.x <= goalFrontX && ball.x >= goalBackX - 0.5;
 
     if (insideDepth && Math.abs(ball.z) <= halfGoalZ + 0.4 && ball.y <= pitch.goalHeight + 0.2) {
-      // Back net
       if (signX > 0 && ball.x + ball.radius > goalBackX) {
         ball.x = goalBackX - ball.radius;
         ball.vx = -Math.abs(ball.vx) * 0.25;
@@ -610,7 +605,6 @@ export function stepBallPhysics(
         ball.vx = Math.abs(ball.vx) * 0.25;
         ball.vz *= 0.5;
       }
-      // Side nets
       if (Math.abs(ball.z) + ball.radius > halfGoalZ) {
         ball.z = Math.sign(ball.z) * (halfGoalZ - ball.radius);
         ball.vz = -ball.vz * 0.3;
@@ -618,13 +612,11 @@ export function stepBallPhysics(
     }
   }
 
-  // Check goal first
   events.goalScored = checkGoalScored(ball, pitch);
   if (!events.goalScored) {
     events.outOfBounds = checkOutOfBounds(ball, pitch);
   }
 
-  // Outer perimeter brick wall / fence safety bounds so ball never escapes the 3D world
   const maxWorldX = halfW + 4.2;
   const maxWorldZ = pitch.depth / 2 + 3.8;
   if (Math.abs(ball.x) > maxWorldX) {
@@ -639,11 +631,6 @@ export function stepBallPhysics(
   return events;
 }
 
-/**
- * Natural ball control / dribble interaction (not glued to feet).
- * When a player approaches the ball at a controllable speed and angle,
- * they nudge the ball slightly ahead of their stride.
- */
 export function resolvePlayerBallInteraction(
   player: PlayerRuntimeState,
   ball: BallState,
@@ -671,7 +658,6 @@ export function resolvePlayerBallInteraction(
   const previousOwner = ball.ownerId;
   const intercepted = previousOwner !== null && previousOwner !== player.id;
 
-  // Clear previous owner's hasBall flag
   for (let i = 0; i < allPlayers.length; i++) {
     allPlayers[i].hasBall = allPlayers[i].id === player.id;
   }
@@ -679,22 +665,18 @@ export function resolvePlayerBallInteraction(
   ball.ownerId = player.id;
   ball.lastTouchTeam = player.team;
   ball.lastTouchPlayerName = player.config.name;
+  ball.lastTouchPlayerId = player.id;
 
-  // Compute natural touch impulse ahead of the player's facing & velocity
-  const playerSpeed = Math.hypot(player.vx, player.vz);
   const dirX = Math.sin(player.facingAngle);
   const dirZ = Math.cos(player.facingAngle);
 
-  // Ideal dribble point is ~0.58m ahead of player feet, not glued inside the player
   const targetBallX = player.x + dirX * 0.58;
   const targetBallZ = player.z + dirZ * 0.58;
 
-  // Soft spring push + forward tap proportional to running speed
   const pushFactor = player.isSprinting ? 1.28 : 1.08;
   ball.vx = player.vx * pushFactor + (targetBallX - ball.x) * 4.5;
   ball.vz = player.vz * pushFactor + (targetBallZ - ball.z) * 4.5;
 
-  // Dampen high vertical bounces when controlling on chest/feet
   if (ball.vy < 0) {
     ball.vy *= 0.35;
   }
@@ -702,9 +684,6 @@ export function resolvePlayerBallInteraction(
   return { touched: true, intercepted };
 }
 
-/**
- * Formats remaining or elapsed match seconds as MM:SS in tabular format.
- */
 export function formatMatchTime(seconds: number): string {
   const clamped = Math.max(0, Math.floor(seconds));
   const mins = Math.floor(clamped / 60);

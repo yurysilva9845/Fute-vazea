@@ -10,9 +10,25 @@ export type MatchPhase =
 
 export type PlayerRole = 'goleiro' | 'fixo' | 'ala' | 'pivo';
 
-export type HairStyle = 'bald' | 'short_fade' | 'curly' | 'afro' | 'buzz' | 'cap_orange' | 'cap_black';
+export type HairStyle =
+  | 'bald'
+  | 'short_fade'
+  | 'curly'
+  | 'afro'
+  | 'buzz'
+  | 'cap_orange'
+  | 'cap_black';
 
-export type ShirtStyle = 'solid' | 'striped' | 'patterned' | 'shirtless' | 'tank_top';
+export type ShirtStyle =
+  | 'solid'
+  | 'striped'
+  | 'patterned'
+  | 'shirtless'
+  | 'tank_top';
+
+export type BodyBuild = 'slim' | 'athletic' | 'stocky' | 'compact';
+
+export type CelebrationStyle = 'yuri' | 'josue' | 'careca' | 'bode' | 'rival';
 
 export type PlayerAnimState =
   | 'idle'
@@ -37,8 +53,11 @@ export interface PlayerCustomization {
   shirtPrimary: string;
   shirtSecondary: string;
   shortsColor: string;
-   barefoot: boolean;
+  barefoot: boolean;
   bootColor: string;
+  bodyBuild?: BodyBuild;
+  personality?: string;
+  celebrationStyle?: CelebrationStyle;
   speedStat: number;   // 0.85 - 1.15
   kickStat: number;    // 0.85 - 1.15
   tackleStat: number;  // 0.85 - 1.15
@@ -61,7 +80,7 @@ export interface PuddleZone {
   rx: number;
   rz: number;
   rotation: number;
-  waterDrag: number; // 0.35 - 0.65 velocity damping per second
+  waterDrag: number;
 }
 
 export interface MudZone {
@@ -69,22 +88,22 @@ export interface MudZone {
   x: number;
   z: number;
   radius: number;
-  speedMultiplier: number; // e.g. 0.75
+  speedMultiplier: number;
 }
 
 export interface TerrainBump {
   x: number;
   z: number;
   radius: number;
-  height: number; // + for bump, - for shallow hole
+  height: number;
 }
 
 export interface PitchDimensions {
-  width: number;       // X axis (goal to goal): e.g., 36m
-  depth: number;       // Z axis (sideline to sideline): e.g., 24m
-  goalWidth: number;   // Z span of small varzea goal: e.g., 4.2m
-  goalHeight: number;  // Y height of small varzea goal: e.g., 2.05m
-  goalDepth: number;   // X depth of net: e.g., 1.3m
+  width: number;
+  depth: number;
+  goalWidth: number;
+  goalHeight: number;
+  goalDepth: number;
 }
 
 export interface BallState {
@@ -100,6 +119,7 @@ export interface BallState {
   ownerId: string | null;
   lastTouchTeam: 'home' | 'away' | null;
   lastTouchPlayerName: string | null;
+  lastTouchPlayerId?: string | null;
   inPuddle: boolean;
 }
 
@@ -112,19 +132,22 @@ export interface PlayerRuntimeState {
   z: number;
   vx: number;
   vz: number;
-  facingAngle: number; // radians in XZ plane
+  facingAngle: number;
   animState: PlayerAnimState;
   animTimer: number;
   stridePhase: number;
-  stamina: number;     // 0 - 100
+  stamina: number;
   isSprinting: boolean;
   tackleCooldown: number;
-  stunTimer: number;   // > 0 when fallen/tackled
-  homeX: number;       // tactical anchor X
-  homeZ: number;       // tactical anchor Z
+  stunTimer: number;
+  homeX: number;
+  homeZ: number;
   hasBall: boolean;
   inMud: boolean;
   inPuddle: boolean;
+  controlledByUid?: string | null;
+  voiceCallout?: string | null;
+  voiceTimer?: number;
 }
 
 export interface MatchStats {
@@ -138,17 +161,154 @@ export interface MatchStats {
   awayTackles: number;
   homePossessionFrames: number;
   awayPossessionFrames: number;
-  scorers: Array<{ playerName: string; team: 'home' | 'away'; timeFormatted: string; half: 1 | 2 }>;
+  scorers: Array<{
+    playerName: string;
+    playerId?: string;
+    team: 'home' | 'away';
+    timeFormatted: string;
+    half: 1 | 2;
+  }>;
 }
 
 export type CameraMode = 'follow' | 'overview' | 'sideline' | 'close';
 
 export interface GameSettings {
   cameraMode: CameraMode;
-  cameraDistance: number; // 0.7 to 1.4 multiplier
+  cameraDistance: number;
   soundEnabled: boolean;
   musicEnabled: boolean;
-  halfDurationSeconds: number; // default 300 (5 minutes)
+  sfxVolume: number;     // 0.0 - 1.0
+  voiceVolume: number;   // 0.0 - 1.0
+  ambientVolume: number; // 0.0 - 1.0
+  musicVolume: number;   // 0.0 - 1.0
+  vibrationEnabled: boolean;
+  halfDurationSeconds: number;
   aiDifficulty: 'raiz' | 'equilibrado' | 'lenda';
   showPlayerNames: boolean;
 }
+
+// Multiplayer & Friends Types
+export interface RoomSlotAssignment {
+  slotId: string; // 'home_1' .. 'home_4', 'away_1' .. 'away_4'
+  playerName: string;
+  team: 'home' | 'away';
+  uid: string;
+  userDisplayName: string;
+  pingMs: number;
+  ready: boolean;
+}
+
+export interface RemotePlayerInputPacket {
+  uid: string;
+  slotId: string;
+  moveX: number;
+  moveZ: number;
+  sprint: boolean;
+  action: 'none' | 'pass' | 'long_pass' | 'shoot' | 'tackle' | 'header';
+  kickPower: number;
+  seq: number;
+  timestamp: number;
+}
+
+export interface NetworkSyncSnapshot {
+  tick: number;
+  timestamp: number;
+  phase: MatchPhase;
+  half: 1 | 2;
+  remainingSeconds: number;
+  homeGoals: number;
+  awayGoals: number;
+  celebratingPlayerId: string | null;
+  celebrationStyle: CelebrationStyle | null;
+  bannerMessage: string | null;
+  bannerSubtext: string | null;
+  ball: {
+    x: number;
+    y: number;
+    z: number;
+    vx: number;
+    vy: number;
+    vz: number;
+    ownerId: string | null;
+  };
+  players: Array<{
+    id: string;
+    x: number;
+    z: number;
+    vx: number;
+    vz: number;
+    facingAngle: number;
+    animState: PlayerAnimState;
+    stamina: number;
+    voiceCallout?: string | null;
+  }>;
+}
+
+export interface OnlineUserProfile {
+  uid: string;
+  displayName: string;
+  tagCode: string;
+  status: 'online' | 'in_room' | 'playing';
+  currentRoomCode: string;
+  updatedAt: number;
+  createdAt: number;
+}
+
+export interface MultiplayerSlot {
+  characterId: string;
+  characterName: string;
+  team: 'home' | 'away';
+  uid: string | null;
+  displayName: string;
+  isBot: boolean;
+  isReady: boolean;
+  pingMs: number;
+}
+
+export interface MultiplayerMatchSnapshot {
+  ball: {
+    x: number;
+    y: number;
+    z: number;
+    vx: number;
+    vy: number;
+    vz: number;
+  };
+  players: Record<
+    string,
+    {
+      x: number;
+      z: number;
+      vx: number;
+      vz: number;
+      facingAngle: number;
+      animState: PlayerAnimState;
+      voiceBubble?: string | null;
+    }
+  >;
+  homeGoals: number;
+  awayGoals: number;
+  half: 1 | 2;
+  remainingSeconds: number;
+  phase: MatchPhase;
+  celebratingPlayerId: string | null;
+  bannerMessage: string | null;
+  bannerSubtext: string | null;
+  timestamp: number;
+}
+
+export interface MultiplayerRoomState {
+  roomCode: string;
+  hostUid: string;
+  hostName: string;
+  status: 'waiting' | 'playing' | 'finished';
+  homeTeamId: string;
+  awayTeamId: string;
+  homeScore: number;
+  awayScore: number;
+  half: 1 | 2;
+  remainingSeconds: number;
+  slots: Record<string, MultiplayerSlot>;
+  matchState: MultiplayerMatchSnapshot | null;
+}
+

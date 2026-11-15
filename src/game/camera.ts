@@ -3,6 +3,7 @@ import {
   BallState,
   CameraMode,
   GameScreenState,
+  MatchPhase,
   PlayerRuntimeState,
 } from '../types/game';
 import { DEFAULT_PITCH } from './rules';
@@ -13,9 +14,9 @@ import { DEFAULT_PITCH } from './rules';
  * - Smooth exponential damping (never jerks or snaps)
  * - Keeps both the ball and active players framed in view
  * - Zooms in subtly during attacks near the goal boxes
+ * - Spotlights the goal scorer during 'goal_celebration' so custom 3D celebrations shine
  * - Supports 4 camera presets: 'follow' (3ª Pessoa / TV Dinâmica), 'overview' (Campinho Inteiro),
  *   'sideline' (Lateral da Várzea), and 'close' (Pro Player)
- * - Supports mouse orbit offset and decaying trauma shake on hard kicks/tackles/goals
  */
 export class VarzeaCameraRig {
   public currentPos = new THREE.Vector3(0, 11.5, 19.5);
@@ -44,7 +45,9 @@ export class VarzeaCameraRig {
     mode: CameraMode,
     distanceMultiplier: number,
     ball: BallState,
-    controlledPlayer: PlayerRuntimeState | undefined
+    controlledPlayer: PlayerRuntimeState | undefined,
+    matchPhase: MatchPhase = 'open_play',
+    celebratingPlayer?: PlayerRuntimeState
   ) {
     // 1. Live World Camera Tour during Title Screen
     if (screenState === 'title') {
@@ -69,7 +72,39 @@ export class VarzeaCameraRig {
       return;
     }
 
-    // 2. Gameplay Camera Modes
+    // 2. Goal Celebration Spotlight Camera (focuses on the goal scorer & celebrating teammates)
+    if (matchPhase === 'goal_celebration' && celebratingPlayer) {
+      this._targetPos.set(
+        celebratingPlayer.x + Math.sin(celebratingPlayer.facingAngle) * 3.8,
+        2.35,
+        celebratingPlayer.z + Math.cos(celebratingPlayer.facingAngle) * 3.8 + 1.2
+      );
+      this._targetLook.set(
+        celebratingPlayer.x,
+        1.25,
+        celebratingPlayer.z
+      );
+
+      this.currentPos.x = THREE.MathUtils.damp(this.currentPos.x, this._targetPos.x, 4.8, dt);
+      this.currentPos.y = THREE.MathUtils.damp(this.currentPos.y, this._targetPos.y, 4.8, dt);
+      this.currentPos.z = THREE.MathUtils.damp(this.currentPos.z, this._targetPos.z, 4.8, dt);
+
+      this.currentLookAt.x = THREE.MathUtils.damp(this.currentLookAt.x, this._targetLook.x, 6.5, dt);
+      this.currentLookAt.y = THREE.MathUtils.damp(this.currentLookAt.y, this._targetLook.y, 6.5, dt);
+      this.currentLookAt.z = THREE.MathUtils.damp(this.currentLookAt.z, this._targetLook.z, 6.5, dt);
+
+      camera.position.copy(this.currentPos);
+      if (this.trauma > 0) {
+        const shake = this.trauma * this.trauma * 0.25;
+        camera.position.x += (Math.random() - 0.5) * shake;
+        camera.position.y += (Math.random() - 0.5) * shake;
+        this.trauma = Math.max(0, this.trauma - dt * 2.4);
+      }
+      camera.lookAt(this.currentLookAt);
+      return;
+    }
+
+    // 3. Gameplay Camera Modes
     const pX = controlledPlayer ? controlledPlayer.x : ball.x;
     const pZ = controlledPlayer ? controlledPlayer.z : ball.z;
 

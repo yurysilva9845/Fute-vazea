@@ -8,8 +8,10 @@ import {
   getMudSpeedMultiplier,
   getPuddleAt,
   getTerrainHeightAt,
+  INITIAL_AWAY_PLAYERS,
   INITIAL_HOME_PLAYERS,
   stepBallPhysics,
+  VARZEA_VOICE_PHRASES,
 } from './rules';
 import { BallState } from '../types/game';
 
@@ -32,9 +34,35 @@ function createBall(overrides: Partial<BallState> = {}): BallState {
   };
 }
 
-test('Team 1 roster contains Yuri, Josué, Careca and Bode', () => {
+test('Team 1 roster contains Yuri, Josué, Careca and Bode with distinct personalities and celebrations', () => {
   const names = INITIAL_HOME_PLAYERS.map((p) => p.name);
   assert.deepEqual(names, ['Yuri', 'Josué', 'Careca', 'Bode']);
+
+  const careca = INITIAL_HOME_PLAYERS.find((p) => p.name === 'Careca');
+  assert.ok(careca, 'Careca must be present');
+  assert.equal(careca.skinColor, '#4a2c18');
+  assert.equal(careca.bodyBuild, 'slim');
+  assert.equal(careca.hairStyle, 'bald');
+  assert.equal(careca.celebrationStyle, 'careca');
+
+  const celebrations = INITIAL_HOME_PLAYERS.map((p) => p.celebrationStyle);
+  assert.deepEqual(celebrations, ['yuri', 'josue', 'careca', 'bode']);
+});
+
+test('Team 2 roster contains Primo, Bicudo, Ismael and Felipe', () => {
+  const names = INITIAL_AWAY_PLAYERS.map((p) => p.name);
+  assert.deepEqual(names, ['Primo', 'Bicudo', 'Ismael', 'Felipe']);
+});
+
+test('Várzea voice phrases include required callouts in Brazilian Portuguese', () => {
+  assert.ok(VARZEA_VOICE_PHRASES.passRequest.includes('Toca a bola!'));
+  assert.ok(VARZEA_VOICE_PHRASES.passRequest.includes('Aqui!'));
+  assert.ok(VARZEA_VOICE_PHRASES.sprintCall.includes('Vai, vai!'));
+  assert.ok(VARZEA_VOICE_PHRASES.goodPlay.includes('Boa!'));
+  assert.ok(VARZEA_VOICE_PHRASES.goalShout.includes('Que golaço!'));
+  assert.ok(VARZEA_VOICE_PHRASES.goalShout.includes('Foi gol!'));
+  assert.ok(VARZEA_VOICE_PHRASES.defendCall.includes('Marca ele!'));
+  assert.ok(VARZEA_VOICE_PHRASES.shootCall.includes('Chuta!'));
 });
 
 test('Goal detection requires complete entry into the small várzea goal', () => {

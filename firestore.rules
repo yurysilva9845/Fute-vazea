@@ -1,0 +1,341 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1 & Phase 4.1: Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Phase 3: Hardened Global Helpers
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Validation Blueprint: UserProfile (Zero PII)
+    function isValidUserProfile(data) {
+      return data.keys().hasAll([
+        'uid',
+        'displayName',
+        'tagCode',
+        'favoritePlayer',
+        'wins',
+        'losses',
+        'draws',
+        'goalsScored',
+        'onlineStatus',
+        'currentRoomCode',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid',
+        'displayName',
+        'tagCode',
+        'favoritePlayer',
+        'wins',
+        'losses',
+        'draws',
+        'goalsScored',
+        'onlineStatus',
+        'currentRoomCode',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128 && data.uid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.uid == request.auth.uid &&
+      data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 32 &&
+      data.tagCode is string && data.tagCode.size() >= 4 && data.tagCode.size() <= 12 && data.tagCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.favoritePlayer is string && data.favoritePlayer in ['Yuri', 'Josué', 'Careca', 'Bode', 'Primo', 'Bicudo', 'Ismael', 'Felipe'] &&
+      data.wins is number && data.wins >= 0 && data.wins <= 100000 &&
+      data.losses is number && data.losses >= 0 && data.losses <= 100000 &&
+      data.draws is number && data.draws >= 0 && data.draws <= 100000 &&
+      data.goalsScored is number && data.goalsScored >= 0 && data.goalsScored <= 500000 &&
+      data.onlineStatus is string && data.onlineStatus in ['online', 'in_lobby', 'in_match', 'offline'] &&
+      data.currentRoomCode is string && data.currentRoomCode.size() <= 16 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: MultiplayerRoom
+    function isValidMultiplayerRoom(data) {
+      return data.keys().hasAll([
+        'roomCode',
+        'hostUid',
+        'hostName',
+        'status',
+        'homeTeamName',
+        'awayTeamName',
+        'homeGoals',
+        'awayGoals',
+        'half',
+        'remainingSeconds',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'roomCode',
+        'hostUid',
+        'hostName',
+        'status',
+        'homeTeamName',
+        'awayTeamName',
+        'homeGoals',
+        'awayGoals',
+        'half',
+        'remainingSeconds',
+        'assignedSlots',
+        'syncState',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 12 && data.roomCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128 && data.hostUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 32 &&
+      data.status is string && data.status in ['waiting', 'playing', 'finished'] &&
+      data.homeTeamName is string && data.homeTeamName.size() >= 1 && data.homeTeamName.size() <= 32 &&
+      data.awayTeamName is string && data.awayTeamName.size() >= 1 && data.awayTeamName.size() <= 32 &&
+      data.homeGoals is number && data.homeGoals >= 0 && data.homeGoals <= 99 &&
+      data.awayGoals is number && data.awayGoals >= 0 && data.awayGoals <= 99 &&
+      data.half is number && data.half in [1, 2] &&
+      data.remainingSeconds is number && data.remainingSeconds >= 0 && data.remainingSeconds <= 600 &&
+      (!('assignedSlots' in data) || (data.assignedSlots is map && data.assignedSlots.keys().size() <= 8)) &&
+      (!('syncState' in data) || (data.syncState is map && data.syncState.keys().size() <= 16)) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: FriendRequest
+    function isValidFriendRequest(data) {
+      return data.keys().hasAll([
+        'fromUid',
+        'fromName',
+        'fromTag',
+        'toUid',
+        'toName',
+        'status',
+        'inviteRoomCode',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'fromUid',
+        'fromName',
+        'fromTag',
+        'toUid',
+        'toName',
+        'status',
+        'inviteRoomCode',
+        'createdAt',
+        'updatedAt'
+      ]) &&
+      data.fromUid is string && data.fromUid.size() >= 1 && data.fromUid.size() <= 128 && data.fromUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 32 &&
+      data.fromTag is string && data.fromTag.size() >= 4 && data.fromTag.size() <= 12 && data.fromTag.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.toUid is string && data.toUid.size() >= 1 && data.toUid.size() <= 128 && data.toUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.fromUid != data.toUid &&
+      data.toName is string && data.toName.size() >= 1 && data.toName.size() <= 32 &&
+      data.status is string && data.status in ['pending', 'accepted', 'declined'] &&
+      data.inviteRoomCode is string && data.inviteRoomCode.size() <= 16 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    // Validation Blueprint: MatchRecord
+    function isValidMatchRecord(data) {
+      return data.keys().hasAll([
+        'roomCode',
+        'recordedByUid',
+        'homeTeamName',
+        'awayTeamName',
+        'homeGoals',
+        'awayGoals',
+        'mvpPlayer',
+        'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'roomCode',
+        'recordedByUid',
+        'homeTeamName',
+        'awayTeamName',
+        'homeGoals',
+        'awayGoals',
+        'mvpPlayer',
+        'createdAt'
+      ]) &&
+      data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 12 && data.roomCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.recordedByUid is string && data.recordedByUid.size() >= 1 && data.recordedByUid.size() <= 128 && data.recordedByUid.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.recordedByUid == request.auth.uid &&
+      data.homeTeamName is string && data.homeTeamName.size() >= 1 && data.homeTeamName.size() <= 32 &&
+      data.awayTeamName is string && data.awayTeamName.size() >= 1 && data.awayTeamName.size() <= 32 &&
+      data.homeGoals is number && data.homeGoals >= 0 && data.homeGoals <= 99 &&
+      data.awayGoals is number && data.awayGoals >= 0 && data.awayGoals <= 99 &&
+      data.mvpPlayer is string && data.mvpPlayer.size() >= 1 && data.mvpPlayer.size() <= 32 &&
+      data.createdAt is timestamp;
+    }
+
+    // 1. /users/{userId} (Public Gamer Profiles — Zero PII)
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (resource == null || existing().uid == userId);
+      allow list: if isSignedIn() && existing().onlineStatus in ['online', 'in_lobby', 'in_match', 'offline'];
+
+      allow create: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().tagCode == existing().tagCode &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName',
+          'favoritePlayer',
+          'wins',
+          'losses',
+          'draws',
+          'goalsScored',
+          'onlineStatus',
+          'currentRoomCode',
+          'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    // 2. /rooms/{roomId} (Multiplayer Rooms & Real-Time State)
+    match /rooms/{roomId} {
+      allow get: if isSignedIn() && isValidId(roomId) && (resource == null || existing().roomCode == roomId);
+      allow list: if isSignedIn() && existing().status in ['waiting', 'playing'];
+
+      allow create: if isSignedIn() &&
+        isValidId(roomId) &&
+        isValidMultiplayerRoom(incoming()) &&
+        incoming().roomCode == roomId &&
+        incoming().hostUid == request.auth.uid &&
+        incoming().status == 'waiting' &&
+        incoming().homeGoals == 0 &&
+        incoming().awayGoals == 0 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+
+      allow update: if isSignedIn() &&
+        isValidId(roomId) &&
+        isValidMultiplayerRoom(incoming()) &&
+        existing().status != 'finished' &&
+        incoming().roomCode == existing().roomCode &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action 1: Host updates match state, score, clock, slots, or status
+          (existing().hostUid == request.auth.uid &&
+            incoming().hostUid == existing().hostUid &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'status',
+              'homeTeamName',
+              'awayTeamName',
+              'homeGoals',
+              'awayGoals',
+              'half',
+              'remainingSeconds',
+              'assignedSlots',
+              'syncState',
+              'updatedAt'
+            ])) ||
+          // Action 2: Participant joins/selects character slot or syncs client input/host migration
+          (existing().status in ['waiting', 'playing'] &&
+            incoming().homeGoals == existing().homeGoals &&
+            incoming().awayGoals == existing().awayGoals &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'assignedSlots',
+              'syncState',
+              'hostUid',
+              'hostName',
+              'updatedAt'
+            ]))
+        );
+
+      allow delete: if isSignedIn() && isValidId(roomId) && existing().hostUid == request.auth.uid;
+    }
+
+    // 3. /friendRequests/{requestId}
+    match /friendRequests/{requestId} {
+      allow get: if isSignedIn() &&
+        isValidId(requestId) &&
+        (resource == null || existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
+
+      allow list: if isSignedIn() &&
+        (existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
+
+      allow create: if isSignedIn() &&
+        isValidId(requestId) &&
+        isValidFriendRequest(incoming()) &&
+        incoming().fromUid == request.auth.uid &&
+        incoming().status == 'pending' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/users/$(incoming().fromUid)) &&
+        exists(/databases/$(database)/documents/users/$(incoming().toUid));
+
+      allow update: if isSignedIn() &&
+        isValidId(requestId) &&
+        isValidFriendRequest(incoming()) &&
+        incoming().fromUid == existing().fromUid &&
+        incoming().fromName == existing().fromName &&
+        incoming().fromTag == existing().fromTag &&
+        incoming().toUid == existing().toUid &&
+        incoming().toName == existing().toName &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action 1: Recipient accepts or declines friend request
+          (existing().toUid == request.auth.uid &&
+            existing().status == 'pending' &&
+            incoming().status in ['accepted', 'declined'] &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          // Action 2: Either friend sends a room code invitation on an accepted friendship
+          ((existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid) &&
+            existing().status == 'accepted' &&
+            incoming().status == 'accepted' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['inviteRoomCode', 'updatedAt']))
+        );
+
+      allow delete: if isSignedIn() &&
+        isValidId(requestId) &&
+        (existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
+    }
+
+    // 4. /matchHistory/{matchId}
+    match /matchHistory/{matchId} {
+      allow get: if isSignedIn() && isValidId(matchId) && (resource == null || existing().recordedByUid == request.auth.uid);
+      allow list: if isSignedIn() && existing().recordedByUid == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+        isValidId(matchId) &&
+        isValidMatchRecord(incoming()) &&
+        incoming().createdAt == request.time &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid));
+
+      allow update, delete: if false;
+    }
+  }
+}

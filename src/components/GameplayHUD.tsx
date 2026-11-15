@@ -3,11 +3,13 @@ import {
   CameraMode,
   GameSettings,
   MatchPhase,
+  MultiplayerRoomState,
   TeamConfig,
 } from '../types/game';
 import { formatMatchTime } from '../game/rules';
 import { VarzeaInputManager } from '../game/controls';
 import { LiveHUDUpdate } from '../game/MatchCanvas';
+import { audioEngine } from '../game/audio';
 
 interface GameplayHUDProps {
   homeTeam: TeamConfig;
@@ -20,6 +22,12 @@ interface GameplayHUDProps {
   settings: GameSettings;
   inputManager: VarzeaInputManager;
   hudUpdateRef: React.MutableRefObject<LiveHUDUpdate>;
+  activeRoom?: MultiplayerRoomState | null;
+  pingMs?: number;
+  isFullscreen?: boolean;
+  onRequestFullscreenLandscape: () => void;
+  onExitFullscreen: () => void;
+  onBackToMenu: () => void;
   onUpdateSettings: (updated: Partial<GameSettings>) => void;
   onPause: () => void;
   onRestart: () => void;
@@ -32,6 +40,18 @@ const CAMERA_MODE_LABELS: Record<CameraMode, string> = {
   close: 'Pro Perto',
 };
 
+function detectMobileOrTouchDevice(): boolean {
+  if (typeof window === 'undefined') return false;
+  const coarse =
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(pointer: coarse)').matches;
+  const narrow = window.innerWidth <= 920;
+  const touchPoints =
+    'ontouchstart' in window ||
+    (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0);
+  return narrow || coarse || (touchPoints && window.innerWidth < 1024);
+}
+
 export const GameplayHUD: React.FC<GameplayHUDProps> = ({
   homeTeam,
   awayTeam,
@@ -42,6 +62,12 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
   settings,
   inputManager,
   hudUpdateRef,
+  activeRoom = null,
+  pingMs = 18,
+  isFullscreen = false,
+  onRequestFullscreenLandscape,
+  onExitFullscreen,
+  onBackToMenu,
   onUpdateSettings,
   onPause,
   onRestart,
@@ -55,24 +81,32 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
   const bannerTitleRef = useRef<HTMLDivElement | null>(null);
   const bannerSubRef = useRef<HTMLDivElement | null>(null);
 
-  // Detect mobile / touch viewport or allow manual touch controls toggle
-  const [showTouchControls, setShowTouchControls] = useState(() => {
+  // Strict mobile / touchscreen detection: controls appear ONLY on mobile/touch devices and disappear completely on desktop PC
+  const [isMobileDevice, setIsMobileDevice] = useState<boolean>(() =>
+    detectMobileOrTouchDevice()
+  );
+  const [isPortraitMobile, setIsPortraitMobile] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
-    return (
-      window.innerWidth <= 900 ||
-      'ontouchstart' in window ||
-      navigator.maxTouchPoints > 0
-    );
+    return detectMobileOrTouchDevice() && window.innerHeight > window.innerWidth;
   });
+  const [dismissedOrientationBanner, setDismissedOrientationBanner] =
+    useState(false);
 
   useEffect(() => {
-    const checkViewport = () => {
-      if (window.innerWidth <= 900) {
-        setShowTouchControls(true);
-      }
+    const checkDeviceAndOrientation = () => {
+      const mobile = detectMobileOrTouchDevice();
+      setIsMobileDevice(mobile);
+      setIsPortraitMobile(mobile && window.innerHeight > window.innerWidth);
     };
-    window.addEventListener('resize', checkViewport);
-    return () => window.removeEventListener('resize', checkViewport);
+    window.addEventListener('resize', checkDeviceAndOrientation);
+    window.addEventListener('orientationchange', checkDeviceAndOrientation);
+    return () => {
+      window.removeEventListener('resize', checkDeviceAndOrientation);
+      window.removeEventListener(
+        'orientationchange',
+        checkDeviceAndOrientation
+      );
+    };
   }, []);
 
   // Sync 60Hz player stamina, kick charge & goal/lateral banners via DOM refs
@@ -80,10 +114,16 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
     let rafId = 0;
     const syncDOM = () => {
       const data = hudUpdateRef.current;
-      if (playerNameRef.current && playerNameRef.current.textContent !== data.controlledPlayerName) {
+      if (
+        playerNameRef.current &&
+        playerNameRef.current.textContent !== data.controlledPlayerName
+      ) {
         playerNameRef.current.textContent = data.controlledPlayerName;
       }
-      if (playerRoleRef.current && playerRoleRef.current.textContent !== data.controlledPlayerRole) {
+      if (
+        playerRoleRef.current &&
+        playerRoleRef.current.textContent !== data.controlledPlayerRole
+      ) {
         playerRoleRef.current.textContent = data.controlledPlayerRole;
       }
       if (staminaBarRef.current) {
@@ -98,7 +138,11 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
           kickChargeWrapRef.current.style.opacity = '0';
         }
       }
-      if (bannerWrapRef.current && bannerTitleRef.current && bannerSubRef.current) {
+      if (
+        bannerWrapRef.current &&
+        bannerTitleRef.current &&
+        bannerSubRef.current
+      ) {
         if (data.bannerMessage) {
           bannerWrapRef.current.style.opacity = '1';
           bannerTitleRef.current.textContent = data.bannerMessage;
@@ -113,7 +157,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
     return () => cancelAnimationFrame(rafId);
   }, [hudUpdateRef]);
 
-  // Virtual Joystick state
+  // Virtual 360-degree Joystick state (walk on inner tilt, automatic sprint on outer tilt > 78%)
   const joystickBaseRef = useRef<HTMLDivElement | null>(null);
   const joystickKnobRef = useRef<HTMLDivElement | null>(null);
   const activePointerId = useRef<number | null>(null);
@@ -135,8 +179,16 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
       dy = (dy / dist) * maxRadius;
     }
 
-    knob.style.transform = `translate3d(${dx.toFixed(1)}px, ${dy.toFixed(1)}px, 0)`;
-    inputManager.setTouchJoystick(dx / maxRadius, dy / maxRadius);
+    const normX = dx / maxRadius;
+    const normY = dy / maxRadius;
+    const tiltMagnitude = Math.hypot(normX, normY);
+
+    knob.style.transform = `translate3d(${dx.toFixed(1)}px, ${dy.toFixed(
+      1
+    )}px, 0)`;
+    inputManager.setTouchJoystick(normX, normY);
+    // Smooth walk -> run transition when tilting joystick near outer rim
+    inputManager.touchSprintHeld = tiltMagnitude > 0.82;
   };
 
   const resetJoystick = () => {
@@ -145,6 +197,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
       joystickKnobRef.current.style.transform = 'translate3d(0px, 0px, 0)';
     }
     inputManager.setTouchJoystick(0, 0);
+    inputManager.touchSprintHeld = false;
   };
 
   const cycleCameraMode = (e: React.MouseEvent<HTMLButtonElement>) => {
@@ -155,8 +208,48 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
   };
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-20 flex flex-col justify-between p-2.5 sm:p-5 select-none">
-      {/* Top Perimeter Bar: Scoreboard + Utility Icon Controls */}
+    <div
+      className="pointer-events-none fixed inset-0 z-20 flex flex-col justify-between p-2 sm:p-4 select-none touch-none"
+      style={{
+        paddingTop: 'max(0.5rem, env(safe-area-inset-top))',
+        paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))',
+        paddingLeft: 'max(0.65rem, env(safe-area-inset-left))',
+        paddingRight: 'max(0.65rem, env(safe-area-inset-right))',
+      }}
+    >
+      {/* Mobile Landscape & Fullscreen Friendly Prompt when in Portrait or non-fullscreen on mobile */}
+      {isMobileDevice &&
+        (isPortraitMobile || !isFullscreen) &&
+        !dismissedOrientationBanner && (
+          <div className="pointer-events-auto w-full max-w-xl mx-auto mb-1.5 bg-stone-950/95 border-2 border-amber-500 rounded-xl px-3 py-2 flex flex-wrap items-center justify-between gap-2 shadow-2xl">
+            <p className="text-[11px] sm:text-xs font-bold text-amber-200 leading-snug flex-1">
+              Vire seu celular para jogar na horizontal e toque para entrar em
+              tela cheia.
+            </p>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  onRequestFullscreenLandscape();
+                  setDismissedOrientationBanner(true);
+                }}
+                className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold text-[11px] rounded-lg shadow cursor-pointer whitespace-nowrap"
+              >
+                JOGAR EM TELA CHEIA
+              </button>
+              <button
+                type="button"
+                onClick={() => setDismissedOrientationBanner(true)}
+                aria-label="Ocultar aviso de tela cheia"
+                className="px-2 py-1 text-[11px] text-stone-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
+
+      {/* Top Perimeter Bar: Scoreboard + Online Ping + Utility Controls */}
       <div className="flex items-start justify-between gap-1.5 sm:gap-3 w-full max-w-7xl mx-auto">
         {/* Top-Left Active Player Badge & Stamina */}
         <div className="pointer-events-auto flex items-center gap-2 bg-stone-950/90 border border-stone-800 rounded-xl px-2.5 sm:px-3.5 py-1.5 sm:py-2 shadow-lg shrink-0">
@@ -194,6 +287,16 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               />
             </div>
           </div>
+
+          {/* Online Room & Ping Indicator when in Multiplayer */}
+          {activeRoom && (
+            <div className="pl-2 border-l border-stone-800 text-[10px] font-mono">
+              <div className="text-amber-400 font-bold">
+                {activeRoom.roomCode}
+              </div>
+              <div className="text-emerald-400">{pingMs} ms</div>
+            </div>
+          )}
         </div>
 
         {/* Top-Center Várzea Match Scoreboard */}
@@ -243,7 +346,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
           </div>
         </div>
 
-        {/* Top-Right Compact Utility Buttons (Camera, Touch Toggle, Mute, Restart, Pause) */}
+        {/* Top-Right Compact Utility Buttons (Camera, Fullscreen Exit/Toggle, Mute, Restart, Pause, Menu) */}
         <div className="pointer-events-auto flex items-center gap-1 sm:gap-1.5 shrink-0">
           <button
             type="button"
@@ -251,35 +354,49 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             onClick={cycleCameraMode}
             title="Alternar Câmera"
             aria-label={`Alternar Câmera (${CAMERA_MODE_LABELS[settings.cameraMode]})`}
-            className="hidden md:flex items-center gap-1.5 px-3 h-10 bg-stone-950/90 hover:bg-stone-800 text-stone-200 border border-stone-800 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
+            className="hidden lg:flex items-center gap-1.5 px-3 h-10 bg-stone-950/90 hover:bg-stone-800 text-stone-200 border border-stone-800 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
           >
-            <svg viewBox="0 0 24 24" className="w-4 h-4 fill-none stroke-amber-400 stroke-2">
+            <svg
+              viewBox="0 0 24 24"
+              className="w-4 h-4 fill-none stroke-amber-400 stroke-2"
+            >
               <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
               <circle cx="12" cy="13" r="4" />
             </svg>
             <span>{CAMERA_MODE_LABELS[settings.cameraMode]}</span>
           </button>
 
-          <button
-            type="button"
-            tabIndex={-1}
-            onClick={(e) => {
-              e.currentTarget.blur();
-              setShowTouchControls((prev) => !prev);
-            }}
-            aria-label="Alternar Controles de Toque"
-            title="Controles de Celular na Tela"
-            className={`hidden sm:flex w-10 h-10 items-center justify-center rounded-xl border transition-colors cursor-pointer ${
-              showTouchControls
-                ? 'bg-amber-500/20 border-amber-500 text-amber-300'
-                : 'bg-stone-950/90 hover:bg-stone-800 border-stone-800 text-stone-300'
-            }`}
-          >
-            <svg viewBox="0 0 24 24" className="w-5 h-5 fill-none stroke-current stroke-2">
-              <rect x="2" y="6" width="20" height="12" rx="3" />
-              <path d="M6 12h4M8 10v4M15 11h.01M18 13h.01" />
-            </svg>
-          </button>
+          {isFullscreen ? (
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onExitFullscreen();
+              }}
+              title="Sair da Tela Cheia"
+              aria-label="Sair da Tela Cheia"
+              className="px-2.5 h-9 sm:h-10 flex items-center justify-center bg-stone-950/90 hover:bg-stone-800 text-amber-300 border border-stone-800 rounded-xl text-[11px] font-bold transition-colors cursor-pointer"
+            >
+              Sair Tela Cheia
+            </button>
+          ) : (
+            isMobileDevice && (
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.currentTarget.blur();
+                  onRequestFullscreenLandscape();
+                }}
+                title="Tela Cheia"
+                aria-label="Entrar em Tela Cheia"
+                className="px-2.5 h-9 flex items-center justify-center bg-amber-500/90 text-stone-950 rounded-xl text-[10px] font-extrabold cursor-pointer"
+              >
+                Tela Cheia
+              </button>
+            )
+          )}
 
           <button
             type="button"
@@ -288,16 +405,24 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               e.currentTarget.blur();
               onUpdateSettings({ soundEnabled: !settings.soundEnabled });
             }}
-            aria-label={settings.soundEnabled ? 'Silenciar Áudio' : 'Ativar Áudio'}
+            aria-label={
+              settings.soundEnabled ? 'Silenciar Áudio' : 'Ativar Áudio'
+            }
             className="w-9 h-9 sm:w-10 sm:h-10 flex items-center justify-center bg-stone-950/90 hover:bg-stone-800 text-stone-200 border border-stone-800 rounded-xl transition-colors cursor-pointer"
           >
             {settings.soundEnabled ? (
-              <svg viewBox="0 0 24 24" className="w-4 h-4 sm:w-5 sm:h-5 fill-none stroke-current stroke-2">
+              <svg
+                viewBox="0 0 24 24"
+                className="w-4 h-4 sm:w-5 sm:h-5 fill-none stroke-current stroke-2"
+              >
                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                 <path d="M15.54 8.46a5 5 0 0 1 0 7.07M19.07 4.93a10 10 0 0 1 0 14.14" />
               </svg>
             ) : (
-              <svg viewBox="0 0 24 24" className="w-4 h-4 sm:w-5 sm:h-5 fill-none stroke-red-400 stroke-2">
+              <svg
+                viewBox="0 0 24 24"
+                className="w-4 h-4 sm:w-5 sm:h-5 fill-none stroke-red-400 stroke-2"
+              >
                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                 <line x1="23" y1="9" x2="17" y2="15" />
                 <line x1="17" y1="9" x2="23" y2="15" />
@@ -315,7 +440,10 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             aria-label="Reiniciar Partida"
             className="hidden sm:flex w-10 h-10 items-center justify-center bg-stone-950/90 hover:bg-stone-800 text-stone-200 border border-stone-800 rounded-xl transition-colors cursor-pointer"
           >
-            <svg viewBox="0 0 24 24" className="w-5 h-5 fill-none stroke-current stroke-2">
+            <svg
+              viewBox="0 0 24 24"
+              className="w-5 h-5 fill-none stroke-current stroke-2"
+            >
               <polyline points="23 4 23 10 17 10" />
               <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
             </svg>
@@ -331,10 +459,27 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             aria-label="Pausar Partida"
             className="w-9 h-9 sm:w-10 sm:h-10 flex items-center justify-center bg-stone-950/90 hover:bg-stone-800 text-amber-400 border border-stone-800 rounded-xl transition-colors cursor-pointer"
           >
-            <svg viewBox="0 0 24 24" className="w-4 h-4 sm:w-5 sm:h-5 fill-none stroke-current stroke-2">
+            <svg
+              viewBox="0 0 24 24"
+              className="w-4 h-4 sm:w-5 sm:h-5 fill-none stroke-current stroke-2"
+            >
               <rect x="6" y="4" width="4" height="16" />
               <rect x="14" y="4" width="4" height="16" />
             </svg>
+          </button>
+
+          <button
+            type="button"
+            tabIndex={-1}
+            onClick={(e) => {
+              e.currentTarget.blur();
+              onBackToMenu();
+            }}
+            title="Voltar ao Menu Principal"
+            aria-label="Voltar ao Menu Principal"
+            className="px-2.5 h-9 sm:h-10 flex items-center justify-center bg-stone-950/90 hover:bg-stone-800 text-stone-300 border border-stone-800 rounded-xl text-[11px] font-bold transition-colors cursor-pointer"
+          >
+            Menu
           </button>
         </div>
       </div>
@@ -355,10 +500,13 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
         />
       </div>
 
-      {/* Bottom Area: Mobile Touch Controls (Left Virtual Joystick + Right 5 Action Buttons) or Desktop Hint */}
-      {showTouchControls ? (
-        <div className="flex items-end justify-between w-full max-w-7xl mx-auto pb-1 pt-2">
-          {/* Left Side: Virtual Joystick */}
+      {/* Bottom Area: Mobile Virtual Controls ONLY on Mobile/Touchscreen Devices; Desktop Hint on PC */}
+      {isMobileDevice ? (
+        <div
+          data-testid="mobile-virtual-controls"
+          className="flex items-end justify-between w-full max-w-7xl mx-auto pb-1 pt-2"
+        >
+          {/* Left Side: 360-Degree Virtual Joystick (Walk & Run) */}
           <div
             ref={joystickBaseRef}
             onPointerDown={(e) => {
@@ -373,8 +521,8 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             }}
             onPointerUp={resetJoystick}
             onPointerCancel={resetJoystick}
-            aria-label="Joystick Virtual de Movimentação"
-            className="pointer-events-auto relative w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-stone-950/65 border-2 border-stone-500/45 flex items-center justify-center touch-none shadow-xl"
+            aria-label="Joystick Virtual 360 Graus"
+            className="pointer-events-auto relative w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-stone-950/55 border-2 border-stone-400/45 flex items-center justify-center touch-none shadow-xl"
           >
             <div
               ref={joystickKnobRef}
@@ -382,24 +530,29 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             />
           </div>
 
-          {/* Right Side: 5 Ergonomic Semi-Transparent Action Buttons (Chute, Passe, Corrida, Carrinho, Trocar) */}
-          <div className="pointer-events-auto grid grid-cols-3 gap-2 sm:gap-3 items-end touch-none">
+          {/* Right Side: 5 Ergonomic Semi-Transparent Action Buttons (CHUTAR, PASSE, CORRER, CARRINHO, TROCAR JOGADOR) */}
+          <div className="pointer-events-auto grid grid-cols-3 gap-2 sm:gap-2.5 items-end touch-none">
             <button
               type="button"
-              onClick={() => inputManager.triggerTouchAction('switch')}
-              className="w-15 h-15 sm:w-18 sm:h-18 rounded-full bg-stone-900/75 active:bg-stone-700 border-2 border-stone-400/50 text-stone-100 font-bold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              onPointerDown={() => {
+                audioEngine.triggerVibration(15);
+                inputManager.triggerTouchAction('switch');
+              }}
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-stone-900/65 active:bg-stone-700 border-2 border-stone-400/50 text-stone-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg leading-tight px-1"
             >
               <span>TROCAR</span>
-              <span className="text-[9px] text-stone-400">Q</span>
+              <span className="text-[9px] text-amber-300">JOGADOR</span>
             </button>
 
             <button
               type="button"
-              onClick={() => inputManager.triggerTouchAction('tackle')}
-              className="w-15 h-15 sm:w-18 sm:h-18 rounded-full bg-orange-950/80 active:bg-orange-800 border-2 border-orange-400/60 text-orange-200 font-bold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              onPointerDown={() => {
+                audioEngine.triggerVibration(25);
+                inputManager.triggerTouchAction('tackle');
+              }}
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-orange-950/70 active:bg-orange-800 border-2 border-orange-400/60 text-orange-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
             >
               <span>CARRINHO</span>
-              <span className="text-[9px] text-orange-300">F</span>
             </button>
 
             <button
@@ -413,39 +566,47 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               onPointerCancel={() => {
                 inputManager.touchSprintHeld = false;
               }}
-              className="w-15 h-15 sm:w-18 sm:h-18 rounded-full bg-emerald-950/80 active:bg-emerald-700 border-2 border-emerald-400/60 text-emerald-200 font-bold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-emerald-950/70 active:bg-emerald-700 border-2 border-emerald-400/60 text-emerald-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
             >
-              <span>CORRIDA</span>
-              <span className="text-[9px] text-emerald-300">SHIFT</span>
+              <span>CORRER</span>
             </button>
 
             <button
               type="button"
-              onClick={() => inputManager.triggerTouchAction('pass')}
-              className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-sky-950/85 active:bg-sky-700 border-2 border-sky-400/70 text-sky-100 font-extrabold text-xs sm:text-sm flex flex-col items-center justify-center shadow-xl"
+              onPointerDown={() => {
+                audioEngine.triggerVibration(18);
+                inputManager.triggerTouchAction('pass');
+              }}
+              className="w-16 h-16 sm:w-20 sm:h-18 rounded-2xl bg-sky-950/75 active:bg-sky-700 border-2 border-sky-400/70 text-sky-100 font-extrabold text-xs sm:text-sm flex flex-col items-center justify-center shadow-xl"
             >
               <span>PASSE</span>
-              <span className="text-[9px] text-sky-300">E</span>
             </button>
 
             <button
               type="button"
-              onPointerDown={() => inputManager.setTouchKickHold(true)}
+              onPointerDown={() => {
+                audioEngine.triggerVibration(30);
+                inputManager.setTouchKickHold(true);
+              }}
               onPointerUp={() => inputManager.setTouchKickHold(false)}
               onPointerCancel={() => inputManager.setTouchKickHold(false)}
-              className="col-span-2 h-16 sm:h-20 rounded-2xl bg-amber-500/85 active:bg-amber-400 border-2 border-amber-200 text-stone-950 font-extrabold text-sm sm:text-base tracking-wide flex flex-col items-center justify-center shadow-xl px-2"
+              className="col-span-2 h-16 sm:h-18 rounded-2xl bg-amber-500/80 active:bg-amber-400 border-2 border-amber-200 text-stone-950 font-extrabold text-sm sm:text-base tracking-wide flex flex-col items-center justify-center shadow-xl px-2"
             >
               <span>CHUTAR</span>
               <span className="text-[9px] sm:text-[10px] font-bold text-stone-900">
-                SEGURE P/ FORTE
+                SEGURE P/ CHUTE FORTE
               </span>
             </button>
           </div>
         </div>
       ) : (
-        <div className="hidden md:flex items-center justify-center w-full">
+        <div
+          data-testid="desktop-controls-hint"
+          className="hidden md:flex items-center justify-center w-full"
+        >
           <div className="bg-stone-950/80 border border-stone-800/80 rounded-lg px-4 py-1.5 text-xs text-stone-300">
-            WASD Mover · Shift Correr · Espaço Chutar (Segure p/ Forte) · E Passe · R Lançamento · F Carrinho · Q Trocar
+            WASD Mover · Shift Correr · Espaço Chutar (Segure p/ Forte) · E
+            Passe · R Lançamento · F Carrinho · Q Trocar Jogador
           </div>
         </div>
       )}

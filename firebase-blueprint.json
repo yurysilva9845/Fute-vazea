@@ -1,0 +1,317 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Public gamer profile for Várzea Raiz 4x4 online lobby and friends system (strictly zero PII).",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the player."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32,
+          "description": "Public display nickname in the game."
+        },
+        "tagCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 12,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique friend search code (e.g., VZR-1234)."
+        },
+        "favoritePlayer": {
+          "type": "string",
+          "enum": ["Yuri", "Josué", "Careca", "Bode", "Primo", "Bicudo", "Ismael", "Felipe"],
+          "description": "Preferred 3D character on the pitch."
+        },
+        "wins": {
+          "type": "number",
+          "description": "Total match victories."
+        },
+        "losses": {
+          "type": "number",
+          "description": "Total match defeats."
+        },
+        "draws": {
+          "type": "number",
+          "description": "Total match draws."
+        },
+        "goalsScored": {
+          "type": "number",
+          "description": "Total goals scored."
+        },
+        "onlineStatus": {
+          "type": "string",
+          "enum": ["online", "in_lobby", "in_match", "offline"],
+          "description": "Current presence status."
+        },
+        "currentRoomCode": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "Active multiplayer room code if in a room."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last profile update."
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "tagCode",
+        "favoritePlayer",
+        "wins",
+        "losses",
+        "draws",
+        "goalsScored",
+        "onlineStatus",
+        "currentRoomCode",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MultiplayerRoom": {
+      "title": "MultiplayerRoom",
+      "description": "Real-time 4v4 multiplayer match room and authoritative state.",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 12,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique room code."
+        },
+        "hostUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the current match authority / room host."
+        },
+        "hostName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Display name of the host."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["waiting", "playing", "finished"],
+          "description": "Lifecycle status of the room."
+        },
+        "homeTeamName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Name of Team 1."
+        },
+        "awayTeamName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Name of Team 2."
+        },
+        "homeGoals": {
+          "type": "number",
+          "description": "Score for Team 1."
+        },
+        "awayGoals": {
+          "type": "number",
+          "description": "Score for Team 2."
+        },
+        "half": {
+          "type": "number",
+          "enum": [1, 2],
+          "description": "Current match half."
+        },
+        "remainingSeconds": {
+          "type": "number",
+          "description": "Remaining clock seconds in current half."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of room creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last room update."
+        }
+      },
+      "required": [
+        "roomCode",
+        "hostUid",
+        "hostName",
+        "status",
+        "homeTeamName",
+        "awayTeamName",
+        "homeGoals",
+        "awayGoals",
+        "half",
+        "remainingSeconds",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "FriendRequest": {
+      "title": "FriendRequest",
+      "description": "Friend request and room invitation between two players.",
+      "type": "object",
+      "properties": {
+        "fromUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Sender UID."
+        },
+        "fromName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Sender display name."
+        },
+        "fromTag": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 12,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Sender tag code."
+        },
+        "toUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Recipient UID."
+        },
+        "toName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Recipient display name."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "declined"],
+          "description": "Friendship status."
+        },
+        "inviteRoomCode": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "Optional active room code invitation."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "fromUid",
+        "fromName",
+        "fromTag",
+        "toUid",
+        "toName",
+        "status",
+        "inviteRoomCode",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MatchRecord": {
+      "title": "MatchRecord",
+      "description": "Historical record of a completed 4v4 match.",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 12,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Room code of the match."
+        },
+        "recordedByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the user recording the match."
+        },
+        "homeTeamName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Team 1 name."
+        },
+        "awayTeamName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Team 2 name."
+        },
+        "homeGoals": {
+          "type": "number",
+          "description": "Team 1 final goals."
+        },
+        "awayGoals": {
+          "type": "number",
+          "description": "Team 2 final goals."
+        },
+        "mvpPlayer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Featured scorer or MVP character."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of match completion."
+        }
+      },
+      "required": [
+        "roomCode",
+        "recordedByUid",
+        "homeTeamName",
+        "awayTeamName",
+        "homeGoals",
+        "awayGoals",
+        "mvpPlayer",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Public gamer profiles for lobby presence and friend search."
+    },
+    "/rooms/{roomId}": {
+      "schema": { "$ref": "#/entities/MultiplayerRoom" },
+      "description": "Multiplayer match rooms and real-time room state."
+    },
+    "/friendRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/FriendRequest" },
+      "description": "Friend invitations and room invites between two users."
+    },
+    "/matchHistory/{matchId}": {
+      "schema": { "$ref": "#/entities/MatchRecord" },
+      "description": "Completed match history records."
+    }
+  }
+}
