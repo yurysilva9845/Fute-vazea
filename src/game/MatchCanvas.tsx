@@ -1,0 +1,1270 @@
+import React, { useEffect, useRef } from 'react';
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import {
+  BallState,
+  GameScreenState,
+  GameSettings,
+  MatchPhase,
+  MatchStats,
+  PlayerCustomization,
+  PlayerRuntimeState,
+  TeamConfig,
+} from '../types/game';
+import {
+  DEFAULT_PITCH,
+  formatMatchTime,
+  getMudSpeedMultiplier,
+  getPuddleAt,
+  getTerrainHeightAt,
+  resolvePlayerBallInteraction,
+  stepBallPhysics,
+} from './rules';
+import { buildVarzeaEnvironment } from './environment';
+import {
+  buildHumanPlayerRig,
+  HumanRig,
+  updateHumanPlayerAnimation,
+} from './playerModel';
+import { createSoccerBallTexture } from './textures';
+import { computeAIDecision, findBestSwitchTeammate } from './ai';
+import { VarzeaCameraRig } from './camera';
+import { VarzeaInputManager } from './controls';
+import { audioEngine } from './audio';
+
+export interface LiveHUDUpdate {
+  controlledPlayerName: string;
+  controlledPlayerRole: string;
+  stamina: number;
+  kickCharge: number;
+  isChargingKick: boolean;
+  bannerMessage: string | null;
+  bannerSubtext: string | null;
+}
+
+interface MatchCanvasProps {
+  screenState: GameScreenState;
+  homeTeam: TeamConfig;
+  awayTeam: TeamConfig;
+  homePlayersConfig: PlayerCustomization[];
+  awayPlayersConfig: PlayerCustomization[];
+  settings: GameSettings;
+  inputManager: VarzeaInputManager;
+  restartSignal: number;
+  onScoreAndClockUpdate: (
+    homeGoals: number,
+    awayGoals: number,
+    half: 1 | 2,
+    remainingSeconds: number,
+    phase: MatchPhase
+  ) => void;
+  onHUDRefUpdate: (hud: LiveHUDUpdate) => void;
+  onMatchFinished: (stats: MatchStats) => void;
+  onTogglePause: () => void;
+}
+
+interface FormationSlot {
+  x: number;
+  z: number;
+}
+
+const HOME_FORMATION: FormationSlot[] = [
+  { x: -3.2, z: -1.5 }, // Yuri (Pivô / Atacante)
+  { x: -5.8, z: 4.2 },  // Josué (Ala)
+  { x: -9.5, z: -0.8 }, // Careca (Fixo / Defensor)
+  { x: -15.6, z: 0.0 }, // Bode (Goleiro)
+];
+
+const AWAY_FORMATION: FormationSlot[] = [
+  { x: 3.2, z: 1.5 },   // Alemão (Pivô)
+  { x: 5.8, z: -4.2 },  // Neguinho (Ala)
+  { x: 9.5, z: 0.8 },   // Ceará (Fixo)
+  { x: 15.6, z: 0.0 },  // Muralha (Goleiro)
+];
+
+export const MatchCanvas: React.FC<MatchCanvasProps> = ({
+  screenState,
+  homeTeam,
+  awayTeam,
+  homePlayersConfig,
+  awayPlayersConfig,
+  settings,
+  inputManager,
+  restartSignal,
+  onScoreAndClockUpdate,
+  onHUDRefUpdate,
+  onMatchFinished,
+  onTogglePause,
+}) => {
+  const canvasMountRef = useRef<HTMLDivElement | null>(null);
+  const labelRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+  // Store latest React props in ref so WebGL loop never tears down
+  const propsRef = useRef({
+    screenState,
+    homeTeam,
+    awayTeam,
+    homePlayersConfig,
+    awayPlayersConfig,
+    settings,
+    onScoreAndClockUpdate,
+    onHUDRefUpdate,
+    onMatchFinished,
+    onTogglePause,
+  });
+
+  useEffect(() => {
+    propsRef.current = {
+      screenState,
+      homeTeam,
+      awayTeam,
+      homePlayersConfig,
+      awayPlayersConfig,
+      settings,
+      onScoreAndClockUpdate,
+      onHUDRefUpdate,
+      onMatchFinished,
+      onTogglePause,
+    };
+  }, [
+    screenState,
+    homeTeam,
+    awayTeam,
+    homePlayersConfig,
+    awayPlayersConfig,
+    settings,
+    onScoreAndClockUpdate,
+    onHUDRefUpdate,
+    onMatchFinished,
+    onTogglePause,
+  ]);
+
+  const rebuildRigsSignalRef = useRef(0);
+  useEffect(() => {
+    rebuildRigsSignalRef.current += 1;
+  }, [homePlayersConfig, awayPlayersConfig, homeTeam, awayTeam]);
+
+  const restartSignalRef = useRef(restartSignal);
+  useEffect(() => {
+    restartSignalRef.current = restartSignal;
+  }, [restartSignal]);
+
+  useEffect(() => {
+    const container = canvasMountRef.current;
+    if (!container) return;
+
+    // 1. Software-WebGL detection per Three.js skill
+    const isSoftwareGl = (() => {
+      const gl = document.createElement('canvas').getContext('webgl2');
+      if (!gl) return true;
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+      const gpu = String(gl.getParameter(param));
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    })();
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: !isSoftwareGl,
+      powerPreference: 'high-performance',
+    });
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.08;
+    renderer.setPixelRatio(
+      isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2)
+    );
+    renderer.shadowMap.enabled = !isSoftwareGl;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.setSize(container.clientWidth || window.innerWidth, container.clientHeight || window.innerHeight);
+
+    container.innerHTML = '';
+    container.appendChild(renderer.domElement);
+
+    // 2. Scene, Partly Cloudy Rural Brazilian Sky & Studio IBL Environment
+    const scene = new THREE.Scene();
+    const skyHorizonColor = new THREE.Color(0xc2ced9); // Overcast/partly cloudy sky from photo
+    scene.background = skyHorizonColor;
+    scene.fog = new THREE.FogExp2(0xc2ced9, 0.011);
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmremGenerator.fromScene(
+      new RoomEnvironment(),
+      0.04
+    ).texture;
+    pmremGenerator.dispose();
+
+    const camera = new THREE.PerspectiveCamera(
+      48,
+      (container.clientWidth || window.innerWidth) /
+        (container.clientHeight || window.innerHeight),
+      0.2,
+      140
+    );
+
+    // 3. Warm/Cool Color-Temperature Lighting Rig
+    const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x8c6d53, 0.85);
+    hemiLight.position.set(0, 40, 0);
+    scene.add(hemiLight);
+
+    const sunLight = new THREE.DirectionalLight(0xfff4e0, 1.45);
+    sunLight.position.set(16, 28, 14);
+    sunLight.castShadow = !isSoftwareGl;
+    if (!isSoftwareGl) {
+      sunLight.shadow.mapSize.width = 1024;
+      sunLight.shadow.mapSize.height = 1024;
+      const d = 22;
+      sunLight.shadow.camera.left = -d;
+      sunLight.shadow.camera.right = d;
+      sunLight.shadow.camera.top = d;
+      sunLight.shadow.camera.bottom = -d;
+      sunLight.shadow.camera.near = 2;
+      sunLight.shadow.camera.far = 65;
+      sunLight.shadow.bias = -0.0005;
+      sunLight.shadow.normalBias = 0.02;
+    }
+    scene.add(sunLight);
+
+    // 4. Build Várzea Dirt Field, Puddles, Brick Walls, Fences, Trees, Flip-Flops & Spectator
+    const world = buildVarzeaEnvironment(renderer, isSoftwareGl);
+    scene.add(world.sceneGroup);
+
+    // 5. Build 3D Soccer Ball + Ground Shadow
+    const ballRadius = 0.22;
+    const ballTex = createSoccerBallTexture();
+    const ballMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(ballRadius, 20, 16),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        map: ballTex,
+        roughness: 0.55,
+        metalness: 0.05,
+      })
+    );
+    ballMesh.castShadow = !isSoftwareGl;
+    scene.add(ballMesh);
+
+    const ballShadow = new THREE.Mesh(
+      new THREE.CircleGeometry(0.28, 16).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({
+        color: 0x1a120b,
+        transparent: true,
+        opacity: 0.48,
+        depthWrite: false,
+      })
+    );
+    scene.add(ballShadow);
+
+    // 6. Initialize Players (4 Home: Yuri, Josué, Careca, Bode + 4 Away)
+    const playersGroup = new THREE.Group();
+    scene.add(playersGroup);
+
+    let playersState: PlayerRuntimeState[] = [];
+    const playerRigs = new Map<string, HumanRig>();
+    let controlledPlayerId = 'home_1'; // Yuri starts selected
+
+    const createPlayersFromConfig = () => {
+      // Clear previous rigs
+      playersGroup.clear();
+      playerRigs.clear();
+
+      const { homePlayersConfig: hCfg, awayPlayersConfig: aCfg } = propsRef.current;
+      const nextPlayers: PlayerRuntimeState[] = [];
+
+      hCfg.forEach((cfg, idx) => {
+        const slot = HOME_FORMATION[idx] || { x: -4 - idx * 2, z: 0 };
+        const pState: PlayerRuntimeState = {
+          id: cfg.id,
+          team: 'home',
+          config: cfg,
+          x: slot.x,
+          y: getTerrainHeightAt(slot.x, slot.z),
+          z: slot.z,
+          vx: 0,
+          vz: 0,
+          facingAngle: Math.PI / 2, // facing +X
+          animState: 'idle',
+          animTimer: 0,
+          stridePhase: idx * 1.1,
+          stamina: 100,
+          isSprinting: false,
+          tackleCooldown: 0,
+          stunTimer: 0,
+          homeX: slot.x,
+          homeZ: slot.z,
+          hasBall: false,
+          inMud: false,
+          inPuddle: false,
+        };
+        nextPlayers.push(pState);
+        const rig = buildHumanPlayerRig(cfg, cfg.id === controlledPlayerId);
+        rig.root.position.set(pState.x, pState.y, pState.z);
+        rig.root.rotation.y = pState.facingAngle;
+        playersGroup.add(rig.root);
+        playerRigs.set(cfg.id, rig);
+      });
+
+      aCfg.forEach((cfg, idx) => {
+        const slot = AWAY_FORMATION[idx] || { x: 4 + idx * 2, z: 0 };
+        const pState: PlayerRuntimeState = {
+          id: cfg.id,
+          team: 'away',
+          config: cfg,
+          x: slot.x,
+          y: getTerrainHeightAt(slot.x, slot.z),
+          z: slot.z,
+          vx: 0,
+          vz: 0,
+          facingAngle: -Math.PI / 2, // facing -X
+          animState: 'idle',
+          animTimer: 0,
+          stridePhase: idx * 1.3,
+          stamina: 100,
+          isSprinting: false,
+          tackleCooldown: 0,
+          stunTimer: 0,
+          homeX: slot.x,
+          homeZ: slot.z,
+          hasBall: false,
+          inMud: false,
+          inPuddle: false,
+        };
+        nextPlayers.push(pState);
+        const rig = buildHumanPlayerRig(cfg, false);
+        rig.root.position.set(pState.x, pState.y, pState.z);
+        rig.root.rotation.y = pState.facingAngle;
+        playersGroup.add(rig.root);
+        playerRigs.set(cfg.id, rig);
+      });
+
+      playersState = nextPlayers;
+    };
+
+    createPlayersFromConfig();
+
+    const ballState: BallState = {
+      x: 0,
+      y: getTerrainHeightAt(0, 0) + ballRadius,
+      z: 0,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      radius: ballRadius,
+      spinX: 0,
+      spinZ: 0,
+      ownerId: null,
+      lastTouchTeam: null,
+      lastTouchPlayerName: null,
+      inPuddle: false,
+    };
+
+    // Match runtime state
+    let matchPhase: MatchPhase = 'open_play';
+    let phaseTimer = 0;
+    let currentHalf: 1 | 2 = 1;
+    let remainingHalfSeconds = propsRef.current.settings.halfDurationSeconds;
+    let lastReportedSecond = -1;
+    let bannerMessage: string | null = null;
+    let bannerSubtext: string | null = null;
+    let hitstopTimer = 0;
+
+    const stats: MatchStats = {
+      homeGoals: 0,
+      awayGoals: 0,
+      homeShots: 0,
+      awayShots: 0,
+      homePasses: 0,
+      awayPasses: 0,
+      homeTackles: 0,
+      awayTackles: 0,
+      homePossessionFrames: 1,
+      awayPossessionFrames: 1,
+      scorers: [],
+    };
+
+    const resetPositionsToKickoff = () => {
+      ballState.x = 0;
+      ballState.z = 0;
+      ballState.y = getTerrainHeightAt(0, 0) + ballRadius;
+      ballState.vx = 0;
+      ballState.vy = 0;
+      ballState.vz = 0;
+      ballState.ownerId = null;
+
+      playersState.forEach((p, idx) => {
+        const slot =
+          p.team === 'home'
+            ? HOME_FORMATION[idx % 4]
+            : AWAY_FORMATION[idx % 4];
+        p.x = slot.x;
+        p.z = slot.z;
+        p.y = getTerrainHeightAt(p.x, p.z);
+        p.vx = 0;
+        p.vz = 0;
+        p.facingAngle = p.team === 'home' ? Math.PI / 2 : -Math.PI / 2;
+        p.animState = 'idle';
+        p.animTimer = 0;
+        p.stunTimer = 0;
+        p.hasBall = false;
+      });
+      controlledPlayerId = 'home_1'; // Yuri
+    };
+
+    const resetFullMatch = () => {
+      stats.homeGoals = 0;
+      stats.awayGoals = 0;
+      stats.homeShots = 0;
+      stats.awayShots = 0;
+      stats.homePasses = 0;
+      stats.awayPasses = 0;
+      stats.homeTackles = 0;
+      stats.awayTackles = 0;
+      stats.homePossessionFrames = 1;
+      stats.awayPossessionFrames = 1;
+      stats.scorers = [];
+      currentHalf = 1;
+      remainingHalfSeconds = propsRef.current.settings.halfDurationSeconds;
+      matchPhase = 'open_play';
+      phaseTimer = 0;
+      bannerMessage = 'BOLA ROLANDO NO TERREIRÃO!';
+      bannerSubtext = '1º Tempo · Várzea Raiz 4x4';
+      setTimeout(() => {
+        if (bannerMessage === 'BOLA ROLANDO NO TERREIRÃO!') {
+          bannerMessage = null;
+          bannerSubtext = null;
+        }
+      }, 2200);
+      resetPositionsToKickoff();
+      audioEngine.playWhistle('short');
+      propsRef.current.onScoreAndClockUpdate(
+        0,
+        0,
+        1,
+        remainingHalfSeconds,
+        'open_play'
+      );
+    };
+
+    if (!isSoftwareGl) {
+      renderer.compile(scene, camera);
+    }
+
+    const cameraRig = new VarzeaCameraRig();
+    const _projVec = new THREE.Vector3();
+    const _ballVec = new THREE.Vector3();
+
+    let lastHandledRebuild = rebuildRigsSignalRef.current;
+    let lastHandledRestart = restartSignalRef.current;
+    let prevScreenState = propsRef.current.screenState;
+
+    // Resize observer
+    const onResize = () => {
+      if (!container) return;
+      const w = container.clientWidth || window.innerWidth;
+      const h = container.clientHeight || window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+    window.addEventListener('resize', onResize);
+
+    // Helper to execute a pass or shot from a player
+    const executeBallStrike = (
+      player: PlayerRuntimeState,
+      kind: 'pass' | 'long_pass' | 'shoot' | 'header',
+      power: number,
+      aimX?: number,
+      aimZ?: number
+    ) => {
+      const dirX =
+        aimX !== undefined
+          ? aimX - player.x
+          : Math.sin(player.facingAngle);
+      const dirZ =
+        aimZ !== undefined
+          ? aimZ - player.z
+          : Math.cos(player.facingAngle);
+      const len = Math.hypot(dirX, dirZ) || 1;
+      const nx = dirX / len;
+      const nz = dirZ / len;
+
+      player.facingAngle = Math.atan2(nx, nz);
+      player.hasBall = false;
+      ballState.ownerId = null;
+      ballState.lastTouchTeam = player.team;
+      ballState.lastTouchPlayerName = player.config.name;
+
+      // Place ball slightly ahead of kicking foot
+      ballState.x = player.x + nx * 0.65;
+      ballState.z = player.z + nz * 0.65;
+
+      if (kind === 'pass') {
+        const speed = 11.5 * player.config.kickStat;
+        ballState.vx = nx * speed;
+        ballState.vz = nz * speed;
+        ballState.vy = 1.1;
+        player.animState = 'pass';
+        player.animTimer = 0;
+        if (player.team === 'home') stats.homePasses++;
+        else stats.awayPasses++;
+        audioEngine.playKick(0.45);
+        world.particles.spawnBurst(ballState.x, ballState.y, ballState.z, 'dust', 5);
+      } else if (kind === 'long_pass') {
+        const speed = 15.5 * player.config.kickStat;
+        ballState.vx = nx * speed;
+        ballState.vz = nz * speed;
+        ballState.vy = 5.4;
+        player.animState = 'kick';
+        player.animTimer = 0;
+        if (player.team === 'home') stats.homePasses++;
+        else stats.awayPasses++;
+        audioEngine.playKick(0.75);
+        world.particles.spawnBurst(ballState.x, ballState.y, ballState.z, 'dust', 9);
+      } else if (kind === 'header') {
+        const speed = 12.5 * player.config.kickStat;
+        ballState.vx = nx * speed;
+        ballState.vz = nz * speed;
+        ballState.vy = 3.2;
+        player.animState = 'header';
+        player.animTimer = 0;
+        audioEngine.playKick(0.6);
+      } else {
+        // Shoot (weak or strong based on power)
+        const clampedPower = THREE.MathUtils.clamp(power, 0.35, 1.0);
+        const speed = (13.0 + clampedPower * 11.5) * player.config.kickStat;
+        ballState.vx = nx * speed;
+        ballState.vz = nz * speed;
+        ballState.vy = 1.6 + clampedPower * 4.4;
+        player.animState = 'kick';
+        player.animTimer = 0;
+        if (player.team === 'home') stats.homeShots++;
+        else stats.awayShots++;
+
+        audioEngine.playKick(clampedPower);
+        const pKind = player.inPuddle ? 'water' : player.inMud ? 'mud' : 'dust';
+        world.particles.spawnBurst(
+          ballState.x,
+          0.05,
+          ballState.z,
+          pKind,
+          clampedPower > 0.7 ? 14 : 7
+        );
+        if (clampedPower > 0.72) {
+          cameraRig.addTrauma(0.32);
+          hitstopTimer = 0.035;
+        }
+      }
+    };
+
+    // 7. Main Simulation & Render Loop (with Software-WebGL afterDraw guard)
+    let frameId = 0;
+    let lastTimestamp = performance.now();
+    let elapsedTime = 0;
+
+    function afterDraw(cb: () => void) {
+      const gl = renderer.getContext() as WebGL2RenderingContext;
+      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      gl.flush();
+      const poll = () => {
+        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+        if (state === gl.UNSIGNALED) {
+          frameId = window.setTimeout(poll, 5);
+        } else {
+          if (sync) gl.deleteSync(sync);
+          frameId = window.setTimeout(cb, 80);
+        }
+      };
+      frameId = window.setTimeout(poll, 5);
+    }
+
+    function tick() {
+      const now = performance.now();
+      const rawDt = (now - lastTimestamp) / 1000;
+      lastTimestamp = now;
+      const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
+      elapsedTime += dt;
+
+      const currentProps = propsRef.current;
+
+      // Check if player customization or team uniform changed
+      if (rebuildRigsSignalRef.current !== lastHandledRebuild) {
+        lastHandledRebuild = rebuildRigsSignalRef.current;
+        createPlayersFromConfig();
+      }
+
+      // Check if explicit match restart requested
+      if (restartSignalRef.current !== lastHandledRestart) {
+        lastHandledRestart = restartSignalRef.current;
+        resetFullMatch();
+      }
+
+      // Transition from title -> playing resets camera offsets and plays whistle
+      if (prevScreenState === 'title' && currentProps.screenState === 'playing') {
+        cameraRig.resetOffsets();
+        resetFullMatch();
+      }
+      prevScreenState = currentProps.screenState;
+
+      const input = inputManager.sampleFrame(dt);
+
+      if (
+        input.pauseJustPressed &&
+        (currentProps.screenState === 'playing' ||
+          currentProps.screenState === 'paused')
+      ) {
+        currentProps.onTogglePause();
+      }
+
+      cameraRig.mouseYawOffset = THREE.MathUtils.clamp(
+        cameraRig.mouseYawOffset - input.mouseDeltaX,
+        -0.8,
+        0.8
+      );
+      cameraRig.mousePitchOffset = THREE.MathUtils.clamp(
+        cameraRig.mousePitchOffset + input.mouseDeltaY,
+        -0.5,
+        0.7
+      );
+
+      // Advance simulation when in 'playing' or ambient 'title' preview
+      const isSimulating =
+        currentProps.screenState === 'playing' ||
+        currentProps.screenState === 'title';
+
+      if (hitstopTimer > 0) {
+        hitstopTimer = Math.max(0, hitstopTimer - dt);
+      } else if (isSimulating) {
+        // Match Clock in 'playing'
+        if (
+          currentProps.screenState === 'playing' &&
+          matchPhase === 'open_play'
+        ) {
+          // Accelerate match clock so a "5 minute" half ticks smoothly (3x game time feel or real seconds)
+          remainingHalfSeconds = Math.max(0, remainingHalfSeconds - dt);
+          const secInt = Math.ceil(remainingHalfSeconds);
+          if (secInt !== lastReportedSecond) {
+            lastReportedSecond = secInt;
+            currentProps.onScoreAndClockUpdate(
+              stats.homeGoals,
+              stats.awayGoals,
+              currentHalf,
+              secInt,
+              matchPhase
+            );
+          }
+
+          if (remainingHalfSeconds <= 0) {
+            if (currentHalf === 1) {
+              matchPhase = 'halftime';
+              phaseTimer = 2.6;
+              audioEngine.playWhistle('fulltime');
+              bannerMessage = 'FIM DO 1º TEMPO!';
+              bannerSubtext = 'Virando de lado no campinho de terra...';
+            } else {
+              matchPhase = 'fulltime';
+              audioEngine.playWhistle('fulltime');
+              currentProps.onMatchFinished({ ...stats });
+            }
+          }
+        }
+
+        // Phase transitions (Goal Celebration, Throw-in, Halftime)
+        if (matchPhase === 'goal_celebration') {
+          phaseTimer -= dt;
+          if (phaseTimer <= 0) {
+            matchPhase = 'open_play';
+            bannerMessage = null;
+            bannerSubtext = null;
+            resetPositionsToKickoff();
+            audioEngine.playWhistle('short');
+          }
+        } else if (matchPhase === 'throw_in') {
+          phaseTimer -= dt;
+          if (phaseTimer <= 0) {
+            matchPhase = 'open_play';
+            bannerMessage = null;
+            bannerSubtext = null;
+          }
+        } else if (matchPhase === 'halftime') {
+          phaseTimer -= dt;
+          if (phaseTimer <= 0) {
+            currentHalf = 2;
+            remainingHalfSeconds = currentProps.settings.halfDurationSeconds;
+            matchPhase = 'open_play';
+            bannerMessage = 'COMEÇA O 2º TEMPO!';
+            bannerSubtext = 'Agora vale tudo na várzea!';
+            resetPositionsToKickoff();
+            audioEngine.playWhistle('short');
+            setTimeout(() => {
+              if (bannerMessage === 'COMEÇA O 2º TEMPO!') {
+                bannerMessage = null;
+                bannerSubtext = null;
+              }
+            }, 2000);
+          }
+        }
+
+        // Switch active player with Q
+        if (
+          currentProps.screenState === 'playing' &&
+          input.switchJustPressed
+        ) {
+          controlledPlayerId = findBestSwitchTeammate(
+            controlledPlayerId,
+            ballState,
+            playersState
+          );
+        }
+
+        // Auto-switch to teammate if a teammate gains possession of the ball
+        if (
+          currentProps.screenState === 'playing' &&
+          ballState.ownerId &&
+          ballState.ownerId.startsWith('home_') &&
+          ballState.ownerId !== controlledPlayerId
+        ) {
+          controlledPlayerId = ballState.ownerId;
+        }
+
+        // Update all 8 players
+        for (let i = 0; i < playersState.length; i++) {
+          const p = playersState[i];
+          const isUserControlled =
+            currentProps.screenState === 'playing' &&
+            p.id === controlledPlayerId;
+
+          if (p.tackleCooldown > 0) p.tackleCooldown = Math.max(0, p.tackleCooldown - dt);
+          if (p.stunTimer > 0) {
+            p.stunTimer = Math.max(0, p.stunTimer - dt);
+            p.animState = 'fall';
+            p.animTimer += dt;
+            p.vx *= 0.85;
+            p.vz *= 0.85;
+          }
+
+          // Check terrain mud & puddle modifiers
+          const mudInfo = getMudSpeedMultiplier(p.x, p.z);
+          p.inMud = mudInfo.inMud;
+          p.inPuddle = mudInfo.inPuddle;
+
+          if (matchPhase === 'goal_celebration') {
+            p.vx = 0;
+            p.vz = 0;
+            p.animState = 'celebrate';
+          } else if (p.stunTimer <= 0) {
+            let moveX = 0;
+            let moveZ = 0;
+            let wantSprint = false;
+
+            if (isUserControlled) {
+              moveX = input.moveX;
+              moveZ = input.moveZ;
+              wantSprint = input.sprintHeld && p.stamina > 8;
+
+              // Slide tackle ("Carrinho / Desarme")
+              if (input.tackleJustPressed && p.tackleCooldown <= 0) {
+                p.tackleCooldown = 1.25;
+                p.animState = 'tackle';
+                p.animTimer = 0;
+                const lungeSpeed = 9.2 * p.config.tackleStat;
+                p.vx = Math.sin(p.facingAngle) * lungeSpeed;
+                p.vz = Math.cos(p.facingAngle) * lungeSpeed;
+                audioEngine.playSlideTackle(p.inPuddle);
+                world.particles.spawnBurst(
+                  p.x,
+                  0.05,
+                  p.z,
+                  p.inPuddle ? 'water' : 'mud',
+                  12
+                );
+              }
+
+              // Header / Lob ("Cabeceio")
+              const distBall = Math.hypot(ballState.x - p.x, ballState.z - p.z);
+              if (input.headerJustPressed && distBall < 1.55) {
+                executeBallStrike(p, 'header', 0.75);
+              }
+
+              // Short Pass (E) or Long Pass (R)
+              if (
+                (input.passJustPressed || input.longPassJustPressed) &&
+                distBall < 1.45
+              ) {
+                // Find teammate in facing direction or closest open teammate
+                const mates = playersState.filter(
+                  (m) => m.team === 'home' && m.id !== p.id
+                );
+                let targetMate = mates[0];
+                let bestScore = -Infinity;
+                const aimDirX = Math.abs(moveX) > 0.1 || Math.abs(moveZ) > 0.1 ? moveX : Math.sin(p.facingAngle);
+                const aimDirZ = Math.abs(moveX) > 0.1 || Math.abs(moveZ) > 0.1 ? moveZ : Math.cos(p.facingAngle);
+                for (const m of mates) {
+                  const dx = m.x - p.x;
+                  const dz = m.z - p.z;
+                  const d = Math.hypot(dx, dz) || 1;
+                  const align = (dx * aimDirX + dz * aimDirZ) / d;
+                  const score = align * 2.0 - d * 0.04;
+                  if (score > bestScore) {
+                    bestScore = score;
+                    targetMate = m;
+                  }
+                }
+                executeBallStrike(
+                  p,
+                  input.longPassJustPressed ? 'long_pass' : 'pass',
+                  0.65,
+                  targetMate ? targetMate.x + 1.2 : undefined,
+                  targetMate ? targetMate.z : undefined
+                );
+              }
+
+              // Shoot (Space released or tapped)
+              if (input.kickJustReleased && distBall < 1.55) {
+                const aimX =
+                  Math.abs(moveX) > 0.15
+                    ? p.x + moveX * 12
+                    : DEFAULT_PITCH.width / 2;
+                const aimZ =
+                  Math.abs(moveZ) > 0.15
+                    ? moveZ * (DEFAULT_PITCH.goalWidth * 0.45)
+                    : (Math.random() - 0.5) * 1.4;
+                executeBallStrike(p, 'shoot', input.kickChargePower, aimX, aimZ);
+              }
+            } else {
+              // AI control for teammates and opponents
+              const ai = computeAIDecision(
+                p,
+                ballState,
+                playersState,
+                currentProps.settings.aiDifficulty
+              );
+              moveX = ai.moveX;
+              moveZ = ai.moveZ;
+              wantSprint = ai.sprint;
+
+              if (ai.action === 'tackle' && p.tackleCooldown <= 0) {
+                p.tackleCooldown = 1.4;
+                p.animState = 'tackle';
+                p.animTimer = 0;
+                p.vx = Math.sin(p.facingAngle) * 8.4;
+                p.vz = Math.cos(p.facingAngle) * 8.4;
+                audioEngine.playSlideTackle(p.inPuddle);
+                world.particles.spawnBurst(p.x, 0.05, p.z, 'mud', 10);
+              } else if (ai.action === 'pass' || ai.action === 'clear') {
+                executeBallStrike(
+                  p,
+                  ai.action === 'clear' ? 'long_pass' : 'pass',
+                  0.7,
+                  ai.targetX,
+                  ai.targetZ
+                );
+              } else if (ai.action === 'shoot') {
+                executeBallStrike(
+                  p,
+                  'shoot',
+                  0.78,
+                  ai.targetX,
+                  ai.targetZ
+                );
+              }
+            }
+
+            // Update active tackle or strike animation timer
+            if (
+              p.animState === 'tackle' ||
+              p.animState === 'kick' ||
+              p.animState === 'pass' ||
+              p.animState === 'header'
+            ) {
+              p.animTimer += dt;
+              const maxDur = p.animState === 'tackle' ? 0.48 : 0.34;
+              if (p.animState === 'tackle') {
+                p.vx *= Math.exp(-3.2 * dt);
+                p.vz *= Math.exp(-3.2 * dt);
+              }
+              if (p.animTimer >= maxDur) {
+                p.animState = 'idle';
+                p.animTimer = 0;
+              }
+            }
+
+            // Apply locomotion velocity when not mid-slide-tackle
+            if (p.animState !== 'tackle') {
+              p.isSprinting = wantSprint && (Math.abs(moveX) > 0.05 || Math.abs(moveZ) > 0.05);
+              if (p.isSprinting) {
+                p.stamina = Math.max(0, p.stamina - 14 * dt);
+              } else {
+                p.stamina = Math.min(100, p.stamina + 11 * dt);
+              }
+
+              const baseSpeed = 5.4 * p.config.speedStat * mudInfo.multiplier;
+              const topSpeed = p.isSprinting ? baseSpeed * 1.34 : baseSpeed;
+
+              const targetVX = moveX * topSpeed;
+              const targetVZ = moveZ * topSpeed;
+              p.vx = THREE.MathUtils.damp(p.vx, targetVX, 10, dt);
+              p.vz = THREE.MathUtils.damp(p.vz, targetVZ, 10, dt);
+
+              const speed = Math.hypot(p.vx, p.vz);
+              if (speed > 0.25) {
+                const targetAngle = Math.atan2(p.vx, p.vz);
+                // Smooth angle interpolation
+                let diff = targetAngle - p.facingAngle;
+                while (diff > Math.PI) diff -= Math.PI * 2;
+                while (diff < -Math.PI) diff += Math.PI * 2;
+                p.facingAngle += diff * Math.min(1, 12 * dt);
+
+                const prevStride = p.stridePhase;
+                p.stridePhase += speed * dt * 2.35;
+
+                // Trigger footstep audio & dust/mud/water particles on stride zero-crossings
+                if (Math.floor(prevStride / Math.PI) !== Math.floor(p.stridePhase / Math.PI)) {
+                  if (isUserControlled || Math.random() < 0.25) {
+                    audioEngine.playFootstep(p.inPuddle, p.inMud);
+                  }
+                  if (p.inPuddle) {
+                    world.particles.spawnBurst(p.x, 0.03, p.z, 'water', 4);
+                  } else if (p.isSprinting) {
+                    world.particles.spawnBurst(
+                      p.x,
+                      0.03,
+                      p.z,
+                      p.inMud ? 'mud' : 'dust',
+                      3
+                    );
+                  }
+                }
+
+                if (p.animState !== 'kick' && p.animState !== 'pass' && p.animState !== 'header') {
+                  p.animState = p.isSprinting ? 'run' : 'walk';
+                }
+              } else if (
+                p.animState !== 'kick' &&
+                p.animState !== 'pass' &&
+                p.animState !== 'header'
+              ) {
+                p.animState = 'idle';
+              }
+            }
+          }
+
+          // Integrate player position and clamp inside outer perimeter
+          p.x = THREE.MathUtils.clamp(
+            p.x + p.vx * dt,
+            -DEFAULT_PITCH.width / 2 - 2.0,
+            DEFAULT_PITCH.width / 2 + 2.0
+          );
+          p.z = THREE.MathUtils.clamp(
+            p.z + p.vz * dt,
+            -DEFAULT_PITCH.depth / 2 - 2.0,
+            DEFAULT_PITCH.depth / 2 + 2.0
+          );
+          p.y = getTerrainHeightAt(p.x, p.z);
+
+          // Ball control & dribble interaction
+          if (matchPhase === 'open_play' && p.animState !== 'kick' && p.animState !== 'pass') {
+            resolvePlayerBallInteraction(p, ballState, playersState);
+          }
+        }
+
+        // Player-to-Player Collisions & Slide Tackle Dispossessions ("Colisões entre jogadores e Desarme")
+        for (let i = 0; i < playersState.length; i++) {
+          for (let j = i + 1; j < playersState.length; j++) {
+            const a = playersState[i];
+            const b = playersState[j];
+            const dx = b.x - a.x;
+            const dz = b.z - a.z;
+            const dist = Math.hypot(dx, dz);
+            const minSep = 0.68;
+
+            if (dist > 0.001 && dist < minSep) {
+              const nx = dx / dist;
+              const nz = dz / dist;
+              const overlap = (minSep - dist) * 0.5;
+              a.x -= nx * overlap;
+              a.z -= nz * overlap;
+              b.x += nx * overlap;
+              b.z += nz * overlap;
+
+              // Check if one player is slide-tackling the other
+              if (a.animState === 'tackle' && b.team !== a.team && b.stunTimer <= 0) {
+                b.stunTimer = 1.05;
+                b.hasBall = false;
+                if (ballState.ownerId === b.id) {
+                  ballState.ownerId = a.id;
+                  ballState.vx = Math.sin(a.facingAngle) * 4.5;
+                  ballState.vz = Math.cos(a.facingAngle) * 4.5;
+                }
+                if (a.team === 'home') stats.homeTackles++;
+                else stats.awayTackles++;
+                cameraRig.addTrauma(0.22);
+              } else if (b.animState === 'tackle' && a.team !== b.team && a.stunTimer <= 0) {
+                a.stunTimer = 1.05;
+                a.hasBall = false;
+                if (ballState.ownerId === a.id) {
+                  ballState.ownerId = b.id;
+                  ballState.vx = Math.sin(b.facingAngle) * 4.5;
+                  ballState.vz = Math.cos(b.facingAngle) * 4.5;
+                }
+                if (b.team === 'home') stats.homeTackles++;
+                else stats.awayTackles++;
+                cameraRig.addTrauma(0.22);
+              }
+            }
+          }
+        }
+
+        // Track possession stats
+        if (ballState.lastTouchTeam === 'home') stats.homePossessionFrames++;
+        else if (ballState.lastTouchTeam === 'away') stats.awayPossessionFrames++;
+
+        // Step Independent Ball Physics
+        if (matchPhase === 'open_play') {
+          const ballEvents = stepBallPhysics(ballState, dt, DEFAULT_PITCH);
+
+          if (ballEvents.bouncedOnDirt) {
+            world.particles.spawnBurst(ballState.x, 0.02, ballState.z, 'dust', 4);
+          }
+          if (ballEvents.splashedInPuddle) {
+            world.particles.spawnBurst(ballState.x, 0.03, ballState.z, 'water', 7);
+          }
+          if (ballEvents.hitGoalpost) {
+            audioEngine.playGoalpostHit();
+            cameraRig.addTrauma(0.28);
+          }
+
+          // Handle Goal Scored
+          if (ballEvents.goalScored && currentProps.screenState === 'playing') {
+            const scoringTeam = ballEvents.goalScored;
+            if (scoringTeam === 'home') {
+              stats.homeGoals++;
+              world.triggerNetRipple('right');
+            } else {
+              stats.awayGoals++;
+              world.triggerNetRipple('left');
+            }
+
+            const scorerName =
+              ballState.lastTouchPlayerName ||
+              (scoringTeam === 'home' ? 'Yuri' : 'Alemão');
+
+            const elapsedInHalf =
+              currentProps.settings.halfDurationSeconds - remainingHalfSeconds;
+            stats.scorers.push({
+              playerName: scorerName,
+              team: scoringTeam,
+              timeFormatted: formatMatchTime(elapsedInHalf),
+              half: currentHalf,
+            });
+
+            matchPhase = 'goal_celebration';
+            phaseTimer = 2.8;
+            bannerMessage = `GOOOOL DO ${
+              scoringTeam === 'home'
+                ? currentProps.homeTeam.name.toUpperCase()
+                : currentProps.awayTeam.name.toUpperCase()
+            }!`;
+            bannerSubtext = `${scorerName} balançou a rede no campinho de terra!`;
+
+            audioEngine.playGoalCelebration();
+            cameraRig.addTrauma(0.45);
+            world.particles.spawnBurst(ballState.x, ballState.y, ballState.z, 'dust', 22);
+
+            currentProps.onScoreAndClockUpdate(
+              stats.homeGoals,
+              stats.awayGoals,
+              currentHalf,
+              Math.ceil(remainingHalfSeconds),
+              matchPhase
+            );
+          } else if (ballEvents.outOfBounds && currentProps.screenState === 'playing') {
+            // Handle Throw-in ("Cobrança de lateral") or Goal Kick / Corner
+            const out = ballEvents.outOfBounds;
+            matchPhase = 'throw_in';
+            phaseTimer = 1.1;
+
+            ballState.x = out.restartX;
+            ballState.z = out.restartZ;
+            ballState.y = getTerrainHeightAt(out.restartX, out.restartZ) + ballRadius;
+            ballState.vx = 0;
+            ballState.vy = 0;
+            ballState.vz = 0;
+            ballState.ownerId = null;
+
+            // Place closest outfield player of the awarded team at the restart spot
+            const teamPlayers = playersState.filter(
+              (p) => p.team === out.awardedTeam && p.config.role !== 'goleiro'
+            );
+            if (teamPlayers.length > 0) {
+              teamPlayers.sort(
+                (a, b) =>
+                  Math.hypot(a.x - out.restartX, a.z - out.restartZ) -
+                  Math.hypot(b.x - out.restartX, b.z - out.restartZ)
+              );
+              const taker = teamPlayers[0];
+              taker.x = out.restartX;
+              taker.z = out.restartZ;
+              taker.vx = 0;
+              taker.vz = 0;
+              taker.facingAngle = Math.atan2(-out.restartX, -out.restartZ);
+              if (out.awardedTeam === 'home') {
+                controlledPlayerId = taker.id;
+              }
+            }
+
+            audioEngine.playWhistle('short');
+            bannerMessage =
+              out.type === 'throw_in'
+                ? 'COBRANÇA DE LATERAL'
+                : out.type === 'corner'
+                ? 'ESCANTEIO NA TERRA'
+                : 'TIRO DE META';
+            bannerSubtext =
+              out.awardedTeam === 'home'
+                ? `Posse: ${currentProps.homeTeam.name}`
+                : `Posse: ${currentProps.awayTeam.name}`;
+          }
+        }
+      }
+
+      // 8. Sync 3D Meshes (Ball, Player Rigs, Environment, Camera, Floating Name Labels)
+      ballMesh.position.set(ballState.x, ballState.y, ballState.z);
+      ballMesh.rotation.z -= (ballState.vx * dt) / ballRadius;
+      ballMesh.rotation.x += (ballState.vz * dt) / ballRadius;
+
+      const groundUnderBall = getTerrainHeightAt(ballState.x, ballState.z);
+      ballShadow.position.set(ballState.x, groundUnderBall + 0.016, ballState.z);
+      const heightAbove = Math.max(0, ballState.y - groundUnderBall - ballRadius);
+      const shadowScale = Math.max(0.4, 1 - heightAbove * 0.22);
+      ballShadow.scale.setScalar(shadowScale);
+
+      _ballVec.set(ballState.x, ballState.y, ballState.z);
+      world.updateEnvironment(dt, _ballVec);
+
+      const controlledPlayer = playersState.find((p) => p.id === controlledPlayerId);
+
+      // Update Camera
+      cameraRig.update(
+        camera,
+        dt,
+        currentProps.screenState,
+        currentProps.settings.cameraMode,
+        currentProps.settings.cameraDistance,
+        ballState,
+        controlledPlayer
+      );
+
+      const cWidth = container?.clientWidth || window.innerWidth;
+      const cHeight = container?.clientHeight || window.innerHeight;
+
+      // Update Player Rigs & Project 3D Floating Names
+      for (let i = 0; i < playersState.length; i++) {
+        const p = playersState[i];
+        const rig = playerRigs.get(p.id);
+        if (rig) {
+          rig.root.position.set(p.x, p.y, p.z);
+          rig.root.rotation.y = p.facingAngle;
+          const speedRatio = Math.min(1.2, Math.hypot(p.vx, p.vz) / 5.5);
+          updateHumanPlayerAnimation(
+            rig,
+            p.animState,
+            p.stridePhase,
+            p.animTimer,
+            speedRatio,
+            currentProps.screenState === 'playing' && p.id === controlledPlayerId,
+            elapsedTime
+          );
+        }
+
+        // Update floating HTML name label above each character via DOM ref (Zero React re-render)
+        const labelEl = labelRefs.current[p.id];
+        if (labelEl) {
+          if (!currentProps.settings.showPlayerNames || currentProps.screenState === 'title') {
+            labelEl.style.opacity = '0';
+          } else {
+            _projVec.set(p.x, p.y + 2.05, p.z);
+            _projVec.project(camera);
+            if (_projVec.z >= -1 && _projVec.z <= 1) {
+              const sx = (_projVec.x * 0.5 + 0.5) * cWidth;
+              const sy = (-_projVec.y * 0.5 + 0.5) * cHeight;
+              labelEl.style.opacity = '1';
+              labelEl.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
+            } else {
+              labelEl.style.opacity = '0';
+            }
+          }
+        }
+      }
+
+      // Update live HUD ref for active player stamina & kick power
+      if (controlledPlayer) {
+        currentProps.onHUDRefUpdate({
+          controlledPlayerName: controlledPlayer.config.name,
+          controlledPlayerRole: controlledPlayer.config.role.toUpperCase(),
+          stamina: controlledPlayer.stamina,
+          kickCharge: input.kickHeld ? input.kickChargePower : 0,
+          isChargingKick: input.kickHeld,
+          bannerMessage,
+          bannerSubtext,
+        });
+      }
+
+      renderer.render(scene, camera);
+
+      if (isSoftwareGl) {
+        afterDraw(tick);
+      } else {
+        frameId = requestAnimationFrame(tick);
+      }
+    }
+
+    tick();
+
+    return () => {
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+      window.removeEventListener('resize', onResize);
+      renderer.dispose();
+    };
+  }, [inputManager]);
+
+  const allConfigs = [
+    ...homePlayersConfig.map((c) => ({ ...c, team: 'home' as const })),
+    ...awayPlayersConfig.map((c) => ({ ...c, team: 'away' as const })),
+  ];
+
+  return (
+    <div className="relative w-full h-full overflow-hidden">
+      {/* Dedicated WebGL Mount Container */}
+      <div
+        ref={canvasMountRef}
+        data-testid="varzea-canvas-container"
+        className="w-full h-full"
+      />
+
+      {/* 3D Projected Player Name Labels (Pointer-events: none) */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden z-10">
+        {allConfigs.map((p) => (
+          <div
+            key={p.id}
+            ref={(el) => {
+              labelRefs.current[p.id] = el;
+            }}
+            style={{ opacity: 0, left: 0, top: 0 }}
+            className="absolute will-change-transform transition-opacity duration-75"
+          >
+            <div
+              className={`px-2 py-0.5 rounded text-xs font-bold tracking-wide whitespace-nowrap shadow-md ${
+                p.team === 'home'
+                  ? 'bg-stone-950/85 text-amber-300 border border-amber-500/40'
+                  : 'bg-stone-950/80 text-stone-200 border border-red-500/40'
+              }`}
+            >
+              {p.name}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
