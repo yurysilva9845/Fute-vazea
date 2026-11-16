@@ -524,6 +524,43 @@ export function stepBallPhysics(
   pitch: PitchDimensions = DEFAULT_PITCH,
   rng: () => number = Math.random
 ): BallStepEvents {
+  const aggregateEvents: BallStepEvents = {
+    bouncedOnDirt: false,
+    splashedInPuddle: false,
+    hitGoalpost: false,
+    goalScored: null,
+    outOfBounds: null,
+  };
+
+  // Sub-step high-velocity ball integration so powerful shots never tunnel through travinhas
+  const speed3D = Math.hypot(ball.vx, ball.vy, ball.vz);
+  const subSteps = speed3D * dt > 0.26 ? Math.min(4, Math.ceil((speed3D * dt) / 0.22)) : 1;
+  const subDt = dt / subSteps;
+
+  for (let step = 0; step < subSteps; step++) {
+    const ev = stepBallPhysicsSingle(ball, subDt, pitch, rng);
+    if (ev.bouncedOnDirt) aggregateEvents.bouncedOnDirt = true;
+    if (ev.splashedInPuddle) aggregateEvents.splashedInPuddle = true;
+    if (ev.hitGoalpost) aggregateEvents.hitGoalpost = true;
+    if (ev.goalScored && !aggregateEvents.goalScored) {
+      aggregateEvents.goalScored = ev.goalScored;
+      break;
+    }
+    if (ev.outOfBounds && !aggregateEvents.outOfBounds) {
+      aggregateEvents.outOfBounds = ev.outOfBounds;
+      break;
+    }
+  }
+
+  return aggregateEvents;
+}
+
+function stepBallPhysicsSingle(
+  ball: BallState,
+  dt: number,
+  pitch: PitchDimensions,
+  rng: () => number
+): BallStepEvents {
   const events: BallStepEvents = {
     bouncedOnDirt: false,
     splashedInPuddle: false,
@@ -558,17 +595,17 @@ export function stepBallPhysics(
         ball.vz *= 0.62;
         events.splashedInPuddle = true;
       } else {
-        const restitution = 0.56;
+        const restitution = 0.54;
         ball.vy = -ball.vy * restitution;
         const speedHoriz = Math.hypot(ball.vx, ball.vz);
         if (speedHoriz > 1.5) {
-          const jitterAngle = (rng() - 0.5) * 0.24;
+          const jitterAngle = (rng() - 0.5) * 0.16;
           const cos = Math.cos(jitterAngle);
           const sin = Math.sin(jitterAngle);
           const nvx = ball.vx * cos - ball.vz * sin;
           const nvz = ball.vx * sin + ball.vz * cos;
-          ball.vx = nvx * 0.88;
-          ball.vz = nvz * 0.88;
+          ball.vx = nvx * 0.9;
+          ball.vz = nvz * 0.9;
         }
         events.bouncedOnDirt = true;
       }
@@ -586,7 +623,7 @@ export function stepBallPhysics(
       }
     } else {
       const mud = getMudSpeedMultiplier(ball.x, ball.z);
-      const frictionRate = mud.inMud ? 2.4 : 1.45;
+      const frictionRate = mud.inMud ? 2.35 : 1.42;
       const damp = Math.exp(-frictionRate * dt);
       ball.vx *= damp;
       ball.vz *= damp;
@@ -604,7 +641,7 @@ export function stepBallPhysics(
 
   const halfW = pitch.width / 2;
   const halfGoalZ = pitch.goalWidth / 2;
-  const postRadius = 0.05;
+  const postRadius = 0.06;
 
   const posts = [
     { x: -halfW, z: -halfGoalZ },
@@ -627,8 +664,8 @@ export function stepBallPhysics(
         ball.z = p.z + nz * minDist;
         const dot = ball.vx * nx + ball.vz * nz;
         if (dot < 0) {
-          ball.vx = (ball.vx - 2 * dot * nx) * 0.75;
-          ball.vz = (ball.vz - 2 * dot * nz) * 0.75;
+          ball.vx = (ball.vx - 2 * dot * nx) * 0.72;
+          ball.vz = (ball.vz - 2 * dot * nz) * 0.72;
           events.hitGoalpost = true;
         }
       }
@@ -640,8 +677,8 @@ export function stepBallPhysics(
     Math.abs(ball.z) <= halfGoalZ &&
     Math.abs(ball.y - pitch.goalHeight) < ball.radius + postRadius
   ) {
-    ball.vy = Math.abs(ball.vy) * 0.7 + 1.5;
-    ball.vx = -ball.vx * 0.7;
+    ball.vy = Math.abs(ball.vy) * 0.65 + 1.2;
+    ball.vx = -ball.vx * 0.68;
     events.hitGoalpost = true;
   }
 
@@ -653,19 +690,19 @@ export function stepBallPhysics(
         ? ball.x >= goalFrontX && ball.x <= goalBackX + 0.5
         : ball.x <= goalFrontX && ball.x >= goalBackX - 0.5;
 
-    if (insideDepth && Math.abs(ball.z) <= halfGoalZ + 0.4 && ball.y <= pitch.goalHeight + 0.2) {
+    if (insideDepth && Math.abs(ball.z) <= halfGoalZ + 0.35 && ball.y <= pitch.goalHeight + 0.2) {
       if (signX > 0 && ball.x + ball.radius > goalBackX) {
         ball.x = goalBackX - ball.radius;
-        ball.vx = -Math.abs(ball.vx) * 0.25;
-        ball.vz *= 0.5;
+        ball.vx = -Math.abs(ball.vx) * 0.22;
+        ball.vz *= 0.45;
       } else if (signX < 0 && ball.x - ball.radius < goalBackX) {
         ball.x = goalBackX + ball.radius;
-        ball.vx = Math.abs(ball.vx) * 0.25;
-        ball.vz *= 0.5;
+        ball.vx = Math.abs(ball.vx) * 0.22;
+        ball.vz *= 0.45;
       }
       if (Math.abs(ball.z) + ball.radius > halfGoalZ) {
         ball.z = Math.sign(ball.z) * (halfGoalZ - ball.radius);
-        ball.vz = -ball.vz * 0.3;
+        ball.vz = -ball.vz * 0.28;
       }
     }
   }
@@ -689,10 +726,16 @@ export function stepBallPhysics(
   return events;
 }
 
+/**
+ * Sistema inteligente de domínio, proteção e condução natural da bola.
+ * Não prende a bola artificialmente quando distante, mas facilita o domínio curto
+ * e a condução próxima aos pés conforme a velocidade e direção do jogador.
+ */
 export function resolvePlayerBallInteraction(
   player: PlayerRuntimeState,
   ball: BallState,
-  allPlayers: PlayerRuntimeState[]
+  allPlayers: PlayerRuntimeState[],
+  customControlRadius = 0.92
 ): { touched: boolean; intercepted: boolean } {
   if (player.stunTimer > 0) {
     player.hasBall = false;
@@ -702,15 +745,32 @@ export function resolvePlayerBallInteraction(
   const dx = ball.x - player.x;
   const dz = ball.z - player.z;
   const dist = Math.hypot(dx, dz);
-  const controlRadius = 0.78;
-  const heightReach = player.animState === 'header' ? 2.35 : 1.35;
+  const controlRadius = Math.max(0.68, Math.min(1.25, customControlRadius));
+  const heightReach = player.animState === 'header' ? 2.35 : 1.42;
 
   if (dist > controlRadius || ball.y > getTerrainHeightAt(player.x, player.z) + heightReach) {
-    if (ball.ownerId === player.id && dist > 1.35) {
+    if (ball.ownerId === player.id && dist > controlRadius * 1.48) {
       ball.ownerId = null;
       player.hasBall = false;
     }
     return { touched: false, intercepted: false };
+  }
+
+  // Se outro jogador já está conduzindo a bola e protegendo com o corpo, exige chegada mais próxima ou carrinho
+  if (ball.ownerId && ball.ownerId !== player.id) {
+    const currentOwner = allPlayers.find((p) => p.id === ball.ownerId);
+    if (currentOwner && currentOwner.team !== player.team && currentOwner.stunTimer <= 0) {
+      // Proteção de bola: se o adversário está nas costas de quem tem a bola, dificulta roubo automático sem carrinho
+      const ownerDirX = Math.sin(currentOwner.facingAngle);
+      const ownerDirZ = Math.cos(currentOwner.facingAngle);
+      const toChallengerX = player.x - currentOwner.x;
+      const toChallengerZ = player.z - currentOwner.z;
+      const dotBehind = toChallengerX * ownerDirX + toChallengerZ * ownerDirZ;
+      const requiredStealDist = dotBehind < 0 ? controlRadius * 0.62 : controlRadius * 0.78;
+      if (dist > requiredStealDist && player.animState !== 'tackle') {
+        return { touched: false, intercepted: false };
+      }
+    }
   }
 
   const previousOwner = ball.ownerId;
@@ -727,19 +787,209 @@ export function resolvePlayerBallInteraction(
 
   const dirX = Math.sin(player.facingAngle);
   const dirZ = Math.cos(player.facingAngle);
+  const playerSpeed = Math.hypot(player.vx, player.vz);
 
-  const targetBallX = player.x + dirX * 0.58;
-  const targetBallZ = player.z + dirZ * 0.58;
+  // Distância de condução curta quando caminhando/parado e ligeiramente à frente na corrida
+  const leadDist = player.isSprinting ? 0.56 : playerSpeed > 0.35 ? 0.48 : 0.42;
+  const targetBallX = player.x + dirX * leadDist;
+  const targetBallZ = player.z + dirZ * leadDist;
 
-  const pushFactor = player.isSprinting ? 1.28 : 1.08;
-  ball.vx = player.vx * pushFactor + (targetBallX - ball.x) * 4.5;
-  ball.vz = player.vz * pushFactor + (targetBallZ - ball.z) * 4.5;
+  // Amortecimento de domínio (first-touch cushion) quando a bola vem rápida de um passe
+  const springRate = player.isSprinting ? 6.8 : 8.2;
+  const pushFactor = player.isSprinting ? 1.16 : 1.04;
+  const desiredVx = player.vx * pushFactor + (targetBallX - ball.x) * springRate;
+  const desiredVz = player.vz * pushFactor + (targetBallZ - ball.z) * springRate;
 
-  if (ball.vy < 0) {
-    ball.vy *= 0.35;
+  ball.vx = ball.vx * 0.25 + desiredVx * 0.75;
+  ball.vz = ball.vz * 0.25 + desiredVz * 0.75;
+
+  if (ball.vy < 0 || ball.y > getTerrainHeightAt(ball.x, ball.z) + ball.radius + 0.05) {
+    ball.vy *= 0.28;
   }
 
   return { touched: true, intercepted };
+}
+
+/**
+ * Seleciona o companheiro mais adequado para receber o passe considerando:
+ * 1. Direção do joystick/teclado (ou orientação do corpo)
+ * 2. Distância (priorizando companheiros próximos e livres em vez de distantes marcados)
+ * 3. Presença de adversários na linha de passe
+ */
+export function selectBestPassTarget(
+  passer: PlayerRuntimeState,
+  allPlayers: PlayerRuntimeState[],
+  inputMoveX: number,
+  inputMoveZ: number
+): PlayerRuntimeState | null {
+  const mates = allPlayers.filter(
+    (m) => m.team === passer.team && m.id !== passer.id
+  );
+  if (mates.length === 0) return null;
+
+  const opponents = allPlayers.filter((o) => o.team !== passer.team);
+  const hasAimInput = Math.hypot(inputMoveX, inputMoveZ) > 0.14;
+  const aimLen = Math.hypot(inputMoveX, inputMoveZ) || 1;
+  const aimDirX = hasAimInput ? inputMoveX / aimLen : Math.sin(passer.facingAngle);
+  const aimDirZ = hasAimInput ? inputMoveZ / aimLen : Math.cos(passer.facingAngle);
+
+  let bestMate: PlayerRuntimeState | null = null;
+  let bestScore = -Infinity;
+
+  for (const mate of mates) {
+    const dx = mate.x - passer.x;
+    const dz = mate.z - passer.z;
+    const dist = Math.hypot(dx, dz) || 0.001;
+    const dirToMateX = dx / dist;
+    const dirToMateZ = dz / dist;
+
+    // Alinhamento angular (-1 a +1)
+    const alignment = dirToMateX * aimDirX + dirToMateZ * aimDirZ;
+
+    // Penaliza companheiros muito distantes quando há opção próxima
+    const distPenalty = dist * 0.11;
+
+    // Verifica se há adversário interceptando o corredor do passe ou colado no companheiro
+    let interceptionPenalty = 0;
+    for (const opp of opponents) {
+      const oppToMate = Math.hypot(opp.x - mate.x, opp.z - mate.z);
+      if (oppToMate < 1.8) {
+        interceptionPenalty += (1.8 - oppToMate) * 0.9;
+      }
+      // Projeção do adversário na linha entre passador e recebedor
+      const ox = opp.x - passer.x;
+      const oz = opp.z - passer.z;
+      const proj = ox * dirToMateX + oz * dirToMateZ;
+      if (proj > 0.8 && proj < dist - 0.5) {
+        const perpDist = Math.abs(ox * -dirToMateZ + oz * dirToMateX);
+        if (perpDist < 1.15) {
+          interceptionPenalty += (1.15 - perpDist) * 1.4;
+        }
+      }
+    }
+
+    const roleBonus = mate.config.role === 'goleiro' ? -0.45 : 0.15;
+    const score = alignment * 3.1 - distPenalty - interceptionPenalty + roleBonus;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMate = mate;
+    }
+  }
+
+  return bestMate;
+}
+
+/**
+ * Calcula a velocidade ideal do passe (curto rasteiro ou longo) proporcional à distância até o alvo.
+ */
+export function computePassVelocity(
+  passer: PlayerRuntimeState,
+  ball: BallState,
+  targetMate: PlayerRuntimeState | null,
+  inputMoveX: number,
+  inputMoveZ: number,
+  isLongPass = false
+): { vx: number; vy: number; vz: number; targetPlayerId: string | null } {
+  const hasAim = Math.hypot(inputMoveX, inputMoveZ) > 0.16;
+  let dirX = hasAim ? inputMoveX : Math.sin(passer.facingAngle);
+  let dirZ = hasAim ? inputMoveZ : Math.cos(passer.facingAngle);
+  let dist = isLongPass ? 12.0 : 7.5;
+  let targetPlayerId: string | null = null;
+
+  if (targetMate) {
+    // Passa ligeiramente à frente do movimento do companheiro
+    const leadX = targetMate.x + targetMate.vx * 0.28;
+    const leadZ = targetMate.z + targetMate.vz * 0.28;
+    const dx = leadX - ball.x;
+    const dz = leadZ - ball.z;
+    const d = Math.hypot(dx, dz) || 1;
+
+    // Se o jogador está mirando fortemente para outro lado livre, permite passe direcional manual
+    const mateAlign = (dx / d) * dirX + (dz / d) * dirZ;
+    if (!hasAim || mateAlign > 0.22) {
+      dirX = dx / d;
+      dirZ = dz / d;
+      dist = d;
+      targetPlayerId = targetMate.id;
+    }
+  }
+
+  const len = Math.hypot(dirX, dirZ) || 1;
+  dirX /= len;
+  dirZ /= len;
+
+  // Força proporcional à distância (garantindo que chegue ao companheiro sem passar direto demais)
+  const basePassSpeed = isLongPass
+    ? Math.max(10.5, Math.min(16.2, 7.2 + dist * 0.62))
+    : Math.max(8.2, Math.min(14.0, 5.8 + dist * 0.58));
+
+  const speed = basePassSpeed * passer.config.kickStat;
+  const vy = isLongPass ? Math.min(3.6, 1.8 + dist * 0.11) : 0.35;
+
+  return {
+    vx: dirX * speed,
+    vy,
+    vz: dirZ * speed,
+    targetPlayerId,
+  };
+}
+
+/**
+ * Calcula a trajetória de finalização (chute fraco, normal, forte, em corrida, parado ou de primeira)
+ * calibrada para a altura das travinhas de mini campo de várzea.
+ */
+export function computeShotVelocity(
+  shooter: PlayerRuntimeState,
+  ball: BallState,
+  chargePower: number, // 0.25 a 1.0
+  inputMoveX: number,
+  inputMoveZ: number,
+  pitch: PitchDimensions = DEFAULT_PITCH
+): { vx: number; vy: number; vz: number } {
+  const clampedPower = Math.max(0.25, Math.min(1.0, chargePower));
+  const targetGoalX = shooter.team === 'home' ? pitch.width / 2 : -pitch.width / 2;
+
+  // Permite direcionar o chute para os cantos da travinha usando o analógico/WASD
+  const maxCornerZ = pitch.goalWidth * 0.44;
+  const aimZ =
+    Math.abs(inputMoveZ) > 0.1
+      ? Math.max(-maxCornerZ, Math.min(maxCornerZ, inputMoveZ * maxCornerZ * 1.12))
+      : (Math.random() - 0.5) * (pitch.goalWidth * 0.35);
+
+  const dx = targetGoalX - ball.x;
+  const dz = aimZ - ball.z;
+  const distToGoal = Math.hypot(dx, dz) || 1;
+
+  // Se o jogador estiver mirando totalmente para trás, respeita orientação do corpo; caso contrário mira no gol com assistência sutil
+  const attackSign = shooter.team === 'home' ? 1 : -1;
+  const aimingBackwards = inputMoveX * attackSign < -0.65;
+
+  const dirX = aimingBackwards ? Math.sin(shooter.facingAngle) : dx / distToGoal;
+  const dirZ = aimingBackwards ? Math.cos(shooter.facingAngle) : dz / distToGoal;
+
+  // Bônus sutil para chute de primeira (quando a bola já vinha rolando em direção ao jogador) ou em corrida
+  const incomingBallSpeed = Math.hypot(ball.vx, ball.vz);
+  const isFirstTimeShot = ball.ownerId !== shooter.id && incomingBallSpeed > 2.2;
+  const sprintBonus = shooter.isSprinting ? 1.06 : 1.0;
+  const firstTimeBonus = isFirstTimeShot ? 1.07 : 1.0;
+
+  // Chute fraco (~10.5 m/s), normal (~14.5 m/s), forte (~18.2 m/s)
+  const shotSpeed =
+    (9.6 + clampedPower * 8.6) *
+    shooter.config.kickStat *
+    sprintBonus *
+    firstTimeBonus;
+
+  // Altura controlada para entrar na travinha (goalHeight = 1.15m) sem isolar a bola por cima
+  const maxLift = distToGoal < 7.5 ? 1.45 : 2.15;
+  const vy = Math.min(maxLift, 0.55 + clampedPower * 1.45);
+
+  return {
+    vx: dirX * shotSpeed,
+    vy,
+    vz: dirZ * shotSpeed,
+  };
 }
 
 export function formatMatchTime(seconds: number): string {
@@ -748,3 +998,4 @@ export function formatMatchTime(seconds: number): string {
   const secs = clamped % 60;
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
+

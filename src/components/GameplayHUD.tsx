@@ -492,19 +492,20 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
         </div>
       )}
 
-      {/* Center Callout Banner for Goals / Lateral Throw-ins / Halftime */}
+      {/* Compact Top Broadcast Banner for Goals / Lateral Throw-ins / Halftime (Never blocks center gameplay) */}
       <div
         ref={bannerWrapRef}
+        data-testid="match-event-banner"
         style={{ opacity: 0 }}
-        className="pointer-events-none self-center my-auto bg-stone-950/95 border-2 border-amber-500 rounded-2xl px-6 sm:px-8 py-3 sm:py-4 text-center shadow-2xl transition-opacity duration-200"
+        className="pointer-events-none self-center mt-1.5 mb-auto max-w-md w-auto bg-stone-950/90 border border-amber-500/85 rounded-xl px-4 py-1.5 text-center shadow-lg transition-opacity duration-200 backdrop-blur-xs"
       >
         <div
           ref={bannerTitleRef}
-          className="font-extrabold text-xl sm:text-4xl text-amber-400 tracking-wider uppercase"
+          className="font-extrabold text-xs sm:text-sm text-amber-400 tracking-wider uppercase leading-tight"
         />
         <div
           ref={bannerSubRef}
-          className="text-xs sm:text-sm font-semibold text-stone-200 mt-1"
+          className="text-[10px] sm:text-xs font-semibold text-stone-200 mt-0.5 leading-tight"
         />
       </div>
 
@@ -512,12 +513,19 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
       {isMobileDevice ? (
         <div
           data-testid="mobile-virtual-controls"
-          className="flex items-end justify-between w-full max-w-7xl mx-auto pb-1 pt-2"
+          className={`flex items-end justify-between w-full max-w-7xl mx-auto pb-1 pt-2 ${
+            settings.mobileControls?.layoutPreset === 'compacto'
+              ? 'px-1'
+              : settings.mobileControls?.layoutPreset === 'espacado'
+              ? 'px-3 sm:px-6'
+              : 'px-1.5 sm:px-3'
+          }`}
         >
-          {/* Left Side: 360-Degree Virtual Joystick (Walk & Run) */}
+          {/* Left Side: 360-Degree Virtual Joystick (Walk & Run, continuous pointer tracking even outside ring) */}
           <div
             ref={joystickBaseRef}
             onPointerDown={(e) => {
+              e.preventDefault();
               e.currentTarget.setPointerCapture(e.pointerId);
               activePointerId.current = e.pointerId;
               handleJoystickMove(e.clientX, e.clientY);
@@ -530,23 +538,40 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             onPointerUp={resetJoystick}
             onPointerCancel={resetJoystick}
             aria-label="Joystick Virtual 360 Graus"
-            className="pointer-events-auto relative w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-stone-950/55 border-2 border-stone-400/45 flex items-center justify-center touch-none shadow-xl"
+            style={{
+              transform: `scale(${settings.mobileControls?.scale ?? 1})`,
+              transformOrigin: 'bottom left',
+            }}
+            className="pointer-events-auto relative w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-stone-950/60 border-2 border-stone-400/50 flex items-center justify-center touch-none shadow-xl"
           >
             <div
               ref={joystickKnobRef}
-              className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-amber-500/80 border-2 border-amber-200 shadow-md pointer-events-none"
+              className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-amber-500/85 border-2 border-amber-200 shadow-md pointer-events-none transition-transform duration-75"
             />
           </div>
 
           {/* Right Side: 5 Ergonomic Semi-Transparent Action Buttons (CHUTAR, PASSE, CORRER, CARRINHO, TROCAR JOGADOR) */}
-          <div className="pointer-events-auto grid grid-cols-3 gap-2 sm:gap-2.5 items-end touch-none">
+          <div
+            style={{
+              transform: `scale(${settings.mobileControls?.scale ?? 1})`,
+              transformOrigin: 'bottom right',
+            }}
+            className={`pointer-events-auto grid grid-cols-3 items-end touch-none ${
+              settings.mobileControls?.layoutPreset === 'compacto'
+                ? 'gap-1.5'
+                : settings.mobileControls?.layoutPreset === 'espacado'
+                ? 'gap-3 sm:gap-3.5'
+                : 'gap-2 sm:gap-2.5'
+            }`}
+          >
             <button
               type="button"
-              onPointerDown={() => {
+              onPointerDown={(e) => {
+                e.preventDefault();
                 audioEngine.triggerVibration(15);
                 inputManager.triggerTouchAction('switch');
               }}
-              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-stone-900/65 active:bg-stone-700 border-2 border-stone-400/50 text-stone-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg leading-tight px-1"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-stone-900/70 active:bg-stone-700 border-2 border-stone-400/50 text-stone-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg leading-tight px-1"
             >
               <span>TROCAR</span>
               <span className="text-[9px] text-amber-300">JOGADOR</span>
@@ -554,18 +579,20 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
 
             <button
               type="button"
-              onPointerDown={() => {
+              onPointerDown={(e) => {
+                e.preventDefault();
                 audioEngine.triggerVibration(25);
                 inputManager.triggerTouchAction('tackle');
               }}
-              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-orange-950/70 active:bg-orange-800 border-2 border-orange-400/60 text-orange-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-orange-950/75 active:bg-orange-800 border-2 border-orange-400/60 text-orange-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
             >
               <span>CARRINHO</span>
             </button>
 
             <button
               type="button"
-              onPointerDown={() => {
+              onPointerDown={(e) => {
+                e.preventDefault();
                 inputManager.touchSprintHeld = true;
               }}
               onPointerUp={() => {
@@ -574,35 +601,37 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               onPointerCancel={() => {
                 inputManager.touchSprintHeld = false;
               }}
-              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-emerald-950/70 active:bg-emerald-700 border-2 border-emerald-400/60 text-emerald-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-emerald-950/75 active:bg-emerald-700 border-2 border-emerald-400/60 text-emerald-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
             >
               <span>CORRER</span>
             </button>
 
             <button
               type="button"
-              onPointerDown={() => {
+              onPointerDown={(e) => {
+                e.preventDefault();
                 audioEngine.triggerVibration(18);
                 inputManager.triggerTouchAction('pass');
               }}
-              className="w-16 h-16 sm:w-20 sm:h-18 rounded-2xl bg-sky-950/75 active:bg-sky-700 border-2 border-sky-400/70 text-sky-100 font-extrabold text-xs sm:text-sm flex flex-col items-center justify-center shadow-xl"
+              className="w-16 h-16 sm:w-20 sm:h-18 rounded-2xl bg-sky-950/80 active:bg-sky-700 border-2 border-sky-400/70 text-sky-100 font-extrabold text-xs sm:text-sm flex flex-col items-center justify-center shadow-xl"
             >
               <span>PASSE</span>
             </button>
 
             <button
               type="button"
-              onPointerDown={() => {
+              onPointerDown={(e) => {
+                e.preventDefault();
                 audioEngine.triggerVibration(30);
                 inputManager.setTouchKickHold(true);
               }}
               onPointerUp={() => inputManager.setTouchKickHold(false)}
               onPointerCancel={() => inputManager.setTouchKickHold(false)}
-              className="col-span-2 h-16 sm:h-18 rounded-2xl bg-amber-500/80 active:bg-amber-400 border-2 border-amber-200 text-stone-950 font-extrabold text-sm sm:text-base tracking-wide flex flex-col items-center justify-center shadow-xl px-2"
+              className="col-span-2 h-16 sm:h-18 rounded-2xl bg-amber-500/85 active:bg-amber-400 border-2 border-amber-200 text-stone-950 font-extrabold text-sm sm:text-base tracking-wide flex flex-col items-center justify-center shadow-xl px-2"
             >
               <span>CHUTAR</span>
               <span className="text-[9px] sm:text-[10px] font-bold text-stone-900">
-                SEGURE P/ CHUTE FORTE
+                TOQUE FRACO · SEGURE P/ FORTE
               </span>
             </button>
           </div>
@@ -613,8 +642,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
           className="hidden md:flex items-center justify-center w-full"
         >
           <div className="bg-stone-950/80 border border-stone-800/80 rounded-lg px-4 py-1.5 text-xs text-stone-300">
-            WASD Mover · Shift Correr · Espaço Chutar (Segure p/ Forte) · E
-            Passe · R Lançamento · F Carrinho · Q Trocar Jogador
+            WASD Mover · Shift Correr · Espaço Chutar (Toque Fraco / Segure Forte) · E Passe Direcional · F Carrinho · Q Trocar · ESC Menu
           </div>
         </div>
       )}

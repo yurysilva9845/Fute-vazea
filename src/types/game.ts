@@ -192,6 +192,33 @@ export interface MatchStats {
 
 export type CameraMode = 'follow' | 'overview' | 'sideline' | 'close';
 
+export interface KeyBindingsConfig {
+  moveUp: string;
+  moveDown: string;
+  moveLeft: string;
+  moveRight: string;
+  sprint: string;
+  shoot: string;
+  pass: string;
+  longPass: string;
+  switchPlayer: string;
+  tackle: string;
+  pause: string;
+}
+
+export interface MobileControlsConfig {
+  scale: number; // 0.85 (Pequeno), 1.0 (Normal), 1.15 (Grande)
+  layoutPreset: 'compacto' | 'padrao' | 'espacado';
+  joystickSensitivity: number; // 0.8 - 1.3
+}
+
+export interface MatchLoadingConfig {
+  minLoadTimeSeconds: number;           // default: 2
+  maxWaitTimeSeconds: number;           // default: 20
+  slowConnectionWarningSeconds: number; // default: 10
+  extraSlowConnectionSeconds: number;   // default: 5
+}
+
 export interface GameSettings {
   cameraMode: CameraMode;
   cameraDistance: number;
@@ -204,6 +231,12 @@ export interface GameSettings {
   halfDurationSeconds: number;
   aiDifficulty: 'raiz' | 'equilibrado' | 'lenda';
   showPlayerNames: boolean;
+  autoSwitchPlayer?: boolean;
+  ballControlRadius?: number; // default: 0.92
+  graphicsQuality?: 'auto' | 'alta' | 'desempenho';
+  keyBindings?: KeyBindingsConfig;
+  mobileControls?: MobileControlsConfig;
+  loadingConfig?: MatchLoadingConfig;
 }
 
 // Multiplayer, Matchmaking, Voice Chat & Friends Types
@@ -309,6 +342,9 @@ export interface MultiplayerSlot {
 }
 
 export interface MultiplayerMatchSnapshot {
+  tick?: number;
+  seq?: number;
+  lastProcessedSeqByUid?: Record<string, number>;
   ball: {
     x: number;
     y: number;
@@ -316,6 +352,7 @@ export interface MultiplayerMatchSnapshot {
     vx: number;
     vy: number;
     vz: number;
+    ownerId?: string | null;
   };
   players: Record<
     string,
@@ -326,7 +363,10 @@ export interface MultiplayerMatchSnapshot {
       vz: number;
       facingAngle: number;
       animState: PlayerAnimState;
+      stamina?: number;
       isSpeaking?: boolean;
+      controlledByUid?: string | null;
+      isBot?: boolean;
     }
   >;
   homeGoals: number;
@@ -378,5 +418,18 @@ export interface MultiplayerRoomState {
   matchState: MultiplayerMatchSnapshot | null;
 }
 
-
-
+export interface WsInputCommand {
+  seq: number;
+  timestamp: number;
+  uid: string;
+  roomCode: string;
+  matchId?: string;
+  slotId: string;
+  moveX: number;
+  moveZ: number;
+  sprint: boolean;
+  action: 'none' | 'pass' | 'long_pass' | 'shoot' | 'tackle' | 'header' | 'switch';
+  kickPower: number;
+  aimX?: number;
+  aimZ?: number;
+}

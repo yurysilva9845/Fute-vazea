@@ -13,7 +13,7 @@ import {
   PlayerCustomization,
   TeamConfig,
 } from './types/game';
-import { VarzeaInputManager } from './game/controls';
+import { DEFAULT_KEY_BINDINGS, VarzeaInputManager } from './game/controls';
 import { LiveHUDUpdate, MatchCanvas } from './game/MatchCanvas';
 import { TitleScreen } from './components/TitleScreen';
 import { GameplayHUD } from './components/GameplayHUD';
@@ -36,6 +36,7 @@ import {
 import { presenceService } from './services/presenceService';
 import { sessionCleanupService } from './services/sessionCleanupService';
 import { voiceChatService } from './services/voiceChatService';
+import { realtimeMatchClient } from './services/realtimeMatchClient';
 
 export default function App() {
   const [screenState, setScreenState] = useState<GameScreenState>(() => {
@@ -75,6 +76,21 @@ export default function App() {
     halfDurationSeconds: 300,
     aiDifficulty: 'equilibrado',
     showPlayerNames: true,
+    ballControlRadius: 0.92,
+    autoSwitchPlayer: true,
+    graphicsQuality: 'auto',
+    keyBindings: { ...DEFAULT_KEY_BINDINGS },
+    mobileControls: {
+      scale: 1.0,
+      joystickSensitivity: 1.0,
+      layoutPreset: 'padrao',
+    },
+    loadingConfig: {
+      minLoadTimeSeconds: 2,
+      slowConnectionWarningSeconds: 10,
+      maxWaitTimeSeconds: 20,
+      extraSlowConnectionSeconds: 5,
+    },
   });
 
   const [scoreAndClock, setScoreAndClock] = useState<{
@@ -122,6 +138,9 @@ export default function App() {
   const inputManager = useMemo(() => new VarzeaInputManager(), []);
 
   useEffect(() => {
+    realtimeMatchClient.setCallbacks({
+      onPingUpdate: (rttMs) => setPingMs(rttMs),
+    });
     return () => {
       inputManager.dispose();
     };
@@ -355,24 +374,34 @@ export default function App() {
     []
   );
 
-  const handleUpdateSettings = useCallback((partial: Partial<GameSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...partial };
-      if (partial.soundEnabled !== undefined) {
-        audioEngine.setSoundEnabled(partial.soundEnabled);
-      }
-      if (partial.musicEnabled !== undefined) {
-        audioEngine.setMusicEnabled(partial.musicEnabled);
-      }
-      audioEngine.updateVolumes({
-        sfxVolume: next.sfxVolume,
-        ambientVolume: next.ambientVolume,
-        musicVolume: next.musicVolume,
-        vibrationEnabled: next.vibrationEnabled,
+  const handleUpdateSettings = useCallback(
+    (partial: Partial<GameSettings>) => {
+      setSettings((prev) => {
+        const next = { ...prev, ...partial };
+        if (partial.soundEnabled !== undefined) {
+          audioEngine.setSoundEnabled(partial.soundEnabled);
+        }
+        if (partial.musicEnabled !== undefined) {
+          audioEngine.setMusicEnabled(partial.musicEnabled);
+        }
+        if (partial.keyBindings) {
+          inputManager.setKeyBindings(partial.keyBindings);
+        }
+        if (partial.mobileControls?.joystickSensitivity !== undefined) {
+          inputManager.joystickSensitivity =
+            partial.mobileControls.joystickSensitivity;
+        }
+        audioEngine.updateVolumes({
+          sfxVolume: next.sfxVolume,
+          ambientVolume: next.ambientVolume,
+          musicVolume: next.musicVolume,
+          vibrationEnabled: next.vibrationEnabled,
+        });
+        return next;
       });
-      return next;
-    });
-  }, []);
+    },
+    [inputManager]
+  );
 
   const handleScoreAndClockUpdate = useCallback(
     (
@@ -447,13 +476,14 @@ export default function App() {
   }, [inputManager]);
 
   /**
-   * Encerra a partida atual, desconecta o chat de voz WebRTC, desliga o microfone,
-   * remove o jogador da sala (ou encerra a sala se for o último) e volta ao menu inicial.
+   * Encerra a partida atual, desconecta o servidor WebSocket 30Hz e o chat de voz WebRTC,
+   * desliga o microfone, remove o jogador da sala e volta ao menu inicial.
    */
   const handleBackToTitle = useCallback(() => {
     inputManager.clearAll();
     exitFullscreenSafe();
     setShowMatchLoadingOverlay(false);
+    realtimeMatchClient.disconnect(true);
 
     if (activeRoomCode) {
       const codeToLeave = activeRoomCode;
@@ -532,6 +562,7 @@ export default function App() {
           room={activeRoom}
           homeTeam={homeTeam}
           awayTeam={awayTeam}
+          loadingConfig={settings.loadingConfig}
           onPlayerLoaded={handlePlayerLoadedInOverlay}
           onReadyToPlay={handleCompleteMatchLoading}
         />

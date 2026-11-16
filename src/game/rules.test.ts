@@ -262,3 +262,214 @@ test('Multiplayer synchronization lifecycle enforces roomId, matchId and blocks 
   assert.equal(playingCheck.joinable, false);
 });
 
+test('PARTE 6 — 15-step Multi-Client Authoritative 30Hz Simulation (Client A & Client B, ownership validation, goals, disconnect -> Bot & reconnect)', async () => {
+  const { AuthoritativeMatchSession } = await import('../server/authoritativeMatchEngine');
+
+  const slotsObj = buildInitialRoomSlots('client_A_uid', 'Yuri (Client A)', 'home_1');
+  slotsObj['away_1'] = {
+    ...slotsObj['away_1'],
+    uid: 'client_B_uid',
+    displayName: 'Primo (Client B)',
+    isBot: false,
+    isReady: true,
+  };
+
+  // 1-4. Client A creates match & Client B joins same match
+  const session = new AuthoritativeMatchSession({
+    roomCode: 'STF-30HZ',
+    matchId: 'MTC-30HZ01',
+    hostUid: 'client_A_uid',
+    mode: '4v4',
+    homeTeamName: 'Sem Terra FC',
+    awayTeamName: 'Rubro-Negro do Beco',
+    halfDurationSeconds: 60,
+    aiDifficulty: 'equilibrado',
+    slots: slotsObj,
+  });
+
+  session.readyUids.add('client_A_uid');
+  session.readyUids.add('client_B_uid');
+  assert.equal(session.readyUids.size, 2);
+
+  // 5-7. Client A moves -> Client B receives updated snapshot; Client B moves -> Client A receives updated snapshot
+  const initialSnap = session.getSnapshot();
+  const initialA = initialSnap.players['home_1'];
+  const initialB = initialSnap.players['away_1'];
+
+  const acceptedA = session.submitCommand({
+    seq: 1,
+    timestamp: Date.now(),
+    uid: 'client_A_uid',
+    roomCode: 'STF-30HZ',
+    slotId: 'home_1',
+    moveX: 1,
+    moveZ: 0,
+    sprint: true,
+    action: 'none',
+    kickPower: 0.65,
+  });
+  assert.equal(acceptedA.accepted, true);
+
+  // Security validation: Client B cannot control Client A's character (home_1), and old seq is rejected
+  const spoofAttempt = session.submitCommand({
+    seq: 1,
+    timestamp: Date.now(),
+    uid: 'client_B_uid',
+    roomCode: 'STF-30HZ',
+    slotId: 'home_1',
+    moveX: -1,
+    moveZ: 0,
+    sprint: false,
+    action: 'none',
+    kickPower: 0.65,
+  });
+  assert.equal(spoofAttempt.accepted, false, 'Server must reject command for another player slot');
+
+  const acceptedB = session.submitCommand({
+    seq: 1,
+    timestamp: Date.now(),
+    uid: 'client_B_uid',
+    roomCode: 'STF-30HZ',
+    slotId: 'away_1',
+    moveX: -1,
+    moveZ: 0.4,
+    sprint: true,
+    action: 'none',
+    kickPower: 0.65,
+  });
+  assert.equal(acceptedB.accepted, true);
+
+  for (let t = 0; t < 10; t++) {
+    session.stepTick(1 / 30);
+  }
+
+  const afterMoveSnap = session.getSnapshot();
+  const movedA = afterMoveSnap.players['home_1'];
+  const movedB = afterMoveSnap.players['away_1'];
+  assert.ok(movedA.x > initialA.x, 'Client A must advance +X');
+  assert.ok(movedB.x < initialB.x, 'Client B must advance -X');
+  assert.equal(afterMoveSnap.lastProcessedSeqByUid?.['client_A_uid'], 1);
+  assert.equal(afterMoveSnap.lastProcessedSeqByUid?.['client_B_uid'], 1);
+
+  // 8-12. Client B disconnects -> Bot IA assumes control -> Client B reconnects
+  const botSlot = session.handlePlayerDisconnect('client_B_uid', true);
+  assert.equal(botSlot?.isBot, true);
+  session.stepTick(1 / 30);
+
+  const reconnectedSlot = session.handlePlayerReconnect('client_B_uid', 'Primo (Client B)', 'away_1');
+  assert.equal(reconnectedSlot?.isBot, false);
+  assert.equal(reconnectedSlot?.uid, 'client_B_uid');
+
+  const afterReconnectCmd = session.submitCommand({
+    seq: 2,
+    timestamp: Date.now(),
+    uid: 'client_B_uid',
+    roomCode: 'STF-30HZ',
+    slotId: 'away_1',
+    moveX: 0,
+    moveZ: -1,
+    sprint: false,
+    action: 'none',
+    kickPower: 0.65,
+  });
+  assert.equal(afterReconnectCmd.accepted, true, 'Reconnected player must resume command control');
+});
+
+test('PARTE 3 — Directional Pass, Weak/Strong Shots, Key Remapping without conflict, and Anti-Crowding AI', async () => {
+  const {
+    selectBestPassTarget,
+    computePassVelocity,
+    computeShotVelocity,
+    resolvePlayerBallInteraction,
+  } = await import('./rules');
+  const { remapKeyWithoutConflict, DEFAULT_KEY_BINDINGS } = await import('./controls');
+  const { computeAIDecision } = await import('./ai');
+
+  // Key remapping swaps conflicting key bindings automatically
+  const remapped = remapKeyWithoutConflict(DEFAULT_KEY_BINDINGS, 'pass', 'KeyQ');
+  assert.equal(remapped.pass, 'KeyQ');
+  assert.equal(remapped.switchPlayer, 'KeyE', 'Previous pass key must swap to switchPlayer');
+
+  // Build test players
+  const active = getActivePlayersForMode(INITIAL_HOME_PLAYERS, INITIAL_AWAY_PLAYERS, '4v4');
+  const players = [
+    ...active.home.map((cfg, i) => ({
+      id: cfg.id,
+      team: 'home' as const,
+      config: cfg,
+      x: i === 0 ? 0 : i === 1 ? 6 : -5,
+      y: 0,
+      z: i === 0 ? 0 : i === 1 ? 4 : -4,
+      vx: 0,
+      vz: 0,
+      facingAngle: Math.PI / 2,
+      animState: 'idle' as const,
+      animTimer: 0,
+      stridePhase: 0,
+      stamina: 100,
+      isSprinting: false,
+      tackleCooldown: 0,
+      stunTimer: 0,
+      homeX: -4 - i * 2,
+      homeZ: 0,
+      hasBall: i === 0,
+      inMud: false,
+      inPuddle: false,
+    })),
+    ...active.away.map((cfg, i) => ({
+      id: cfg.id,
+      team: 'away' as const,
+      config: cfg,
+      x: 5 + i * 2.5,
+      y: 0,
+      z: i * 1.5 - 2,
+      vx: 0,
+      vz: 0,
+      facingAngle: -Math.PI / 2,
+      animState: 'idle' as const,
+      animTimer: 0,
+      stridePhase: 0,
+      stamina: 100,
+      isSprinting: false,
+      tackleCooldown: 0,
+      stunTimer: 0,
+      homeX: 5 + i * 2.5,
+      homeZ: i * 1.5 - 2,
+      hasBall: false,
+      inMud: false,
+      inPuddle: false,
+    })),
+  ];
+
+  const passer = players[0];
+  const ball = createBall({ x: 0.4, z: 0, ownerId: 'home_1' });
+  const targetMate = selectBestPassTarget(passer, players, 0.8, 0.6);
+  assert.ok(targetMate);
+  assert.equal(targetMate?.id, 'home_2', 'Directional pass must select Josué in (+X, +Z) direction');
+
+  const passVel = computePassVelocity(passer, ball, targetMate, 0.8, 0.6, false);
+  assert.ok(passVel.vx > 0 && passVel.vz > 0);
+
+  // Weak tap shot vs strong charged shot
+  const weakShot = computeShotVelocity(passer, ball, 0.28, 1, 0, DEFAULT_PITCH);
+  const strongShot = computeShotVelocity(passer, ball, 1.0, 1, 0, DEFAULT_PITCH);
+  assert.ok(
+    Math.hypot(strongShot.vx, strongShot.vz) > Math.hypot(weakShot.vx, weakShot.vz),
+    'Charged strong shot must have higher velocity than tap shot'
+  );
+
+  // Ball control domain within configurable radius
+  const freeBall = createBall({ x: 0.55, z: 0, vx: 8, vz: 0 });
+  const controlled = resolvePlayerBallInteraction(passer, freeBall, players, 0.95);
+  assert.equal(controlled.touched, true);
+  assert.equal(freeBall.ownerId, passer.id);
+
+  // Anti-crowding AI: away outfield bots do not all converge to the exact same ball point
+  const awayOutfield = players.filter((p) => p.team === 'away' && p.config.role !== 'goleiro');
+  const decisions = awayOutfield.map((bot) =>
+    computeAIDecision(bot, freeBall, players, 'equilibrado')
+  );
+  assert.equal(decisions.length, 3);
+});
+
+

@@ -1,6 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, RefreshCw, Shield, Users, Wifi } from 'lucide-react';
-import { MatchFormatMode, MultiplayerRoomState, TeamConfig } from '../types/game';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  RefreshCw,
+  Shield,
+  Users,
+  Wifi,
+} from 'lucide-react';
+import {
+  MatchFormatMode,
+  MatchLoadingConfig,
+  MultiplayerRoomState,
+  TeamConfig,
+} from '../types/game';
+import { getCurrentAuthUser } from '../services/firebase';
+import { realtimeMatchClient } from '../services/realtimeMatchClient';
 
 interface MatchLoadingOverlayProps {
   type: 'connecting_lobby' | 'joining_room' | 'starting_match';
@@ -8,18 +23,26 @@ interface MatchLoadingOverlayProps {
   room?: MultiplayerRoomState | null;
   homeTeam?: TeamConfig;
   awayTeam?: TeamConfig;
+  loadingConfig?: MatchLoadingConfig;
   onPlayerLoaded?: () => void;
   onReadyToPlay?: () => void;
   onRetryOrCancel?: () => void;
 }
 
 const MATCH_LOADING_STEPS = [
-  'CONECTANDO AOS JOGADORES...',
-  'PREPARANDO O CAMPO...',
-  'CARREGANDO PERSONAGENS...',
-  'SINCRONIZANDO A BOLA...',
-  'INICIANDO PARTIDA...',
+  'CONECTANDO AO SERVIDOR DE PARTIDA (30Hz)...',
+  'PREPARANDO O CAMPO DE TERRA E TRAVINHAS...',
+  'CARREGANDO SKINS E MODELOS 3D...',
+  'SINCRONIZANDO BOLA E POSIÇÕES INICIAIS...',
+  'AGUARDANDO CONFIRMAÇÃO DOS JOGADORES...',
 ];
+
+const DEFAULT_LOADING_CONFIG: MatchLoadingConfig = {
+  minLoadTimeSeconds: 2,
+  slowConnectionWarningSeconds: 10,
+  maxWaitTimeSeconds: 20,
+  extraSlowConnectionSeconds: 5,
+};
 
 export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
   type,
@@ -27,13 +50,18 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
   room,
   homeTeam,
   awayTeam,
+  loadingConfig = DEFAULT_LOADING_CONFIG,
   onPlayerLoaded,
   onReadyToPlay,
   onRetryOrCancel,
 }) => {
+  const cfg = { ...DEFAULT_LOADING_CONFIG, ...loadingConfig };
   const [progress, setProgress] = useState(14);
   const [stepIdx, setStepIdx] = useState(0);
-  const [countdownSec, setCountdownSec] = useState(5);
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const [maxWaitSec, setMaxWaitSec] = useState(cfg.maxWaitTimeSeconds);
+  const [wsReadyMap, setWsReadyMap] = useState<Record<string, boolean>>({});
+
   const loadedNotifiedRef = useRef(false);
   const startedNotifiedRef = useRef(false);
 
@@ -45,70 +73,101 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
   }, [onPlayerLoaded, onReadyToPlay]);
 
   useEffect(() => {
+    realtimeMatchClient.setCallbacks({
+      onPlayerReadyUpdate: (readyByUid, allReady) => {
+        setWsReadyMap(readyByUid);
+        if (allReady && elapsedSec >= cfg.minLoadTimeSeconds && !startedNotifiedRef.current) {
+          startedNotifiedRef.current = true;
+          onReadyToPlayRef.current?.();
+        }
+      },
+    });
+  }, [elapsedSec, cfg.minLoadTimeSeconds]);
+
+  useEffect(() => {
     if (type !== 'starting_match') return;
 
     loadedNotifiedRef.current = false;
     startedNotifiedRef.current = false;
-    setProgress(16);
+    setProgress(18);
     setStepIdx(0);
-    setCountdownSec(5);
+    setElapsedSec(0);
+    setMaxWaitSec(cfg.maxWaitTimeSeconds);
 
     const stepInterval = window.setInterval(() => {
-      setProgress((prev) => Math.min(100, prev + 21));
+      setProgress((prev) => Math.min(100, prev + 22));
       setStepIdx((prev) => Math.min(MATCH_LOADING_STEPS.length - 1, prev + 1));
-    }, 380);
+    }, 360);
 
-    // Marca este cliente como carregado após preparar cenário/personagens (~1.8s)
+    // Notifica que este cliente carregou recursos após minLoadTimeSeconds (~2s)
     const localReadyTimer = window.setTimeout(() => {
       setProgress(100);
       setStepIdx(MATCH_LOADING_STEPS.length - 1);
       if (!loadedNotifiedRef.current) {
         loadedNotifiedRef.current = true;
+        realtimeMatchClient.sendPlayerReady(false);
         onPlayerLoadedRef.current?.();
       }
-    }, 1850);
+    }, cfg.minLoadTimeSeconds * 1000);
 
-    // Contador regressivo de 5 segundos para início automático com quem carregou
-    const countdownInterval = window.setInterval(() => {
-      setCountdownSec((prev) => Math.max(0, prev - 1));
+    const elapsedInterval = window.setInterval(() => {
+      setElapsedSec((prev) => prev + 1);
     }, 1000);
-
-    // Timeout máximo de 5 segundos (conforme definido: iniciar automaticamente após 5s com quem carregou)
-    const maxTimeout = window.setTimeout(() => {
-      if (!startedNotifiedRef.current) {
-        startedNotifiedRef.current = true;
-        onReadyToPlayRef.current?.();
-      }
-    }, 5000);
 
     return () => {
       window.clearInterval(stepInterval);
       window.clearTimeout(localReadyTimer);
-      window.clearInterval(countdownInterval);
-      window.clearTimeout(maxTimeout);
+      window.clearInterval(elapsedInterval);
     };
-  }, [type]);
+  }, [type, cfg.minLoadTimeSeconds, cfg.maxWaitTimeSeconds]);
 
-  // Se todos os jogadores humanos já confirmaram carregamento ou o status virou 'playing', inicia imediatamente
+  // Verifica prontidão real de todos os jogadores humanos ou limite máximo configurável
   useEffect(() => {
-    if (type !== 'starting_match' || !room) return;
-    const humanUids = Object.values(room.slots || {})
+    if (type !== 'starting_match') return;
+
+    const humanUids = Object.values(room?.slots || {})
       .filter((s) => !s.isBot && s.uid)
       .map((s) => String(s.uid));
-    const readyUids = room.loadingReadyUids || [];
-    const allHumansReady =
-      humanUids.length > 0 && humanUids.every((uid) => readyUids.includes(uid));
+    const roomReadyUids = room?.loadingReadyUids || [];
 
-    if ((room.status === 'playing' || (allHumansReady && progress >= 95)) && !startedNotifiedRef.current) {
+    const allHumansReady =
+      humanUids.length === 0 ||
+      humanUids.every(
+        (uid) => roomReadyUids.includes(uid) || Boolean(wsReadyMap[uid])
+      );
+
+    // Inicia imediatamente assim que o tempo mínimo (2s) passou E todos os humanos confirmaram
+    if (
+      (room?.status === 'playing' ||
+        (elapsedSec >= cfg.minLoadTimeSeconds && allHumansReady && progress >= 95)) &&
+      !startedNotifiedRef.current
+    ) {
       const quickStart = window.setTimeout(() => {
         if (!startedNotifiedRef.current) {
           startedNotifiedRef.current = true;
+          realtimeMatchClient.sendPlayerReady(true);
           onReadyToPlayRef.current?.();
         }
-      }, 350);
+      }, 220);
       return () => window.clearTimeout(quickStart);
     }
-  }, [type, room, progress]);
+
+    // Caso o limite máximo configurável (maxWaitSec) seja atingido, inicia com quem carregou
+    if (elapsedSec >= maxWaitSec && !startedNotifiedRef.current) {
+      startedNotifiedRef.current = true;
+      realtimeMatchClient.sendPlayerReady(true);
+      onReadyToPlayRef.current?.();
+    }
+    return undefined;
+  }, [
+    type,
+    room,
+    progress,
+    elapsedSec,
+    maxWaitSec,
+    wsReadyMap,
+    cfg.minLoadTimeSeconds,
+  ]);
 
   if (type === 'connecting_lobby' || type === 'joining_room') {
     return (
@@ -159,9 +218,23 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
   const homeSlots = activeSlots.filter((s) => s.team === 'home');
   const awaySlots = activeSlots.filter((s) => s.team === 'away');
   const humanSlots = allSlots.filter((s) => !s.isBot && s.uid);
+
+  const isPlayerSlotReady = (uid?: string | null, isBot?: boolean) => {
+    if (isBot || !uid) return true;
+    return (
+      (room?.loadingReadyUids || []).includes(uid) || Boolean(wsReadyMap[uid])
+    );
+  };
+
   const readyCount = humanSlots.filter((s) =>
-    (room?.loadingReadyUids || []).includes(String(s.uid))
+    isPlayerSlotReady(s.uid, s.isBot)
   ).length;
+  const myUid = getCurrentAuthUser()?.uid;
+  const isHost = !room?.hostUid || room.hostUid === myUid;
+  const isSlowConnectionWarning =
+    elapsedSec >= cfg.slowConnectionWarningSeconds &&
+    readyCount < humanSlots.length;
+  const remainingWaitSec = Math.max(0, maxWaitSec - elapsedSec);
 
   return (
     <div className="fixed inset-0 z-[80] bg-stone-950 flex flex-col justify-between p-3 sm:p-6 overflow-y-auto select-none">
@@ -182,7 +255,7 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
           </div>
           <div>
             <div className="text-[10px] font-black uppercase tracking-widest text-amber-400">
-              SEM TERRA FC · SINCRONIZAÇÃO DE PARTIDA {mode.toUpperCase()}
+              SEM TERRA FC · SINCRONIZAÇÃO DE PARTIDA {mode.toUpperCase()} (30Hz)
             </div>
             <h2 className="text-lg sm:text-xl font-black uppercase text-white tracking-tight">
               {room?.roomName || `PARTIDA ONLINE ${mode.toUpperCase()}`}
@@ -228,17 +301,17 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
           </div>
           <div className="space-y-1.5">
             {homeSlots.map((slot) => {
-              const isLoaded =
-                slot.isBot ||
-                (slot.uid && (room?.loadingReadyUids || []).includes(slot.uid));
+              const isLoaded = isPlayerSlotReady(slot.uid, slot.isBot);
               return (
                 <div
                   key={slot.characterId}
                   className="flex items-center justify-between bg-stone-950/80 px-3 py-1.5 rounded border border-stone-800"
                 >
                   <div className="flex items-center gap-1.5">
-                    {isLoaded && (
+                    {isLoaded ? (
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <Clock className="w-3.5 h-3.5 text-amber-400 animate-spin shrink-0" />
                     )}
                     <span className="text-xs font-black uppercase text-white">
                       {slot.characterName}
@@ -251,10 +324,16 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
                     className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${
                       slot.isBot
                         ? 'bg-stone-800 text-stone-400'
-                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : isLoaded
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                     }`}
                   >
-                    {slot.isBot ? 'BOT IA' : 'HUMANO'}
+                    {slot.isBot
+                      ? 'BOT IA'
+                      : isLoaded
+                      ? 'PRONTO'
+                      : 'CARREGANDO...'}
                   </span>
                 </div>
               );
@@ -284,17 +363,17 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
           </div>
           <div className="space-y-1.5">
             {awaySlots.map((slot) => {
-              const isLoaded =
-                slot.isBot ||
-                (slot.uid && (room?.loadingReadyUids || []).includes(slot.uid));
+              const isLoaded = isPlayerSlotReady(slot.uid, slot.isBot);
               return (
                 <div
                   key={slot.characterId}
                   className="flex items-center justify-between bg-stone-950/80 px-3 py-1.5 rounded border border-stone-800"
                 >
                   <div className="flex items-center gap-1.5">
-                    {isLoaded && (
+                    {isLoaded ? (
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <Clock className="w-3.5 h-3.5 text-amber-400 animate-spin shrink-0" />
                     )}
                     <span className="text-xs font-black uppercase text-white">
                       {slot.characterName}
@@ -307,10 +386,16 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
                     className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${
                       slot.isBot
                         ? 'bg-stone-800 text-stone-400'
-                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : isLoaded
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                     }`}
                   >
-                    {slot.isBot ? 'BOT IA' : 'HUMANO'}
+                    {slot.isBot
+                      ? 'BOT IA'
+                      : isLoaded
+                      ? 'PRONTO'
+                      : 'CARREGANDO...'}
                   </span>
                 </div>
               );
@@ -319,12 +404,52 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
         </div>
       </div>
 
-      {/* Bottom Progress Bar & Step Message */}
+      {/* Bottom Progress Bar, Slow Connection Warning & Host Controls */}
       <div className="relative z-10 max-w-2xl w-full mx-auto space-y-2.5 pt-2">
+        {isSlowConnectionWarning && (
+          <div className="bg-amber-950/90 border border-amber-500/70 rounded p-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 text-amber-200">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                Conexão lenta detectada em um dos jogadores ({readyCount}/
+                {humanSlots.length} prontos). Tempo restante: {remainingWaitSec}s
+              </span>
+            </div>
+            {isHost && (
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setMaxWaitSec(
+                      (prev) => prev + cfg.extraSlowConnectionSeconds
+                    )
+                  }
+                  className="px-2.5 py-1 bg-stone-800 hover:bg-stone-700 text-amber-300 border border-amber-500/40 rounded font-bold text-[11px] cursor-pointer"
+                >
+                  AGUARDAR +{cfg.extraSlowConnectionSeconds}s
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!startedNotifiedRef.current) {
+                      startedNotifiedRef.current = true;
+                      realtimeMatchClient.sendPlayerReady(true);
+                      onReadyToPlay?.();
+                    }
+                  }}
+                  className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-stone-950 rounded font-black text-[11px] cursor-pointer"
+                >
+                  PROSSEGUIR AGORA
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="flex items-center justify-between text-xs font-black uppercase tracking-wider">
           <span className="text-amber-400">{MATCH_LOADING_STEPS[stepIdx]}</span>
           <span className="text-stone-300 font-mono">
-            {progress}% · Início automático em {countdownSec}s
+            {progress}% · Timeout máx: {remainingWaitSec}s
           </span>
         </div>
         <div className="w-full h-3 bg-stone-900 border border-stone-700 rounded-full overflow-hidden">
@@ -336,21 +461,23 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
 
         <div className="flex items-center justify-between bg-stone-900/90 border border-stone-800 px-3 py-2 rounded text-[11px]">
           <span className="text-stone-300">
-            Sincronizando estado da sala, posições iniciais e bola compartilhada...
+            Início imediato após {cfg.minLoadTimeSeconds}s quando todos os
+            jogadores confirmarem prontidão.
           </span>
-          {onReadyToPlay && (
+          {onReadyToPlay && isHost && (
             <button
               type="button"
               onClick={() => {
                 if (!startedNotifiedRef.current) {
                   startedNotifiedRef.current = true;
+                  realtimeMatchClient.sendPlayerReady(true);
                   onReadyToPlay();
                 }
               }}
               className="flex items-center gap-1 bg-amber-500 hover:bg-amber-400 text-stone-950 font-black uppercase px-2.5 py-1 rounded cursor-pointer shrink-0"
             >
               <RefreshCw className="w-3 h-3" />
-              Entrar Agora
+              Iniciar Agora
             </button>
           )}
         </div>
@@ -358,4 +485,3 @@ export const MatchLoadingOverlay: React.FC<MatchLoadingOverlayProps> = ({
     </div>
   );
 };
-

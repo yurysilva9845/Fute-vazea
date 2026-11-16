@@ -1,5 +1,8 @@
+import { KeyBindingsConfig } from '../types/game';
+
 /**
- * Unified Input Controller for PC (Keyboard + Mouse) and Mobile (Virtual Joystick + Touch Buttons).
+ * Unified Input Controller for PC (Keyboard + Mouse with Remappable Keys) and
+ * Mobile (360° Virtual Joystick + Ergonomic Touch Action Buttons).
  * Separates continuous `held` states from single-frame `justPressed` / `justReleased` edges
  * and clears held keys on window blur / visibilitychange.
  */
@@ -8,6 +11,7 @@ export interface InputSnapshot {
   moveZ: number; // -1 to 1
   sprintHeld: boolean;
   kickHeld: boolean;
+  kickJustPressed: boolean;
   kickJustReleased: boolean;
   kickChargePower: number; // 0.25 to 1.0
   passJustPressed: boolean;
@@ -20,18 +24,83 @@ export interface InputSnapshot {
   mouseDeltaY: number;
 }
 
+export const DEFAULT_KEY_BINDINGS: KeyBindingsConfig = {
+  moveUp: 'KeyW',
+  moveDown: 'KeyS',
+  moveLeft: 'KeyA',
+  moveRight: 'KeyD',
+  sprint: 'ShiftLeft',
+  shoot: 'Space',
+  pass: 'KeyE',
+  longPass: 'KeyR',
+  switchPlayer: 'KeyQ',
+  tackle: 'KeyF',
+  pause: 'Escape',
+};
+
+/**
+ * Remapeia uma tecla garantindo que não existam comandos duplicados ou conflitantes:
+ * se a nova tecla já estiver atribuída a outra ação, realiza a troca automática entre elas.
+ */
+export function remapKeyWithoutConflict(
+  current: KeyBindingsConfig,
+  action: keyof KeyBindingsConfig,
+  newKeyCode: string
+): KeyBindingsConfig {
+  const updated: KeyBindingsConfig = { ...current };
+  const oldCode = updated[action];
+  const conflictingAction = (Object.keys(updated) as Array<keyof KeyBindingsConfig>).find(
+    (k) => k !== action && updated[k] === newKeyCode
+  );
+  if (conflictingAction) {
+    updated[conflictingAction] = oldCode;
+  }
+  updated[action] = newKeyCode;
+  return updated;
+}
+
+export function formatKeyCodeLabel(code: string): string {
+  if (!code) return '—';
+  if (code.startsWith('Key')) return code.slice(3).toUpperCase();
+  if (code.startsWith('Digit')) return code.slice(5);
+  switch (code) {
+    case 'Space':
+      return 'ESPAÇO';
+    case 'ShiftLeft':
+    case 'ShiftRight':
+      return 'SHIFT';
+    case 'ControlLeft':
+    case 'ControlRight':
+      return 'CTRL';
+    case 'Escape':
+      return 'ESC';
+    case 'ArrowUp':
+      return '↑';
+    case 'ArrowDown':
+      return '↓';
+    case 'ArrowLeft':
+      return '←';
+    case 'ArrowRight':
+      return '→';
+    default:
+      return code.toUpperCase();
+  }
+}
+
 export class VarzeaInputManager {
   private keysHeld = new Set<string>();
   private keysJustPressed = new Set<string>();
   private keysJustReleased = new Set<string>();
+  private keyBindings: KeyBindingsConfig = { ...DEFAULT_KEY_BINDINGS };
 
   // Mobile / Touch virtual state
   public touchMoveX = 0;
   public touchMoveZ = 0;
   public touchSprintHeld = false;
+  public joystickSensitivity = 1.0;
   private touchKickHeld = false;
   private kickHoldDuration = 0;
-  private lastReleasedKickPower = 0.65;
+  private lastReleasedKickPower = 0.55;
 
   // Mouse camera drag delta
   private isRightOrLeftDragging = false;
@@ -50,6 +119,15 @@ export class VarzeaInputManager {
       window.addEventListener('mouseup', this.onMouseUp);
       document.addEventListener('visibilitychange', this.onVisibilityChange);
     }
+  }
+
+  public setKeyBindings(bindings?: Partial<KeyBindingsConfig>) {
+    if (!bindings) return;
+    this.keyBindings = { ...DEFAULT_KEY_BINDINGS, ...bindings };
+  }
+
+  public getKeyBindings(): KeyBindingsConfig {
+    return { ...this.keyBindings };
   }
 
   public dispose() {
@@ -136,35 +214,39 @@ export class VarzeaInputManager {
 
   // Touch button triggers for mobile UI
   public setTouchJoystick(x: number, z: number) {
-    this.touchMoveX = x;
-    this.touchMoveZ = z;
+    const sens = Math.max(0.75, Math.min(1.35, this.joystickSensitivity));
+    this.touchMoveX = Math.max(-1, Math.min(1, x * sens));
+    this.touchMoveZ = Math.max(-1, Math.min(1, z * sens));
   }
 
   public setTouchKickHold(held: boolean) {
+    const shootKey = this.keyBindings.shoot;
     if (this.touchKickHeld && !held) {
-      this.keysJustReleased.add('Space');
+      this.keysJustReleased.add(shootKey);
     } else if (!this.touchKickHeld && held) {
-      this.keysJustPressed.add('Space');
+      this.keysJustPressed.add(shootKey);
     }
     this.touchKickHeld = held;
   }
 
   public triggerTouchAction(action: 'pass' | 'tackle' | 'switch' | 'header') {
-    if (action === 'pass') this.keysJustPressed.add('KeyE');
-    if (action === 'tackle') this.keysJustPressed.add('KeyF');
-    if (action === 'switch') this.keysJustPressed.add('KeyQ');
+    if (action === 'pass') this.keysJustPressed.add(this.keyBindings.pass);
+    if (action === 'tackle') this.keysJustPressed.add(this.keyBindings.tackle);
+    if (action === 'switch') this.keysJustPressed.add(this.keyBindings.switchPlayer);
     if (action === 'header') this.keysJustPressed.add('KeyC');
   }
 
   public sampleFrame(dt: number): InputSnapshot {
-    // Movement axes (WASD + Arrows + Virtual Joystick)
+    const kb = this.keyBindings;
+
+    // Movement axes (Configured Keys + Arrow keys + Virtual 360° Joystick)
     let mx = this.touchMoveX;
     let mz = this.touchMoveZ;
 
-    if (this.keysHeld.has('KeyD') || this.keysHeld.has('ArrowRight')) mx += 1;
-    if (this.keysHeld.has('KeyA') || this.keysHeld.has('ArrowLeft')) mx -= 1;
-    if (this.keysHeld.has('KeyS') || this.keysHeld.has('ArrowDown')) mz += 1;
-    if (this.keysHeld.has('KeyW') || this.keysHeld.has('ArrowUp')) mz -= 1;
+    if (this.keysHeld.has(kb.moveRight) || this.keysHeld.has('ArrowRight')) mx += 1;
+    if (this.keysHeld.has(kb.moveLeft) || this.keysHeld.has('ArrowLeft')) mx -= 1;
+    if (this.keysHeld.has(kb.moveDown) || this.keysHeld.has('ArrowDown')) mz += 1;
+    if (this.keysHeld.has(kb.moveUp) || this.keysHeld.has('ArrowUp')) mz -= 1;
 
     const len = Math.hypot(mx, mz);
     if (len > 1) {
@@ -174,38 +256,44 @@ export class VarzeaInputManager {
 
     const sprintHeld =
       this.touchSprintHeld ||
-      this.keysHeld.has('ShiftLeft') ||
-      this.keysHeld.has('ShiftRight');
+      this.keysHeld.has(kb.sprint) ||
+      (kb.sprint === 'ShiftLeft' && this.keysHeld.has('ShiftRight'));
 
-    const kickHeld = this.touchKickHeld || this.keysHeld.has('Space');
+    const kickHeld = this.touchKickHeld || this.keysHeld.has(kb.shoot);
+    const kickJustPressed = this.keysJustPressed.has(kb.shoot);
+
     if (kickHeld) {
-      this.kickHoldDuration = Math.min(0.85, this.kickHoldDuration + dt);
+      this.kickHoldDuration = Math.min(0.75, this.kickHoldDuration + dt);
+      // Curva progressiva: toque rápido = chute fraco/colocado (~0.32), segurar = chute normal (~0.65) até chute forte máximo (1.0)
       this.lastReleasedKickPower = Math.min(
         1.0,
-        0.35 + (this.kickHoldDuration / 0.65) * 0.65
+        0.28 + Math.pow(this.kickHoldDuration / 0.62, 0.9) * 0.72
       );
     }
 
     const kickJustReleased =
-      this.keysJustReleased.has('Space') ||
-      (this.keysJustPressed.has('Space') && !kickHeld);
+      this.keysJustReleased.has(kb.shoot) ||
+      (kickJustPressed && !kickHeld);
 
     const snapshot: InputSnapshot = {
       moveX: mx,
       moveZ: mz,
       sprintHeld,
       kickHeld,
+      kickJustPressed,
       kickJustReleased,
       kickChargePower: kickHeld
-        ? Math.min(1.0, 0.35 + (this.kickHoldDuration / 0.65) * 0.65)
+        ? Math.min(1.0, 0.28 + Math.pow(this.kickHoldDuration / 0.62, 0.9) * 0.72)
         : this.lastReleasedKickPower,
-      passJustPressed: this.keysJustPressed.has('KeyE'),
-      longPassJustPressed: this.keysJustPressed.has('KeyR'),
-      switchJustPressed: this.keysJustPressed.has('KeyQ'),
-      tackleJustPressed: this.keysJustPressed.has('KeyF'),
+      passJustPressed: this.keysJustPressed.has(kb.pass),
+      longPassJustPressed: this.keysJustPressed.has(kb.longPass),
+      switchJustPressed: this.keysJustPressed.has(kb.switchPlayer),
+      tackleJustPressed: this.keysJustPressed.has(kb.tackle),
       headerJustPressed: this.keysJustPressed.has('KeyC'),
       pauseJustPressed:
-        this.keysJustPressed.has('KeyP') || this.keysJustPressed.has('Escape'),
+        this.keysJustPressed.has(kb.pause) ||
+        this.keysJustPressed.has('Escape') ||
+        this.keysJustPressed.has('KeyP'),
       mouseDeltaX: this.accumMouseDX,
       mouseDeltaY: this.accumMouseDY,
     };
@@ -222,3 +310,4 @@ export class VarzeaInputManager {
     return snapshot;
   }
 }
+

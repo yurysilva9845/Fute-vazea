@@ -13,12 +13,15 @@ import {
   TeamConfig,
 } from '../types/game';
 import {
+  computePassVelocity,
+  computeShotVelocity,
   DEFAULT_PITCH,
   formatMatchTime,
   getActivePlayersForMode,
   getMudSpeedMultiplier,
   getTerrainHeightAt,
   resolvePlayerBallInteraction,
+  selectBestPassTarget,
   stepBallPhysics,
 } from './rules';
 import { buildVarzeaEnvironment } from './environment';
@@ -35,9 +38,8 @@ import { audioEngine } from './audio';
 import {
   auth,
   ClientInputState,
-  publishClientInput,
-  publishHostMatchSnapshot,
 } from '../services/firebase';
+import { realtimeMatchClient } from '../services/realtimeMatchClient';
 
 export interface LiveHUDUpdate {
   controlledPlayerName: string;
@@ -172,6 +174,45 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
   useEffect(() => {
     restartSignalRef.current = restartSignal;
   }, [restartSignal]);
+
+  // Connect to 30Hz Authoritative WebSocket Server when in an Online Match Room
+  useEffect(() => {
+    const myUid = auth.currentUser?.uid;
+    if (
+      activeRoom &&
+      activeRoom.roomCode &&
+      (activeRoom.status === 'starting' || activeRoom.status === 'playing') &&
+      myUid
+    ) {
+      const matchId = activeRoom.matchId || `MTC-${activeRoom.roomCode}`;
+      realtimeMatchClient.connectAndJoin({
+        roomCode: activeRoom.roomCode,
+        matchId,
+        uid: myUid,
+        displayName: auth.currentUser?.displayName || 'Jogador',
+        slotId: onlineControlledCharacterId || 'home_1',
+        mode: activeRoom.mode === '2v2' ? '2v2' : '4v4',
+        slots: activeRoom.slots || {},
+        halfDurationSeconds: settings.halfDurationSeconds,
+      });
+      if (activeRoom.status === 'playing') {
+        realtimeMatchClient.sendPlayerReady(true);
+      }
+      return () => {
+        if (screenState === 'title') {
+          realtimeMatchClient.disconnect(true);
+        }
+      };
+    }
+    return undefined;
+  }, [
+    activeRoom?.roomCode,
+    activeRoom?.matchId,
+    activeRoom?.status,
+    onlineControlledCharacterId,
+    settings.halfDurationSeconds,
+    screenState,
+  ]);
 
   useEffect(() => {
     const container = canvasMountRef.current;
@@ -411,7 +452,6 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
     let bannerMessage: string | null = null;
     let bannerSubtext: string | null = null;
     let hitstopTimer = 0;
-    let lastNetworkSyncMs = 0;
 
     const stats: MatchStats = {
       homeGoals: 0,
@@ -460,7 +500,6 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
     let guestFulltimeHandled = false;
     let lastGuestHomeGoals = 0;
     let lastGuestAwayGoals = 0;
-    const lastRemoteActionTsByUid: Record<string, number> = {};
 
     const resetFullMatch = () => {
       stats.homeGoals = 0;
@@ -532,84 +571,122 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       resizeObserver.observe(container);
     }
 
-    // Helper to execute a pass or shot from a player
+    // 5b. Pass Target Ring Indicator (highlights teammate who will receive a directional pass)
+    const passTargetRingMesh = new THREE.Mesh(
+      new THREE.RingGeometry(0.42, 0.54, 24).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        transparent: true,
+        opacity: 0.72,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    passTargetRingMesh.visible = false;
+    scene.add(passTargetRingMesh);
+
+    let autoSwitchCooldown = 0;
+
+    // Helper to execute a pass or shot from a player using directional pass & complete shot physics
     const executeBallStrike = (
       player: PlayerRuntimeState,
       kind: 'pass' | 'long_pass' | 'shoot' | 'header',
       power: number,
       aimX?: number,
-      aimZ?: number
+      aimZ?: number,
+      moveInputX = 0,
+      moveInputZ = 0
     ) => {
-      const dirX =
-        aimX !== undefined ? aimX - player.x : Math.sin(player.facingAngle);
-      const dirZ =
-        aimZ !== undefined ? aimZ - player.z : Math.cos(player.facingAngle);
-      const len = Math.hypot(dirX, dirZ) || 1;
-      const nx = dirX / len;
-      const nz = dirZ / len;
-
-      player.facingAngle = Math.atan2(nx, nz);
       player.hasBall = false;
       ballState.ownerId = null;
       ballState.lastTouchTeam = player.team;
       ballState.lastTouchPlayerName = player.config.name;
 
-      ballState.x = player.x + nx * 0.65;
-      ballState.z = player.z + nz * 0.65;
-
-      if (kind === 'pass') {
-        const speed = 11.5 * player.config.kickStat;
-        ballState.vx = nx * speed;
-        ballState.vz = nz * speed;
-        ballState.vy = 1.1;
-        player.animState = 'pass';
-        player.animTimer = 0;
-        if (player.team === 'home') stats.homePasses++;
-        else stats.awayPasses++;
-        audioEngine.playKick(0.45);
-        world.particles.spawnBurst(
-          ballState.x,
-          ballState.y,
-          ballState.z,
-          'dust',
-          5
+      if (kind === 'pass' || kind === 'long_pass') {
+        const mates = playersState.filter(
+          (m) => m.team === player.team && m.id !== player.id
         );
-      } else if (kind === 'long_pass') {
-        const speed = 15.5 * player.config.kickStat;
-        ballState.vx = nx * speed;
-        ballState.vz = nz * speed;
-        ballState.vy = 5.4;
-        player.animState = 'kick';
+        const explicitMate =
+          aimX !== undefined && aimZ !== undefined
+            ? mates.reduce<PlayerRuntimeState | null>((best, m) => {
+                if (!best) return m;
+                const d1 = Math.hypot(m.x - aimX, m.z - aimZ);
+                const d2 = Math.hypot(best.x - aimX, best.z - aimZ);
+                return d1 < d2 ? m : best;
+              }, null)
+            : selectBestPassTarget(player, playersState, moveInputX, moveInputZ);
+
+        const passVel = computePassVelocity(
+          player,
+          ballState,
+          explicitMate,
+          moveInputX,
+          moveInputZ,
+          kind === 'long_pass'
+        );
+        player.facingAngle = Math.atan2(passVel.vx, passVel.vz);
+        const nx = Math.sin(player.facingAngle);
+        const nz = Math.cos(player.facingAngle);
+        ballState.x = player.x + nx * 0.62;
+        ballState.z = player.z + nz * 0.62;
+        ballState.vx = passVel.vx;
+        ballState.vy = passVel.vy;
+        ballState.vz = passVel.vz;
+
+        player.animState = kind === 'long_pass' ? 'kick' : 'pass';
         player.animTimer = 0;
         if (player.team === 'home') stats.homePasses++;
         else stats.awayPasses++;
-        audioEngine.playKick(0.75);
+        audioEngine.playKick(kind === 'long_pass' ? 0.72 : 0.48);
         world.particles.spawnBurst(
           ballState.x,
           ballState.y,
           ballState.z,
           'dust',
-          9
+          kind === 'long_pass' ? 8 : 5
         );
       } else if (kind === 'header') {
-        const speed = 12.5 * player.config.kickStat;
+        const dirX =
+          aimX !== undefined ? aimX - player.x : Math.sin(player.facingAngle);
+        const dirZ =
+          aimZ !== undefined ? aimZ - player.z : Math.cos(player.facingAngle);
+        const len = Math.hypot(dirX, dirZ) || 1;
+        const nx = dirX / len;
+        const nz = dirZ / len;
+        player.facingAngle = Math.atan2(nx, nz);
+        ballState.x = player.x + nx * 0.62;
+        ballState.z = player.z + nz * 0.62;
+        const speed = 12.8 * player.config.kickStat;
         ballState.vx = nx * speed;
         ballState.vz = nz * speed;
-        ballState.vy = 3.2;
+        ballState.vy = 3.1;
         player.animState = 'header';
         player.animTimer = 0;
         audioEngine.playKick(0.6);
       } else {
-        const clampedPower = THREE.MathUtils.clamp(power, 0.35, 1.0);
-        const speed = (13.0 + clampedPower * 11.5) * player.config.kickStat;
-        ballState.vx = nx * speed;
-        ballState.vz = nz * speed;
-        ballState.vy = 1.6 + clampedPower * 4.4;
+        const shotVel = computeShotVelocity(
+          player,
+          ballState,
+          power,
+          moveInputX,
+          moveInputZ,
+          DEFAULT_PITCH
+        );
+        player.facingAngle = Math.atan2(shotVel.vx, shotVel.vz);
+        const nx = Math.sin(player.facingAngle);
+        const nz = Math.cos(player.facingAngle);
+        ballState.x = player.x + nx * 0.64;
+        ballState.z = player.z + nz * 0.64;
+        ballState.vx = shotVel.vx;
+        ballState.vy = shotVel.vy;
+        ballState.vz = shotVel.vz;
+
         player.animState = 'kick';
         player.animTimer = 0;
         if (player.team === 'home') stats.homeShots++;
         else stats.awayShots++;
 
+        const clampedPower = THREE.MathUtils.clamp(power, 0.25, 1.0);
         audioEngine.playKick(clampedPower);
         const pKind = player.inPuddle
           ? 'water'
@@ -625,7 +702,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         );
         if (clampedPower > 0.72) {
           cameraRig.addTrauma(0.32);
-          hitstopTimer = 0.035;
+          hitstopTimer = 0.03;
         }
       }
     };
@@ -634,6 +711,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
     let frameId = 0;
     let lastTimestamp = performance.now();
     let elapsedTime = 0;
+    let lastAppliedGraphicsQuality = propsRef.current.settings.graphicsQuality;
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -660,6 +738,23 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
 
       const currentProps = propsRef.current;
 
+      // Adaptive Graphics Quality adjustment
+      if (
+        !isSoftwareGl &&
+        currentProps.settings.graphicsQuality !== lastAppliedGraphicsQuality
+      ) {
+        lastAppliedGraphicsQuality = currentProps.settings.graphicsQuality;
+        const q = lastAppliedGraphicsQuality || 'auto';
+        const targetRatio =
+          q === 'desempenho'
+            ? 1
+            : q === 'auto'
+            ? Math.min(window.devicePixelRatio, 1.5)
+            : Math.min(window.devicePixelRatio, 2);
+        renderer.setPixelRatio(targetRatio);
+        renderer.shadowMap.enabled = q !== 'desempenho';
+      }
+
       if (rebuildRigsSignalRef.current !== lastHandledRebuild) {
         lastHandledRebuild = rebuildRigsSignalRef.current;
         createPlayersFromConfig();
@@ -681,15 +776,20 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       }
       prevScreenState = currentProps.screenState;
 
-      // Online Multiplayer role check
+      // Online Multiplayer role & 30Hz Authoritative WebSocket check
       const room = currentProps.activeRoom;
       const isOnlineMatch = Boolean(room && room.roomCode);
-      const myUid = auth.currentUser?.uid;
-      const isOnlineHost =
-        !isOnlineMatch || !room?.hostUid || room.hostUid === myUid;
+      const wsConnected =
+        isOnlineMatch &&
+        realtimeMatchClient.getStatus() === 'connected' &&
+        realtimeMatchClient.getLatestSnapshot() !== null;
 
       if (isOnlineMatch && currentProps.onlineControlledCharacterId) {
         controlledPlayerId = currentProps.onlineControlledCharacterId;
+      }
+
+      if (autoSwitchCooldown > 0) {
+        autoSwitchCooldown = Math.max(0, autoSwitchCooldown - dt);
       }
 
       const input = inputManager.sampleFrame(dt);
@@ -720,25 +820,48 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       if (hitstopTimer > 0) {
         hitstopTimer = Math.max(0, hitstopTimer - dt);
       } else if (isSimulating) {
-        // If Online Non-Host Client: interpolate authoritative ball, clock, score, goal events & non-controlled players from room.matchState
-        if (isOnlineMatch && !isOnlineHost && room?.matchState) {
-          const ms = room.matchState;
-          ballState.x = THREE.MathUtils.lerp(ballState.x, ms.ball.x, 0.35);
-          ballState.y = THREE.MathUtils.lerp(ballState.y, ms.ball.y, 0.35);
-          ballState.z = THREE.MathUtils.lerp(ballState.z, ms.ball.z, 0.35);
-          ballState.vx = ms.ball.vx;
-          ballState.vy = ms.ball.vy;
-          ballState.vz = ms.ball.vz;
-          matchPhase = ms.phase || 'open_play';
-          celebratingPlayerId = ms.celebratingPlayerId || null;
-          bannerMessage = ms.bannerMessage;
-          bannerSubtext = ms.bannerSubtext;
+        // 1. Send compact 30Hz player command to Authoritative WebSocket Server when in online match
+        if (isOnlineMatch && currentProps.screenState === 'playing') {
+          realtimeMatchClient.sendInputCommand(
+            {
+              slotId: controlledPlayerId,
+              moveX: input.moveX,
+              moveZ: input.moveZ,
+              sprint: input.sprintHeld,
+              pass: input.passJustPressed || input.longPassJustPressed,
+              shoot: input.kickJustReleased,
+              shootPower: input.kickChargePower,
+              tackle: input.tackleJustPressed,
+              switchPlayer: input.switchJustPressed,
+            },
+            dt
+          );
+        }
 
-          // Sync score & detect newly scored goals on Guest client
-          const nextHomeGoals = typeof ms.homeGoals === 'number' ? ms.homeGoals : room.homeScore || 0;
-          const nextAwayGoals = typeof ms.awayGoals === 'number' ? ms.awayGoals : room.awayScore || 0;
+        // 2. If connected to 30Hz Authoritative WebSocket Server: apply snapshot interpolation & client reconciliation
+        const wsSnap = wsConnected
+          ? realtimeMatchClient.getInterpolatedSnapshot(50)
+          : null;
 
-          if (nextHomeGoals > lastGuestHomeGoals || nextAwayGoals > lastGuestAwayGoals) {
+        if (isOnlineMatch && wsSnap) {
+          ballState.x = THREE.MathUtils.lerp(ballState.x, wsSnap.ball.x, 0.45);
+          ballState.y = THREE.MathUtils.lerp(ballState.y, wsSnap.ball.y, 0.45);
+          ballState.z = THREE.MathUtils.lerp(ballState.z, wsSnap.ball.z, 0.45);
+          ballState.vx = wsSnap.ball.vx;
+          ballState.vy = wsSnap.ball.vy;
+          ballState.vz = wsSnap.ball.vz;
+          ballState.ownerId = wsSnap.ball.ownerId || null;
+          matchPhase = wsSnap.phase || 'open_play';
+          bannerMessage = wsSnap.bannerMessage;
+          bannerSubtext = wsSnap.bannerSubtext;
+
+          const nextHomeGoals = wsSnap.homeGoals || 0;
+          const nextAwayGoals = wsSnap.awayGoals || 0;
+
+          if (
+            nextHomeGoals > lastGuestHomeGoals ||
+            nextAwayGoals > lastGuestAwayGoals
+          ) {
             const scoredHome = nextHomeGoals > lastGuestHomeGoals;
             lastGuestHomeGoals = nextHomeGoals;
             lastGuestAwayGoals = nextAwayGoals;
@@ -746,25 +869,23 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             stats.awayGoals = nextAwayGoals;
             world.triggerNetRipple(scoredHome ? 'right' : 'left');
             audioEngine.playGoalCelebration();
-            cameraRig.addTrauma(0.45);
-            world.particles.spawnBurst(ballState.x, ballState.y, ballState.z, 'dust', 20);
+            cameraRig.addTrauma(0.42);
+            world.particles.spawnBurst(
+              ballState.x,
+              ballState.y,
+              ballState.z,
+              'dust',
+              20
+            );
           } else {
             stats.homeGoals = nextHomeGoals;
             stats.awayGoals = nextAwayGoals;
           }
 
-          currentHalf = ms.half || room.half || 1;
-          remainingHalfSeconds =
-            typeof ms.remainingSeconds === 'number'
-              ? ms.remainingSeconds
-              : room.remainingSeconds ?? remainingHalfSeconds;
-
+          currentHalf = wsSnap.half || 1;
+          remainingHalfSeconds = wsSnap.remainingSeconds;
           const secInt = Math.max(0, Math.ceil(remainingHalfSeconds));
-          if (
-            secInt !== lastReportedSecond ||
-            stats.homeGoals !== lastGuestHomeGoals ||
-            stats.awayGoals !== lastGuestAwayGoals
-          ) {
+          if (secInt !== lastReportedSecond) {
             lastReportedSecond = secInt;
             currentProps.onScoreAndClockUpdate(
               stats.homeGoals,
@@ -776,7 +897,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           }
 
           if (
-            (ms.phase === 'fulltime' || room.status === 'finished') &&
+            wsSnap.phase === 'fulltime' &&
             currentProps.screenState === 'playing' &&
             !guestFulltimeHandled
           ) {
@@ -785,29 +906,65 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             currentProps.onMatchFinished({ ...stats });
           }
 
-          playersState.forEach((p) => {
-            if (p.id !== controlledPlayerId && ms.players?.[p.id]) {
-              const netP = ms.players[p.id];
-              p.x = THREE.MathUtils.lerp(p.x, netP.x, 0.35);
-              p.z = THREE.MathUtils.lerp(p.z, netP.z, 0.35);
-              p.y = getTerrainHeightAt(p.x, p.z);
-              p.vx = netP.vx;
-              p.vz = netP.vz;
-              p.facingAngle = netP.facingAngle;
-              p.animState = netP.animState;
-            } else if (p.id === controlledPlayerId && ms.players?.[p.id] && matchPhase !== 'open_play') {
-              // During kickoff/celebration resets, align controlled player with host position
-              const netP = ms.players[p.id];
-              p.x = THREE.MathUtils.lerp(p.x, netP.x, 0.25);
-              p.z = THREE.MathUtils.lerp(p.z, netP.z, 0.25);
-              p.y = getTerrainHeightAt(p.x, p.z);
+          // Reconcile local player & interpolate remote players
+          Object.entries(wsSnap.players || {}).forEach(([playerId, netP]) => {
+            const localP = playersState.find((p) => p.id === playerId);
+            if (!localP) return;
+            localP.hasBall = wsSnap.ball.ownerId === playerId;
+            if (typeof netP.stamina === 'number') {
+              localP.stamina = netP.stamina;
+            }
+
+            if (localP.id === controlledPlayerId && matchPhase === 'open_play') {
+              // Client-Side Prediction + Server Reconciliation without sudden teleports
+              const reconciled =
+                realtimeMatchClient.getReconciledLocalPlayerTarget(
+                  localP.id,
+                  netP,
+                  5.4 * localP.config.speedStat
+                );
+              const errDist = Math.hypot(
+                reconciled.x - localP.x,
+                reconciled.z - localP.z
+              );
+              if (errDist > 3.2) {
+                localP.x = reconciled.x;
+                localP.z = reconciled.z;
+              } else if (errDist > 0.08) {
+                localP.x = THREE.MathUtils.damp(
+                  localP.x,
+                  reconciled.x,
+                  14,
+                  dt
+                );
+                localP.z = THREE.MathUtils.damp(
+                  localP.z,
+                  reconciled.z,
+                  14,
+                  dt
+                );
+              }
+              localP.y = getTerrainHeightAt(localP.x, localP.z);
+            } else {
+              // Smooth snapshot interpolation for remote players & bots
+              localP.x = THREE.MathUtils.lerp(localP.x, netP.x, 0.42);
+              localP.z = THREE.MathUtils.lerp(localP.z, netP.z, 0.42);
+              localP.y = getTerrainHeightAt(localP.x, localP.z);
+              localP.vx = netP.vx;
+              localP.vz = netP.vz;
+              localP.facingAngle = netP.facingAngle;
+              localP.animState = netP.animState;
+              const spd = Math.hypot(netP.vx, netP.vz);
+              if (spd > 0.25) {
+                localP.stridePhase += spd * dt * 2.35;
+              }
             }
           });
         }
 
-        // Match Clock in 'playing' (Authoritative on Host or Singleplayer)
+        // Match Clock in 'playing' (Singleplayer or local fallback when WS not yet connected)
         if (
-          isOnlineHost &&
+          (!isOnlineMatch || !wsConnected) &&
           currentProps.screenState === 'playing' &&
           matchPhase === 'open_play'
         ) {
@@ -839,8 +996,8 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           }
         }
 
-        // Phase transitions (Goal Celebration, Throw-in, Halftime)
-        if (isOnlineHost) {
+        // Phase transitions (Goal Celebration, Throw-in, Halftime) when running locally
+        if (!isOnlineMatch || !wsConnected) {
           if (matchPhase === 'goal_celebration') {
             phaseTimer -= dt;
             if (phaseTimer <= 0) {
@@ -877,20 +1034,24 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           }
         }
 
-        // Switch active player with Q (only in offline / singleplayer mode; in online mode each human controls their locked character)
+        // Switch active player with Q / TROCAR JOGADOR (immediate manual switch)
         if (
           !isOnlineMatch &&
           currentProps.screenState === 'playing' &&
           input.switchJustPressed
         ) {
-          controlledPlayerId = findBestSwitchTeammate(
+          const nextId = findBestSwitchTeammate(
             controlledPlayerId,
             ballState,
             playersState
           );
+          if (nextId !== controlledPlayerId) {
+            controlledPlayerId = nextId;
+            autoSwitchCooldown = 0.75;
+          }
         }
 
-        // Auto-switch to teammate if a teammate gains possession of the ball (offline mode)
+        // Auto-switch to teammate with hysteresis cooldown (prevents rapid flickering)
         const currentControlledPlayer = playersState.find(
           (p) => p.id === controlledPlayerId
         );
@@ -898,44 +1059,52 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         if (
           !isOnlineMatch &&
           currentProps.screenState === 'playing' &&
-          ballState.ownerId &&
-          ballState.ownerId.startsWith(`${userTeam}_`) &&
-          ballState.ownerId !== controlledPlayerId
+          currentProps.settings.autoSwitchPlayer !== false &&
+          autoSwitchCooldown <= 0
         ) {
-          controlledPlayerId = ballState.ownerId;
+          if (
+            ballState.ownerId &&
+            ballState.ownerId.startsWith(`${userTeam}_`) &&
+            ballState.ownerId !== controlledPlayerId
+          ) {
+            controlledPlayerId = ballState.ownerId;
+            autoSwitchCooldown = 0.65;
+          } else if (!ballState.ownerId && currentControlledPlayer) {
+            const bestMateId = findBestSwitchTeammate(
+              controlledPlayerId,
+              ballState,
+              playersState
+            );
+            const bestMate = playersState.find((m) => m.id === bestMateId);
+            if (bestMate) {
+              const distCurrent = Math.hypot(
+                ballState.x - currentControlledPlayer.x,
+                ballState.z - currentControlledPlayer.z
+              );
+              const distMate = Math.hypot(
+                ballState.x - bestMate.x,
+                ballState.z - bestMate.z
+              );
+              if (distMate + 2.4 < distCurrent) {
+                controlledPlayerId = bestMate.id;
+                autoSwitchCooldown = 0.85;
+              }
+            }
+          }
         }
 
         const celebratingScorer = playersState.find(
           (p) => p.id === celebratingPlayerId
         );
 
-        // Update all 8 players
+        // Update players (all 8 locally in Singleplayer/fallback; or Client-Side Prediction on controlled player in WS online match)
         for (let i = 0; i < playersState.length; i++) {
           const p = playersState[i];
           const isUserControlled =
             currentProps.screenState === 'playing' &&
             p.id === controlledPlayerId;
 
-          // If online host, check if this character is controlled by another remote human client
-          const slotInfo = room?.slots?.[p.id];
-          const isRemoteHumanOnHost = Boolean(
-            isOnlineMatch &&
-              isOnlineHost &&
-              slotInfo &&
-              !slotInfo.isBot &&
-              slotInfo.uid &&
-              slotInfo.uid !== myUid
-          );
-          const remoteInput =
-            isRemoteHumanOnHost && slotInfo?.uid
-              ? room?.inputs?.[slotInfo.uid]
-              : undefined;
-          const hasFreshRemoteInput = Boolean(
-            remoteInput && Date.now() - (remoteInput.timestamp || 0) < 12000
-          );
-
-          // If online non-host client, only simulate the locally controlled player
-          if (isOnlineMatch && !isOnlineHost && !isUserControlled) {
+          if (isOnlineMatch && wsConnected && !isUserControlled) {
             continue;
           }
 
@@ -945,8 +1114,8 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             p.stunTimer = Math.max(0, p.stunTimer - dt);
             p.animState = 'fall';
             p.animTimer += dt;
-            p.vx *= 0.85;
-            p.vz *= 0.85;
+            p.vx *= 0.82;
+            p.vz *= 0.82;
           }
 
           const mudInfo = getMudSpeedMultiplier(p.x, p.z);
@@ -956,17 +1125,16 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           if (matchPhase === 'goal_celebration') {
             p.animTimer += dt;
             if (celebratingScorer && p.id === celebratingScorer.id) {
-              // Goal scorer runs briefly toward the sideline camera, then performs their signature 3D celebration!
               const targetZ = Math.min(6.2, p.z + 2.5);
               if (p.animTimer < 0.55 && p.z < 5.0) {
                 p.vx = 0;
                 p.vz = 4.2;
-                p.facingAngle = 0; // Face +Z camera
+                p.facingAngle = 0;
                 p.stridePhase += 4.2 * dt * 2.4;
               } else {
                 p.vx = 0;
                 p.vz = 0;
-                p.facingAngle = 0; // Face camera for celebration
+                p.facingAngle = 0;
               }
               p.z = Math.min(targetZ, p.z + p.vz * dt);
               p.animState = 'celebrate';
@@ -974,7 +1142,6 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
               celebratingScorer &&
               p.team === celebratingScorer.team
             ) {
-              // Teammates jog toward the goal scorer to celebrate together!
               const dx = celebratingScorer.x - p.x;
               const dz = celebratingScorer.z - p.z;
               const dist = Math.hypot(dx, dz);
@@ -992,7 +1159,6 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
                 p.animState = 'celebrate';
               }
             } else {
-              // Conceding team stands idle
               p.vx = 0;
               p.vz = 0;
               p.animState = 'idle';
@@ -1005,13 +1171,13 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             if (isUserControlled) {
               moveX = input.moveX;
               moveZ = input.moveZ;
-              wantSprint = input.sprintHeld && p.stamina > 8;
+              wantSprint = input.sprintHeld && p.stamina > 6;
 
               if (input.tackleJustPressed && p.tackleCooldown <= 0) {
-                p.tackleCooldown = 1.25;
+                p.tackleCooldown = 1.05;
                 p.animState = 'tackle';
                 p.animTimer = 0;
-                const lungeSpeed = 9.2 * p.config.tackleStat;
+                const lungeSpeed = 9.5 * p.config.tackleStat;
                 p.vx = Math.sin(p.facingAngle) * lungeSpeed;
                 p.vz = Math.cos(p.facingAngle) * lungeSpeed;
                 audioEngine.playSlideTackle(p.inPuddle);
@@ -1028,129 +1194,38 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
                 ballState.x - p.x,
                 ballState.z - p.z
               );
-              if (input.headerJustPressed && distBall < 1.55) {
-                executeBallStrike(p, 'header', 0.75);
+              if (input.headerJustPressed && distBall < 1.62) {
+                executeBallStrike(p, 'header', 0.75, undefined, undefined, moveX, moveZ);
               }
 
               if (
                 (input.passJustPressed || input.longPassJustPressed) &&
-                distBall < 1.45
+                distBall < 1.62
               ) {
-                const mates = playersState.filter(
-                  (m) => m.team === p.team && m.id !== p.id
-                );
-                let targetMate = mates[0];
-                let bestScore = -Infinity;
-                const aimDirX =
-                  Math.abs(moveX) > 0.1 || Math.abs(moveZ) > 0.1
-                    ? moveX
-                    : Math.sin(p.facingAngle);
-                const aimDirZ =
-                  Math.abs(moveX) > 0.1 || Math.abs(moveZ) > 0.1
-                    ? moveZ
-                    : Math.cos(p.facingAngle);
-                for (const m of mates) {
-                  const dx = m.x - p.x;
-                  const dz = m.z - p.z;
-                  const d = Math.hypot(dx, dz) || 1;
-                  const align = (dx * aimDirX + dz * aimDirZ) / d;
-                  const score = align * 2.0 - d * 0.04;
-                  if (score > bestScore) {
-                    bestScore = score;
-                    targetMate = m;
-                  }
-                }
                 executeBallStrike(
                   p,
                   input.longPassJustPressed ? 'long_pass' : 'pass',
-                  0.65,
-                  targetMate
-                    ? targetMate.x + (p.team === 'home' ? 1.2 : -1.2)
-                    : undefined,
-                  targetMate ? targetMate.z : undefined
+                  0.68,
+                  undefined,
+                  undefined,
+                  moveX,
+                  moveZ
                 );
               }
 
-              if (input.kickJustReleased && distBall < 1.55) {
-                const targetGoalX =
-                  p.team === 'home'
-                    ? DEFAULT_PITCH.width / 2
-                    : -DEFAULT_PITCH.width / 2;
-                const aimX =
-                  Math.abs(moveX) > 0.15 ? p.x + moveX * 12 : targetGoalX;
-                const aimZ =
-                  Math.abs(moveZ) > 0.15
-                    ? moveZ * (DEFAULT_PITCH.goalWidth * 0.45)
-                    : (Math.random() - 0.5) * 1.4;
+              if (input.kickJustReleased && distBall < 1.68) {
                 executeBallStrike(
                   p,
                   'shoot',
                   input.kickChargePower,
-                  aimX,
-                  aimZ
+                  undefined,
+                  undefined,
+                  moveX,
+                  moveZ
                 );
               }
-            } else if (isRemoteHumanOnHost && hasFreshRemoteInput && remoteInput && slotInfo?.uid) {
-              // Authoritative simulation of remote human guest inputs on the Host
-              moveX = THREE.MathUtils.clamp(remoteInput.moveX || 0, -1, 1);
-              moveZ = THREE.MathUtils.clamp(remoteInput.moveZ || 0, -1, 1);
-              wantSprint = Boolean(remoteInput.sprint) && p.stamina > 8;
-
-              const isNewActionPacket =
-                remoteInput.action !== 'none' &&
-                remoteInput.timestamp !== lastRemoteActionTsByUid[slotInfo.uid];
-
-              if (isNewActionPacket) {
-                lastRemoteActionTsByUid[slotInfo.uid] = remoteInput.timestamp;
-                const distBall = Math.hypot(ballState.x - p.x, ballState.z - p.z);
-
-                if (remoteInput.action === 'tackle' && p.tackleCooldown <= 0) {
-                  p.tackleCooldown = 1.25;
-                  p.animState = 'tackle';
-                  p.animTimer = 0;
-                  const lungeSpeed = 9.2 * p.config.tackleStat;
-                  p.vx = Math.sin(p.facingAngle) * lungeSpeed;
-                  p.vz = Math.cos(p.facingAngle) * lungeSpeed;
-                  audioEngine.playSlideTackle(p.inPuddle);
-                  world.particles.spawnBurst(
-                    p.x,
-                    0.05,
-                    p.z,
-                    p.inPuddle ? 'water' : 'mud',
-                    10
-                  );
-                } else if (remoteInput.action === 'pass' && distBall < 1.55) {
-                  const mates = playersState.filter(
-                    (m) => m.team === p.team && m.id !== p.id
-                  );
-                  const targetMate = mates[0];
-                  executeBallStrike(
-                    p,
-                    'pass',
-                    0.68,
-                    targetMate ? targetMate.x : undefined,
-                    targetMate ? targetMate.z : undefined
-                  );
-                } else if (remoteInput.action === 'shoot' && distBall < 1.65) {
-                  const targetGoalX =
-                    p.team === 'home'
-                      ? DEFAULT_PITCH.width / 2
-                      : -DEFAULT_PITCH.width / 2;
-                  const aimZ =
-                    Math.abs(moveZ) > 0.15
-                      ? moveZ * (DEFAULT_PITCH.goalWidth * 0.45)
-                      : (Math.random() - 0.5) * 1.3;
-                  executeBallStrike(
-                    p,
-                    'shoot',
-                    remoteInput.kickPower || 0.78,
-                    targetGoalX,
-                    aimZ
-                  );
-                }
-              }
             } else {
-              // AI control for bots (or fallback if remote human temporarily has no input packet)
+              // Role-based AI control for bots (with anti-crowding & spacing)
               const ai = computeAIDecision(
                 p,
                 ballState,
@@ -1162,7 +1237,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
               wantSprint = ai.sprint;
 
               if (ai.action === 'tackle' && p.tackleCooldown <= 0) {
-                p.tackleCooldown = 1.4;
+                p.tackleCooldown = 1.35;
                 p.animState = 'tackle';
                 p.animTimer = 0;
                 p.vx = Math.sin(p.facingAngle) * 8.4;
@@ -1175,7 +1250,9 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
                   ai.action === 'clear' ? 'long_pass' : 'pass',
                   0.7,
                   ai.targetX,
-                  ai.targetZ
+                  ai.targetZ,
+                  moveX,
+                  moveZ
                 );
               } else if (ai.action === 'shoot') {
                 executeBallStrike(
@@ -1183,7 +1260,9 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
                   'shoot',
                   0.78,
                   ai.targetX,
-                  ai.targetZ
+                  ai.targetZ,
+                  moveX,
+                  moveZ
                 );
               }
             }
@@ -1195,10 +1274,10 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
               p.animState === 'header'
             ) {
               p.animTimer += dt;
-              const maxDur = p.animState === 'tackle' ? 0.48 : 0.34;
+              const maxDur = p.animState === 'tackle' ? 0.44 : 0.32;
               if (p.animState === 'tackle') {
-                p.vx *= Math.exp(-3.2 * dt);
-                p.vz *= Math.exp(-3.2 * dt);
+                p.vx *= Math.exp(-3.4 * dt);
+                p.vz *= Math.exp(-3.4 * dt);
               }
               if (p.animTimer >= maxDur) {
                 p.animState = 'idle';
@@ -1207,33 +1286,48 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             }
 
             if (p.animState !== 'tackle') {
-              p.isSprinting =
-                wantSprint &&
-                (Math.abs(moveX) > 0.05 || Math.abs(moveZ) > 0.05);
+              const hasMoveInput =
+                Math.abs(moveX) > 0.04 || Math.abs(moveZ) > 0.04;
+              p.isSprinting = wantSprint && hasMoveInput;
               if (p.isSprinting) {
-                p.stamina = Math.max(0, p.stamina - 14 * dt);
+                p.stamina = Math.max(0, p.stamina - 12.5 * dt);
               } else {
-                p.stamina = Math.min(100, p.stamina + 11 * dt);
+                p.stamina = Math.min(100, p.stamina + 13.5 * dt);
               }
 
-              const baseSpeed = 5.4 * p.config.speedStat * mudInfo.multiplier;
-              const topSpeed = p.isSprinting ? baseSpeed * 1.34 : baseSpeed;
+              const baseSpeed = 5.65 * p.config.speedStat * mudInfo.multiplier;
+              const topSpeed = p.isSprinting ? baseSpeed * 1.35 : baseSpeed;
 
               const targetVX = moveX * topSpeed;
               const targetVZ = moveZ * topSpeed;
-              p.vx = THREE.MathUtils.damp(p.vx, targetVX, 10, dt);
-              p.vz = THREE.MathUtils.damp(p.vz, targetVZ, 10, dt);
+
+              // Snappy acceleration, crisp braking when input released, and fast turn boost when reversing direction
+              const dotDir = p.vx * targetVX + p.vz * targetVZ;
+              const responseRate = !hasMoveInput
+                ? 22 // Crisp immediate braking when releasing joystick/keys
+                : dotDir < -0.5
+                ? 24 // Fast direction reversal without heavy sliding
+                : 18; // Snappy acceleration
+
+              p.vx = THREE.MathUtils.damp(p.vx, targetVX, responseRate, dt);
+              p.vz = THREE.MathUtils.damp(p.vz, targetVZ, responseRate, dt);
+              if (!hasMoveInput && Math.hypot(p.vx, p.vz) < 0.14) {
+                p.vx = 0;
+                p.vz = 0;
+              }
 
               const speed = Math.hypot(p.vx, p.vz);
-              if (speed > 0.25) {
-                const targetAngle = Math.atan2(p.vx, p.vz);
+              if (speed > 0.18) {
+                const targetAngle = hasMoveInput
+                  ? Math.atan2(moveX, moveZ)
+                  : Math.atan2(p.vx, p.vz);
                 let diff = targetAngle - p.facingAngle;
                 while (diff > Math.PI) diff -= Math.PI * 2;
                 while (diff < -Math.PI) diff += Math.PI * 2;
-                p.facingAngle += diff * Math.min(1, 12 * dt);
+                p.facingAngle += diff * Math.min(1, 16 * dt);
 
                 const prevStride = p.stridePhase;
-                p.stridePhase += speed * dt * 2.35;
+                p.stridePhase += speed * dt * 2.38;
 
                 if (
                   Math.floor(prevStride / Math.PI) !==
@@ -1285,68 +1379,75 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           p.y = getTerrainHeightAt(p.x, p.z);
 
           if (
-            isOnlineHost &&
+            (!isOnlineMatch || !wsConnected) &&
             matchPhase === 'open_play' &&
             p.animState !== 'kick' &&
             p.animState !== 'pass'
           ) {
-            resolvePlayerBallInteraction(p, ballState, playersState);
+            resolvePlayerBallInteraction(
+              p,
+              ballState,
+              playersState,
+              currentProps.settings.ballControlRadius ?? 0.92
+            );
           }
         }
 
-        // Player-to-Player Collisions & Slide Tackle Dispossessions
-        for (let i = 0; i < playersState.length; i++) {
-          for (let j = i + 1; j < playersState.length; j++) {
-            const a = playersState[i];
-            const b = playersState[j];
-            const dx = b.x - a.x;
-            const dz = b.z - a.z;
-            const dist = Math.hypot(dx, dz);
-            const minSep = 0.68;
+        // Player-to-Player Collisions & Slide Tackle Dispossessions (with fast 0.68s recovery)
+        if (!isOnlineMatch || !wsConnected) {
+          for (let i = 0; i < playersState.length; i++) {
+            for (let j = i + 1; j < playersState.length; j++) {
+              const a = playersState[i];
+              const b = playersState[j];
+              const dx = b.x - a.x;
+              const dz = b.z - a.z;
+              const dist = Math.hypot(dx, dz);
+              const minSep = 0.68;
 
-            if (dist > 0.001 && dist < minSep) {
-              const nx = dx / dist;
-              const nz = dz / dist;
-              const overlap = (minSep - dist) * 0.5;
-              a.x -= nx * overlap;
-              a.z -= nz * overlap;
-              b.x += nx * overlap;
-              b.z += nz * overlap;
+              if (dist > 0.001 && dist < minSep) {
+                const nx = dx / dist;
+                const nz = dz / dist;
+                const overlap = (minSep - dist) * 0.5;
+                a.x -= nx * overlap;
+                a.z -= nz * overlap;
+                b.x += nx * overlap;
+                b.z += nz * overlap;
 
-              if (Math.random() < 0.08) {
-                audioEngine.playCollision();
-              }
-
-              if (
-                a.animState === 'tackle' &&
-                b.team !== a.team &&
-                b.stunTimer <= 0
-              ) {
-                b.stunTimer = 1.05;
-                b.hasBall = false;
-                if (ballState.ownerId === b.id) {
-                  ballState.ownerId = a.id;
-                  ballState.vx = Math.sin(a.facingAngle) * 4.5;
-                  ballState.vz = Math.cos(a.facingAngle) * 4.5;
+                if (Math.random() < 0.08) {
+                  audioEngine.playCollision();
                 }
-                if (a.team === 'home') stats.homeTackles++;
-                else stats.awayTackles++;
-                cameraRig.addTrauma(0.22);
-              } else if (
-                b.animState === 'tackle' &&
-                a.team !== b.team &&
-                a.stunTimer <= 0
-              ) {
-                a.stunTimer = 1.05;
-                a.hasBall = false;
-                if (ballState.ownerId === a.id) {
-                  ballState.ownerId = b.id;
-                  ballState.vx = Math.sin(b.facingAngle) * 4.5;
-                  ballState.vz = Math.cos(b.facingAngle) * 4.5;
+
+                if (
+                  a.animState === 'tackle' &&
+                  b.team !== a.team &&
+                  b.stunTimer <= 0
+                ) {
+                  b.stunTimer = 0.68;
+                  b.hasBall = false;
+                  if (ballState.ownerId === b.id) {
+                    ballState.ownerId = a.id;
+                    ballState.vx = Math.sin(a.facingAngle) * 4.5;
+                    ballState.vz = Math.cos(a.facingAngle) * 4.5;
+                  }
+                  if (a.team === 'home') stats.homeTackles++;
+                  else stats.awayTackles++;
+                  cameraRig.addTrauma(0.22);
+                } else if (
+                  b.animState === 'tackle' &&
+                  a.team !== b.team &&
+                  a.stunTimer <= 0
+                ) {
+                  a.stunTimer = 0.68;
+                  a.hasBall = false;
+                  if (ballState.ownerId === a.id) {
+                    ballState.ownerId = b.id;
+                    ballState.vx = Math.sin(b.facingAngle) * 4.5;
+                    ballState.vz = Math.cos(b.facingAngle) * 4.5;
+                  }
+                  if (b.team === 'home') stats.homeTackles++;
+                  else stats.awayTackles++;
+                  cameraRig.addTrauma(0.22);
                 }
-                if (b.team === 'home') stats.homeTackles++;
-                else stats.awayTackles++;
-                cameraRig.addTrauma(0.22);
               }
             }
           }
@@ -1356,8 +1457,8 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         else if (ballState.lastTouchTeam === 'away')
           stats.awayPossessionFrames++;
 
-        // Step Authoritative Ball Physics (on Host or Offline)
-        if (isOnlineHost && matchPhase === 'open_play') {
+        // Step Authoritative Ball Physics (when running locally/offline)
+        if ((!isOnlineMatch || !wsConnected) && matchPhase === 'open_play') {
           const ballEvents = stepBallPhysics(ballState, dt, DEFAULT_PITCH);
 
           if (ballEvents.bouncedOnDirt) {
@@ -1420,16 +1521,16 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
             });
 
             matchPhase = 'goal_celebration';
-            phaseTimer = 3.4; // Enough time to watch the custom 3D celebration & teammates gathering
+            phaseTimer = 3.2;
             bannerMessage = `GOOOOL DO ${
               scoringTeam === 'home'
                 ? currentProps.homeTeam.name.toUpperCase()
                 : currentProps.awayTeam.name.toUpperCase()
             }!`;
-            bannerSubtext = `${scorerName} mandou pra rede e puxou a comemoração na várzea!`;
+            bannerSubtext = `${scorerName} mandou pra rede na travinha!`;
 
             audioEngine.playGoalCelebration();
-            cameraRig.addTrauma(0.45);
+            cameraRig.addTrauma(0.42);
             world.particles.spawnBurst(
               ballState.x,
               ballState.y,
@@ -1451,7 +1552,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           ) {
             const out = ballEvents.outOfBounds;
             matchPhase = 'throw_in';
-            phaseTimer = 1.1;
+            phaseTimer = 1.0;
 
             ballState.x = out.restartX;
             ballState.z = out.restartZ;
@@ -1495,77 +1596,9 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
                 : `Posse: ${currentProps.awayTeam.name}`;
           }
         }
-
-        // Network Sync Publishing (~7Hz to Firestore when in an online room)
-        if (
-          isOnlineMatch &&
-          room?.roomCode &&
-          currentProps.screenState === 'playing' &&
-          now - lastNetworkSyncMs > 140
-        ) {
-          lastNetworkSyncMs = now;
-          if (isOnlineHost) {
-            const playersMap: Record<
-              string,
-              {
-                x: number;
-                z: number;
-                vx: number;
-                vz: number;
-                facingAngle: number;
-                animState: PlayerRuntimeState['animState'];
-              }
-            > = {};
-            playersState.forEach((p) => {
-              playersMap[p.id] = {
-                x: Number(p.x.toFixed(2)),
-                z: Number(p.z.toFixed(2)),
-                vx: Number(p.vx.toFixed(2)),
-                vz: Number(p.vz.toFixed(2)),
-                facingAngle: Number(p.facingAngle.toFixed(2)),
-                animState: p.animState,
-              };
-            });
-            publishHostMatchSnapshot(room.roomCode, {
-              ball: {
-                x: Number(ballState.x.toFixed(2)),
-                y: Number(ballState.y.toFixed(2)),
-                z: Number(ballState.z.toFixed(2)),
-                vx: Number(ballState.vx.toFixed(2)),
-                vy: Number(ballState.vy.toFixed(2)),
-                vz: Number(ballState.vz.toFixed(2)),
-              },
-              players: playersMap,
-              homeGoals: stats.homeGoals,
-              awayGoals: stats.awayGoals,
-              half: currentHalf,
-              remainingSeconds: Math.ceil(remainingHalfSeconds),
-              phase: matchPhase,
-              celebratingPlayerId,
-              bannerMessage,
-              bannerSubtext,
-              timestamp: Date.now(),
-            });
-          } else {
-            publishClientInput(room.roomCode, {
-              moveX: Number(input.moveX.toFixed(2)),
-              moveZ: Number(input.moveZ.toFixed(2)),
-              sprint: input.sprintHeld,
-              action: input.tackleJustPressed
-                ? 'tackle'
-                : input.passJustPressed || input.longPassJustPressed
-                ? 'pass'
-                : input.kickJustReleased
-                ? 'shoot'
-                : 'none',
-              kickPower: Number(input.kickChargePower.toFixed(2)),
-              timestamp: Date.now(),
-            });
-          }
-        }
       }
 
-      // 8. Sync 3D Meshes (Ball, Player Rigs, Environment, Camera, Floating Name Labels & Voice Bubbles)
+      // 8. Sync 3D Meshes (Ball, Pass Target Ring, Player Rigs, Environment, Camera, Floating Name Labels)
       ballMesh.position.set(ballState.x, ballState.y, ballState.z);
       ballMesh.rotation.z -= (ballState.vx * dt) / ballRadius;
       ballMesh.rotation.x += (ballState.vz * dt) / ballRadius;
@@ -1592,6 +1625,39 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       const celebratingPlayer = playersState.find(
         (p) => p.id === celebratingPlayerId
       );
+
+      // Update Pass Target Ring under best receiver when controlled player has or is near the ball
+      if (
+        currentProps.screenState === 'playing' &&
+        matchPhase === 'open_play' &&
+        controlledPlayer &&
+        (ballState.ownerId === controlledPlayer.id ||
+          Math.hypot(
+            ballState.x - controlledPlayer.x,
+            ballState.z - controlledPlayer.z
+          ) < 1.55)
+      ) {
+        const bestPassMate = selectBestPassTarget(
+          controlledPlayer,
+          playersState,
+          input.moveX,
+          input.moveZ
+        );
+        if (bestPassMate) {
+          passTargetRingMesh.visible = true;
+          passTargetRingMesh.position.set(
+            bestPassMate.x,
+            bestPassMate.y + 0.025,
+            bestPassMate.z
+          );
+          const pulse = 1 + Math.sin(elapsedTime * 8) * 0.08;
+          passTargetRingMesh.scale.setScalar(pulse);
+        } else {
+          passTargetRingMesh.visible = false;
+        }
+      } else {
+        passTargetRingMesh.visible = false;
+      }
 
       // Update Camera (including celebration spotlight)
       cameraRig.update(
