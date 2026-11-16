@@ -1,6 +1,7 @@
 {
   "name": "Várzea Raiz 4x4",
-  "description": "Jogo de futebol de várzea 3D 4 contra 4 em campo de terra batida, com física realista, poças de lama e controles para PC e celular.",
-  "requestFramePermissions": [],
+  "description": "SEM TERRA FC — Jogo de futebol de várzea 3D 2v2 e 4v4 em campo de terra batida, com multiplayer online, salas públicas e privadas, bots automáticos e chat de voz WebRTC.",
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
+

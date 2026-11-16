@@ -1,34 +1,24 @@
-/**
- * Procedural Web Audio API & Speech Engine for Várzea Raiz 4x4.
- * Supports 4 independent volume channels:
- * - Efeitos Sonoros (sfxVolume): chute, passe, bola quicando na terra, trave, rede, passos na areia, carrinho na lama, colisão, apito, comemoração
- * - Vozes dos Jogadores (voiceVolume): "Toca a bola!", "Aqui!", "Vai, vai!", "Boa!", "Que golaço!", "Marca ele!", "Chuta!", "Foi gol!"
- * - Ambiente da Várzea (ambientVolume): som de fundo do campinho, murmúrio da torcida e reação da comunidade
- * - Música (musicVolume): batucada de samba/várzea no menu
- * Plus optional mobile haptic vibration via Vibration API.
- */
+// Procedural Web Audio API sound effects & campinho ambience for SEM TERRA FC — Várzea 4x4
+// Note: Artificial/synthetic player voices (SpeechSynthesis / formant callouts) have been completely removed.
+// Voice communication occurs exclusively through real human WebRTC voice chat in online rooms.
+
 class VarzeaAudioEngine {
   private ctx: AudioContext | null = null;
-  public soundEnabled = true;
-  public musicEnabled = false;
-  public sfxVolume = 0.85;
-  public voiceVolume = 0.9;
-  public ambientVolume = 0.65;
-  public musicVolume = 0.5;
-  public vibrationEnabled = true;
-
+  private enabled: boolean = true;
+  private musicEnabled: boolean = true;
+  private sfxVolume: number = 0.85;
+  private ambientVolume: number = 0.65;
+  private musicVolume: number = 0.5;
+  private vibrationEnabled: boolean = true;
+  private ambienceInterval: number | null = null;
   private musicInterval: number | null = null;
-  private ambientInterval: number | null = null;
-  private musicStep = 0;
-  private lastVoiceTimestamp = 0;
 
   private ensureContext(): AudioContext | null {
-    if (!this.soundEnabled && !this.musicEnabled) return null;
-    if (!this.ctx && typeof window !== 'undefined') {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext })
-          .webkitAudioContext;
+    if (!this.enabled) return null;
+    if (typeof window === 'undefined') return null;
+
+    if (!this.ctx) {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (AudioCtx) {
         this.ctx = new AudioCtx();
       }
@@ -39,42 +29,32 @@ class VarzeaAudioEngine {
     return this.ctx;
   }
 
-  public setSoundEnabled(enabled: boolean) {
-    this.soundEnabled = enabled;
+  public setEnabled(enabled: boolean) {
+    this.enabled = enabled;
     if (!enabled) {
-      this.stopAmbientLoop();
+      this.stopAmbience();
+      this.stopMenuMusic();
     }
   }
 
-  public setMusicEnabled(enabled: boolean) {
-    this.musicEnabled = enabled;
-    if (enabled) {
-      this.startMenuBatucada();
-    } else {
-      this.stopMenuBatucada();
-    }
-  }
-
-  public updateVolumes(opts: {
+  public setVolumes(opts: {
     sfxVolume?: number;
-    voiceVolume?: number;
     ambientVolume?: number;
     musicVolume?: number;
+    musicEnabled?: boolean;
     vibrationEnabled?: boolean;
   }) {
-    if (opts.sfxVolume !== undefined) this.sfxVolume = opts.sfxVolume;
-    if (opts.voiceVolume !== undefined) this.voiceVolume = opts.voiceVolume;
-    if (opts.ambientVolume !== undefined) this.ambientVolume = opts.ambientVolume;
-    if (opts.musicVolume !== undefined) this.musicVolume = opts.musicVolume;
-    if (opts.vibrationEnabled !== undefined) {
-      this.vibrationEnabled = opts.vibrationEnabled;
+    if (opts.sfxVolume !== undefined) this.sfxVolume = Math.max(0, Math.min(1, opts.sfxVolume));
+    if (opts.ambientVolume !== undefined) this.ambientVolume = Math.max(0, Math.min(1, opts.ambientVolume));
+    if (opts.musicVolume !== undefined) this.musicVolume = Math.max(0, Math.min(1, opts.musicVolume));
+    if (opts.musicEnabled !== undefined) {
+      this.musicEnabled = opts.musicEnabled;
+      if (!this.musicEnabled) this.stopMenuMusic();
     }
+    if (opts.vibrationEnabled !== undefined) this.vibrationEnabled = opts.vibrationEnabled;
   }
 
-  /**
-   * Optional haptic vibration on mobile devices (when kicking, tackling, or scoring)
-   */
-  public triggerVibration(pattern: number | number[] = 35) {
+  public vibrate(pattern: number | number[]) {
     if (!this.vibrationEnabled) return;
     if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
       try {
@@ -85,408 +65,563 @@ class VarzeaAudioEngine {
     }
   }
 
-  /**
-   * Kick / Pass sound: deep leather thud + dirt burst
-   */
-  public playKick(power = 0.7) {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
+  public startMenuMusic() {
+    if (!this.enabled || !this.musicEnabled || this.musicInterval !== null) return;
+    if (typeof window === 'undefined') return;
+
+    let step = 0;
+    // Batucada / Samba de Várzea percussive groove in menu
+    this.musicInterval = window.setInterval(() => {
+      if (!this.enabled || !this.musicEnabled) return;
+      const ctx = this.ensureContext();
+      if (!ctx) return;
+
+      const now = ctx.currentTime;
+      const vol = this.musicVolume * 0.25;
+      if (vol <= 0.01) return;
+
+      // Surdo bass beat on 0 and 4
+      if (step % 4 === 0) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        const pitch = step % 8 === 0 ? 68 : 82;
+        osc.frequency.setValueAtTime(pitch, now);
+        osc.frequency.exponentialRampToValueAtTime(42, now + 0.22);
+
+        gain.gain.setValueAtTime(vol * 0.9, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.24);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.25);
+      }
+
+      // Tamborim / Agogô syncopation
+      if (step % 2 === 1 || step % 8 === 6) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(step % 4 === 1 ? 680 : 880, now);
+        gain.gain.setValueAtTime(vol * 0.22, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.07);
+      }
+
+      step = (step + 1) % 8;
+    }, 240);
+  }
+
+  public stopMenuMusic() {
+    if (this.musicInterval !== null && typeof window !== 'undefined') {
+      window.clearInterval(this.musicInterval);
+      this.musicInterval = null;
+    }
+  }
+
+  public startAmbience() {
+    this.stopMenuMusic();
+    if (!this.enabled || this.ambienceInterval !== null) return;
+    if (typeof window === 'undefined') return;
+
+    this.ambienceInterval = window.setInterval(() => {
+      if (!this.enabled) return;
+      const r = Math.random();
+      if (r < 0.42) {
+        this.playBirdChirp();
+      } else if (r < 0.65) {
+        this.playDistantDogBark();
+      } else if (r < 0.85) {
+        this.playWindGust();
+      }
+    }, 3200);
+  }
+
+  public stopAmbience() {
+    if (this.ambienceInterval !== null && typeof window !== 'undefined') {
+      window.clearInterval(this.ambienceInterval);
+      this.ambienceInterval = null;
+    }
+  }
+
+  private playWindGust() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const vol = this.ambientVolume * 0.035;
+    if (vol <= 0.002) return;
+
+    const bufferSize = Math.floor(ctx.sampleRate * 0.65);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.sin((i / bufferSize) * Math.PI);
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(340, now);
+    filter.Q.value = 2.5;
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.65);
+
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+    noise.start(now);
+  }
+
+  public playKick(power: number = 0.7, inPuddle: boolean = false) {
+    this.vibrate(power > 0.75 ? [22, 15, 30] : 14);
     const ctx = this.ensureContext();
     if (!ctx) return;
 
-    const vol = this.sfxVolume;
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
-    const startFreq = 115 + power * 45 + (Math.random() - 0.5) * 14;
     osc.type = 'triangle';
+    const startFreq = 135 + power * 65;
     osc.frequency.setValueAtTime(startFreq, now);
-    osc.frequency.exponentialRampToValueAtTime(32, now + 0.14);
+    osc.frequency.exponentialRampToValueAtTime(36, now + 0.13);
 
-    gain.gain.setValueAtTime(Math.min(0.65, (0.25 + power * 0.3) * vol), now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+    const vol = Math.min(0.45, (0.16 + power * 0.24) * this.sfxVolume);
+    gain.gain.setValueAtTime(vol, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
 
     osc.connect(gain);
     gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + 0.16);
 
-    if (power > 0.55) {
-      this.playNoiseBurst(0.09, 950, 0.16 * power * vol);
-      this.triggerVibration(power > 0.75 ? 45 : 22);
-    } else {
-      this.triggerVibration(15);
+    osc.start(now);
+    osc.stop(now + 0.15);
+
+    if (inPuddle) {
+      this.playSplash(0.6);
     }
   }
 
-  /**
-   * Ball bouncing on packed dirt / sand ("bola quicando na terra")
-   */
-  public playDirtBounce(intensity = 0.5) {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
+  public playPass(inPuddle: boolean = false) {
+    this.vibrate(10);
+    this.playKick(0.35, inPuddle);
+  }
+
+  public playBounce(intensity: number = 0.5, inPuddle: boolean = false) {
     const ctx = this.ensureContext();
     if (!ctx) return;
 
-    const vol = Math.min(0.35, intensity * 0.25 * this.sfxVolume);
+    if (inPuddle) {
+      this.playSplash(intensity * 0.7);
+      return;
+    }
+
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(92 + intensity * 25, now);
-    osc.frequency.exponentialRampToValueAtTime(38, now + 0.09);
+    osc.frequency.setValueAtTime(92 + intensity * 30, now);
+    osc.frequency.exponentialRampToValueAtTime(34, now + 0.08);
 
-    gain.gain.setValueAtTime(vol, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.095);
+    const vol = Math.min(0.22, intensity * 0.18 * this.sfxVolume);
+    gain.gain.setValueAtTime(Math.max(0.01, vol), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.09);
+  }
+
+  public playSplash(intensity: number = 0.5) {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const bufferSize = Math.floor(ctx.sampleRate * 0.18);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.42));
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(920 + Math.random() * 350, now);
+    filter.Q.setValueAtTime(1.8, now);
+
+    const gain = ctx.createGain();
+    const vol = Math.min(0.25, (0.06 + intensity * 0.14) * this.sfxVolume);
+    gain.gain.setValueAtTime(Math.max(0.005, vol), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+
+    noise.start(now);
+  }
+
+  public playFootstep(inPuddle: boolean = false, inMud: boolean = false) {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    if (inPuddle) {
+      this.playSplash(0.28);
+      return;
+    }
+
+    const now = ctx.currentTime;
+    const bufferSize = Math.floor(ctx.sampleRate * 0.055);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.35));
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(inMud ? 320 : 540, now);
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.045 * this.sfxVolume, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.055);
+
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+
+    noise.start(now);
+  }
+
+  public playSlideTackle(inPuddle: boolean = false) {
+    this.vibrate([18, 20, 28]);
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    if (inPuddle) {
+      this.playSplash(0.85);
+    }
+
+    const now = ctx.currentTime;
+    const bufferSize = Math.floor(ctx.sampleRate * 0.26);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.55));
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(480, now);
+    filter.Q.value = 1.2;
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.16 * this.sfxVolume, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+    noise.start(now);
+  }
+
+  public playCollision() {
+    this.vibrate(25);
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(115, now);
+    osc.frequency.exponentialRampToValueAtTime(42, now + 0.11);
+
+    gain.gain.setValueAtTime(0.22 * this.sfxVolume, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
 
     osc.connect(gain);
     gain.connect(ctx.destination);
     osc.start(now);
-    osc.stop(now + 0.1);
-
-    this.playNoiseBurst(0.04, 820, vol * 0.45);
+    osc.stop(now + 0.12);
   }
 
-  /**
-   * Player body collision / shoulder charge ("colisão entre jogadores")
-   */
-  public playCollision() {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
+  public playPostHit() {
+    this.vibrate([35, 20, 35]);
     const ctx = this.ensureContext();
     if (!ctx) return;
 
-    const vol = 0.22 * this.sfxVolume;
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
 
     osc.type = 'triangle';
-    osc.frequency.setValueAtTime(84, now);
-    osc.frequency.exponentialRampToValueAtTime(29, now + 0.12);
+    osc.frequency.setValueAtTime(340, now);
+    osc.frequency.exponentialRampToValueAtTime(145, now + 0.22);
 
-    gain.gain.setValueAtTime(vol, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.13);
+    gain.gain.setValueAtTime(0.32 * this.sfxVolume, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.24);
 
     osc.connect(gain);
     gain.connect(ctx.destination);
+
     osc.start(now);
-    osc.stop(now + 0.14);
+    osc.stop(now + 0.25);
   }
 
-  /**
-   * Footstep on dry sand/dirt or wet mud/puddle
-   */
-  public playFootstep(inPuddle = false, inMud = false) {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
-    const vol = this.sfxVolume;
-    if (inPuddle) {
-      this.playNoiseBurst(
-        0.075,
-        1650 + (Math.random() - 0.5) * 280,
-        0.11 * vol
-      );
-    } else if (inMud) {
-      this.playNoiseBurst(0.065, 620 + (Math.random() - 0.5) * 110, 0.09 * vol);
-    } else {
-      this.playNoiseBurst(
-        0.045,
-        980 + (Math.random() - 0.5) * 160,
-        0.065 * vol
-      );
-    }
-  }
-
-  /**
-   * Slide tackle ("carrinho na lama") on dirt/mud
-   */
-  public playSlideTackle(inPuddle = false) {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
-    const freq = inPuddle ? 1400 : 750;
-    this.playNoiseBurst(0.26, freq, 0.24 * this.sfxVolume);
-    this.triggerVibration(35);
-  }
-
-  /**
-   * Ball hitting wooden/iron goalpost ("bola batendo na trave")
-   */
-  public playGoalpostHit() {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
+  public playNetSwish() {
     const ctx = this.ensureContext();
     if (!ctx) return;
 
     const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
+    const bufferSize = Math.floor(ctx.sampleRate * 0.22);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.sin((i / bufferSize) * Math.PI);
+    }
+
+    const noise = ctx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.setValueAtTime(1100, now);
+
     const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.14 * this.sfxVolume, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
 
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(340, now);
-    osc.frequency.exponentialRampToValueAtTime(195, now + 0.24);
-
-    gain.gain.setValueAtTime(0.32 * this.sfxVolume, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.26);
-
-    osc.connect(gain);
+    noise.connect(filter);
+    filter.connect(gain);
     gain.connect(ctx.destination);
-    osc.start(now);
-    osc.stop(now + 0.27);
-    this.triggerVibration([30, 40, 30]);
+    noise.start(now);
   }
 
-  /**
-   * Ball rustling in goal net ("bola na rede")
-   */
-  public playNetRustle() {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
-    this.playNoiseBurst(0.22, 1200, 0.18 * this.sfxVolume);
-  }
-
-  /**
-   * Referee whistle ("apito de início e fim")
-   */
-  public playWhistle(mode: 'short' | 'goal' | 'fulltime' = 'short') {
-    if (!this.soundEnabled || this.sfxVolume <= 0.01) return;
+  public playWhistle(type: 'short' | 'long' | 'double' | 'fulltime' = 'short') {
+    this.vibrate(type === 'long' || type === 'fulltime' ? [40, 30, 80] : 25);
     const ctx = this.ensureContext();
     if (!ctx) return;
 
-    const vol = this.sfxVolume;
-    const triggerTone = (offset: number, duration: number) => {
-      const now = ctx.currentTime + offset;
+    const now = ctx.currentTime;
+    const playTone = (startOffset: number, duration: number) => {
       const osc = ctx.createOscillator();
       const lfo = ctx.createOscillator();
       const lfoGain = ctx.createGain();
       const gain = ctx.createGain();
 
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(2820, now);
+      osc.frequency.setValueAtTime(2750, now + startOffset);
 
+      // Whistle pea trill effect
       lfo.type = 'sine';
-      lfo.frequency.setValueAtTime(42, now);
-      lfoGain.gain.setValueAtTime(95, now);
+      lfo.frequency.setValueAtTime(42, now + startOffset);
+      lfoGain.gain.setValueAtTime(120, now + startOffset);
 
       lfo.connect(lfoGain);
       lfoGain.connect(osc.frequency);
 
-      gain.gain.setValueAtTime(0.01, now);
-      gain.gain.linearRampToValueAtTime(0.22 * vol, now + 0.03);
-      gain.gain.setValueAtTime(
-        0.2 * vol,
-        now + Math.max(0.04, duration - 0.05)
-      );
-      gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+      const vol = 0.16 * this.sfxVolume;
+      gain.gain.setValueAtTime(0.001, now + startOffset);
+      gain.gain.linearRampToValueAtTime(vol, now + startOffset + 0.02);
+      gain.gain.setValueAtTime(vol, now + startOffset + duration - 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + startOffset + duration);
 
       osc.connect(gain);
       gain.connect(ctx.destination);
 
-      osc.start(now);
-      lfo.start(now);
-      osc.stop(now + duration + 0.02);
-      lfo.stop(now + duration + 0.02);
+      osc.start(now + startOffset);
+      lfo.start(now + startOffset);
+      osc.stop(now + startOffset + duration);
+      lfo.stop(now + startOffset + duration);
     };
 
-    if (mode === 'short') {
-      triggerTone(0, 0.28);
-    } else if (mode === 'goal') {
-      triggerTone(0, 0.65);
+    if (type === 'short') {
+      playTone(0, 0.28);
+    } else if (type === 'double') {
+      playTone(0, 0.18);
+      playTone(0.24, 0.35);
     } else {
-      triggerTone(0, 0.25);
-      triggerTone(0.34, 0.55);
+      playTone(0, 0.65);
     }
   }
 
-  /**
-   * Goal celebration fanfare + várzea shout/cheer ("comemoração de gol")
-   */
-  public playGoalCelebration() {
-    if (!this.soundEnabled) return;
-    this.playWhistle('goal');
-    this.playNetRustle();
-    this.triggerVibration([70, 50, 110]);
-
+  public playGoalCheer() {
+    this.vibrate([60, 40, 90, 40, 120]);
+    this.playNetSwish();
     const ctx = this.ensureContext();
-    if (!ctx || this.sfxVolume <= 0.01) return;
+    if (!ctx) return;
 
-    const vol = this.sfxVolume;
-    const notes = [261.63, 329.63, 392.0, 523.25];
-    notes.forEach((freq, idx) => {
-      const now = ctx.currentTime + 0.1 + idx * 0.09;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
+    const now = ctx.currentTime;
 
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(freq, now);
-
-      gain.gain.setValueAtTime(0.18 * vol, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.46);
-    });
-
-    // Crowd & sideline reaction burst
-    this.playNoiseBurst(0.85, 850, 0.16 * Math.max(vol, this.ambientVolume));
-  }
-
-  /**
-   * Short contextual player voice callout ("Toca a bola!", "Aqui!", "Que golaço!", etc.)
-   * Uses Web Speech API in pt-BR when available plus a subtle vocal callout chime,
-   * respecting a cooldown so voices never become repetitive.
-   */
-  public speakPhrase(
-    phrase: string,
-    pitchHint = 1.0,
-    forceImmediate = false
-  ): boolean {
-    if (!this.soundEnabled || this.voiceVolume <= 0.02) return false;
-    const nowMs = performance.now();
-    if (!forceImmediate && nowMs - this.lastVoiceTimestamp < 3800) {
-      return false;
+    // Sideline crowd roar + celebratory brass/percussion chord (without synthetic player speech)
+    const bufferSize = Math.floor(ctx.sampleRate * 1.4);
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      const env = Math.sin((i / bufferSize) * Math.PI);
+      data[i] = (Math.random() * 2 - 1) * env;
     }
-    this.lastVoiceTimestamp = nowMs;
 
-    // Synthesize a short expressive human-formant callout tone so audio feedback works even in headless/no-TTS browsers
-    const ctx = this.ensureContext();
-    if (ctx) {
-      const now = ctx.currentTime;
+    const crowd = ctx.createBufferSource();
+    crowd.buffer = buffer;
+    const crowdFilter = ctx.createBiquadFilter();
+    crowdFilter.type = 'bandpass';
+    crowdFilter.frequency.setValueAtTime(720, now);
+    crowdFilter.Q.value = 1.4;
+
+    const crowdGain = ctx.createGain();
+    crowdGain.gain.setValueAtTime(0.18 * this.sfxVolume, now);
+    crowdGain.gain.exponentialRampToValueAtTime(0.001, now + 1.4);
+
+    crowd.connect(crowdFilter);
+    crowdFilter.connect(crowdGain);
+    crowdGain.connect(ctx.destination);
+    crowd.start(now);
+
+    const freqs = [261.63, 329.63, 392.0, 523.25];
+    freqs.forEach((f, idx) => {
       const osc = ctx.createOscillator();
-      const formant = ctx.createBiquadFilter();
       const gain = ctx.createGain();
-
       osc.type = 'sawtooth';
-      const baseF = 145 * pitchHint;
-      osc.frequency.setValueAtTime(baseF, now);
-      osc.frequency.linearRampToValueAtTime(baseF * 1.24, now + 0.09);
-      osc.frequency.exponentialRampToValueAtTime(baseF * 0.92, now + 0.22);
+      osc.frequency.setValueAtTime(f, now + idx * 0.06);
 
-      formant.type = 'bandpass';
-      formant.frequency.setValueAtTime(720, now);
-      formant.Q.setValueAtTime(3.2, now);
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(1100, now);
 
-      gain.gain.setValueAtTime(0.12 * this.voiceVolume, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.24);
+      gain.gain.setValueAtTime(0.08 * this.sfxVolume, now + idx * 0.06);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 1.15);
 
-      osc.connect(formant);
-      formant.connect(gain);
+      osc.connect(filter);
+      filter.connect(gain);
       gain.connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.25);
-    }
 
-    // Also speak in Brazilian Portuguese via SpeechSynthesis if supported by browser
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      try {
-        window.speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(phrase);
-        utter.lang = 'pt-BR';
-        utter.volume = Math.min(1, Math.max(0, this.voiceVolume));
-        utter.rate = 1.18;
-        utter.pitch = pitchHint;
-        window.speechSynthesis.speak(utter);
-      } catch {
-        // Ignore if SpeechSynthesis is blocked
-      }
-    }
-
-    return true;
+      osc.start(now + idx * 0.06);
+      osc.stop(now + 1.2);
+    });
   }
 
-  /**
-   * Continuous rural Várzea sideline ambience (breeze, distant birds, sideline murmur)
-   */
-  public startAmbientLoop() {
-    this.stopAmbientLoop();
-    if (!this.soundEnabled) return;
+  private playBirdChirp() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
 
-    this.ambientInterval = window.setInterval(() => {
-      if (!this.soundEnabled || this.ambientVolume <= 0.02) return;
-      // Soft rural breeze / distant crowd murmur burst
-      this.playNoiseBurst(
-        0.55,
-        460 + (Math.random() - 0.5) * 140,
-        0.028 * this.ambientVolume
-      );
-    }, 1400);
+    const now = ctx.currentTime;
+    const vol = 0.03 * this.ambientVolume;
+    if (vol <= 0.001) return;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.type = 'sine';
+    const baseFreq = 2600 + Math.random() * 900;
+    osc.frequency.setValueAtTime(baseFreq, now);
+    osc.frequency.exponentialRampToValueAtTime(baseFreq * 1.28, now + 0.07);
+    osc.frequency.exponentialRampToValueAtTime(baseFreq * 0.92, now + 0.14);
+
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(vol, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.16);
+  }
+
+  private playDistantDogBark() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const vol = 0.025 * this.ambientVolume;
+    if (vol <= 0.001) return;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(360, now);
+    osc.frequency.exponentialRampToValueAtTime(190, now + 0.11);
+
+    gain.gain.setValueAtTime(vol, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.13);
+  }
+
+  // Compatibility aliases for MatchCanvas and UI components
+  public startAmbientLoop() {
+    this.startAmbience();
   }
 
   public stopAmbientLoop() {
-    if (this.ambientInterval !== null) {
-      clearInterval(this.ambientInterval);
-      this.ambientInterval = null;
-    }
+    this.stopAmbience();
   }
 
-  private playNoiseBurst(duration: number, centerFreq: number, volume: number) {
-    const ctx = this.ensureContext();
-    if (!ctx || volume <= 0.001) return;
-
-    const sampleCount = Math.max(1, Math.floor(ctx.sampleRate * duration));
-    const buffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < sampleCount; i++) {
-      data[i] = (Math.random() * 2 - 1) * (1 - i / sampleCount);
-    }
-
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'bandpass';
-    filter.frequency.value = centerFreq;
-    filter.Q.value = 1.4;
-
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(volume, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-
-    source.connect(filter);
-    filter.connect(gain);
-    gain.connect(ctx.destination);
-    source.start();
+  public playDirtBounce(intensity: number = 0.55) {
+    this.playBounce(intensity, false);
   }
 
-  public startMenuBatucada() {
-    this.stopMenuBatucada();
-    if (!this.musicEnabled) return;
+  public playGoalpostHit() {
+    this.playPostHit();
+  }
 
-    this.musicInterval = window.setInterval(() => {
-      if (!this.musicEnabled || this.musicVolume <= 0.01) return;
-      const ctx = this.ensureContext();
-      if (!ctx) return;
+  public playGoalCelebration() {
+    this.playGoalCheer();
+  }
 
-      const vol = this.musicVolume;
-      const step = this.musicStep % 8;
-      this.musicStep++;
+  public triggerVibration(pattern: number | number[]) {
+    this.vibrate(pattern);
+  }
 
-      // Surdo beat on 0 and 4
-      if (step === 0 || step === 4) {
-        const now = ctx.currentTime;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(step === 0 ? 75 : 92, now);
-        osc.frequency.exponentialRampToValueAtTime(42, now + 0.18);
-        gain.gain.setValueAtTime(0.22 * vol, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(now);
-        osc.stop(now + 0.21);
-      }
+  public setSoundEnabled(enabled: boolean) {
+    this.setEnabled(enabled);
+  }
 
-      // Shake/ganzá on offbeats
-      if (step % 2 === 1) {
-        this.playNoiseBurst(0.04, 3200, 0.055 * vol);
-      }
-    }, 220);
+  public setMusicEnabled(enabled: boolean) {
+    this.setVolumes({ musicEnabled: enabled });
+  }
+
+  public updateVolumes(opts: {
+    sfxVolume?: number;
+    ambientVolume?: number;
+    musicVolume?: number;
+    vibrationEnabled?: boolean;
+  }) {
+    this.setVolumes(opts);
   }
 
   public stopMenuBatucada() {
-    if (this.musicInterval !== null) {
-      clearInterval(this.musicInterval);
-      this.musicInterval = null;
-    }
+    this.stopMenuMusic();
   }
 }
 
-export const audioEngine = new VarzeaAudioEngine();
+export const soundEngine = new VarzeaAudioEngine();
+export const audioEngine = soundEngine;
+

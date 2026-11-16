@@ -5,14 +5,19 @@ import {
   checkOutOfBounds,
   DEFAULT_PITCH,
   formatMatchTime,
+  getActivePlayersForMode,
   getMudSpeedMultiplier,
   getPuddleAt,
   getTerrainHeightAt,
   INITIAL_AWAY_PLAYERS,
   INITIAL_HOME_PLAYERS,
   stepBallPhysics,
-  VARZEA_VOICE_PHRASES,
 } from './rules';
+import {
+  buildInitialRoomSlots,
+  convertSlotToBot,
+  resolveActiveCharacterIdsForRoom,
+} from '../services/botService';
 import { BallState } from '../types/game';
 
 function createBall(overrides: Partial<BallState> = {}): BallState {
@@ -54,15 +59,41 @@ test('Team 2 roster contains Primo, Bicudo, Ismael and Felipe', () => {
   assert.deepEqual(names, ['Primo', 'Bicudo', 'Ismael', 'Felipe']);
 });
 
-test('Várzea voice phrases include required callouts in Brazilian Portuguese', () => {
-  assert.ok(VARZEA_VOICE_PHRASES.passRequest.includes('Toca a bola!'));
-  assert.ok(VARZEA_VOICE_PHRASES.passRequest.includes('Aqui!'));
-  assert.ok(VARZEA_VOICE_PHRASES.sprintCall.includes('Vai, vai!'));
-  assert.ok(VARZEA_VOICE_PHRASES.goodPlay.includes('Boa!'));
-  assert.ok(VARZEA_VOICE_PHRASES.goalShout.includes('Que golaço!'));
-  assert.ok(VARZEA_VOICE_PHRASES.goalShout.includes('Foi gol!'));
-  assert.ok(VARZEA_VOICE_PHRASES.defendCall.includes('Marca ele!'));
-  assert.ok(VARZEA_VOICE_PHRASES.shootCall.includes('Chuta!'));
+test('2v2 and 4v4 modes isolate team sizes and support free choice of 2 characters per team with bot auto-fill', () => {
+  const active4v4 = getActivePlayersForMode(INITIAL_HOME_PLAYERS, INITIAL_AWAY_PLAYERS, '4v4');
+  assert.equal(active4v4.home.length, 4);
+  assert.equal(active4v4.away.length, 4);
+
+  const active2v2 = getActivePlayersForMode(
+    INITIAL_HOME_PLAYERS,
+    INITIAL_AWAY_PLAYERS,
+    '2v2',
+    ['home_2', 'home_4', 'away_1', 'away_3']
+  );
+  assert.equal(active2v2.home.length, 2);
+  assert.equal(active2v2.away.length, 2);
+  assert.deepEqual(
+    active2v2.home.map((p) => p.name),
+    ['Josué', 'Bode']
+  );
+  assert.deepEqual(
+    active2v2.away.map((p) => p.name),
+    ['Primo', 'Ismael']
+  );
+
+  // Verify botService builds 8 slots and converts disconnected humans back to bots
+  const slots = buildInitialRoomSlots('host_123', 'YuriHost', 'home_3');
+  assert.equal(slots['home_3'].isBot, false);
+  assert.equal(slots['home_3'].uid, 'host_123');
+  assert.equal(slots['home_1'].isBot, true);
+
+  const ids2v2 = resolveActiveCharacterIdsForRoom(slots, '2v2');
+  assert.equal(ids2v2.length, 4);
+  assert.ok(ids2v2.includes('home_3'), 'Host chosen character must be active in 2v2');
+
+  const botFallback = convertSlotToBot(slots['home_3']);
+  assert.equal(botFallback.isBot, true);
+  assert.equal(botFallback.uid, null);
 });
 
 test('Goal detection requires complete entry into the small várzea goal', () => {

@@ -167,8 +167,7 @@ export interface PlayerRuntimeState {
   inMud: boolean;
   inPuddle: boolean;
   controlledByUid?: string | null;
-  voiceCallout?: string | null;
-  voiceTimer?: number;
+  isSpeaking?: boolean;
 }
 
 export interface MatchStats {
@@ -199,7 +198,6 @@ export interface GameSettings {
   soundEnabled: boolean;
   musicEnabled: boolean;
   sfxVolume: number;     // 0.0 - 1.0
-  voiceVolume: number;   // 0.0 - 1.0
   ambientVolume: number; // 0.0 - 1.0
   musicVolume: number;   // 0.0 - 1.0
   vibrationEnabled: boolean;
@@ -208,7 +206,22 @@ export interface GameSettings {
   showPlayerNames: boolean;
 }
 
-// Multiplayer & Friends Types
+// Multiplayer, Matchmaking, Voice Chat & Friends Types
+export type MatchFormatMode = '2v2' | '4v4';
+export type RoomVisibility = 'public' | 'private';
+export type VoiceTransmissionMode = 'muted' | 'open_mic' | 'push_to_talk';
+
+export interface VoicePeerState {
+  uid: string;
+  displayName: string;
+  characterId?: string;
+  team?: 'home' | 'away';
+  micEnabled: boolean;
+  isSpeaking: boolean;
+  mutedByMe: boolean;
+  connectionState: 'connecting' | 'connected' | 'disconnected' | 'failed';
+}
+
 export interface RoomSlotAssignment {
   slotId: string; // 'home_1' .. 'home_4', 'away_1' .. 'away_4'
   playerName: string;
@@ -261,7 +274,7 @@ export interface NetworkSyncSnapshot {
     facingAngle: number;
     animState: PlayerAnimState;
     stamina: number;
-    voiceCallout?: string | null;
+    isSpeaking?: boolean;
   }>;
 }
 
@@ -271,6 +284,12 @@ export interface OnlineUserProfile {
   tagCode: string;
   status: 'online' | 'in_room' | 'playing';
   currentRoomCode: string;
+  wins?: number;
+  losses?: number;
+  draws?: number;
+  goalsScored?: number;
+  goalsConceded?: number;
+  matchesPlayed?: number;
   updatedAt: number;
   createdAt: number;
 }
@@ -284,6 +303,9 @@ export interface MultiplayerSlot {
   isBot: boolean;
   isReady: boolean;
   pingMs: number;
+  micEnabled?: boolean;
+  isSpeaking?: boolean;
+  lastSeenMs?: number;
 }
 
 export interface MultiplayerMatchSnapshot {
@@ -304,7 +326,7 @@ export interface MultiplayerMatchSnapshot {
       vz: number;
       facingAngle: number;
       animState: PlayerAnimState;
-      voiceBubble?: string | null;
+      isSpeaking?: boolean;
     }
   >;
   homeGoals: number;
@@ -320,6 +342,16 @@ export interface MultiplayerMatchSnapshot {
 
 export interface MultiplayerRoomState {
   roomCode: string;
+  roomName?: string;
+  mode?: MatchFormatMode;
+  visibility?: RoomVisibility;
+  hasPassword?: boolean;
+  passwordHash?: string | null;
+  maxHumans?: number;
+  autoFillBots?: boolean;
+  activeCharacterIds?: string[];
+  loadingReadyUids?: string[];
+  lastActivityMs?: number;
   hostUid: string;
   hostName: string;
   status: 'waiting' | 'playing' | 'finished';
@@ -332,4 +364,5 @@ export interface MultiplayerRoomState {
   slots: Record<string, MultiplayerSlot>;
   matchState: MultiplayerMatchSnapshot | null;
 }
+
 

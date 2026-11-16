@@ -1,1047 +1,961 @@
 import React, { useEffect, useState } from 'react';
 import {
-  auth,
-  collection,
-  createMultiplayerRoom,
-  db,
-  doc,
-  ensureAuthenticatedUser,
-  FIREBASE_PROJECT_INFO,
-  FriendRequestRecord,
-  joinMultiplayerRoom,
-  leaveMultiplayerRoom,
-  listActiveRooms,
-  listOnlineUsers,
-  onAuthStateChanged,
-  onSnapshot,
-  OnlineUserProfile,
-  query,
-  respondToFriendRequest,
-  selectCharacterInRoom,
-  sendFriendRequestOrInvite,
-  signInOrLinkWithGoogle,
-  startMultiplayerMatchInRoom,
-  testFirebaseConnection,
-  updateUserProfileName,
-  where,
-} from '../services/firebase';
+  Bot,
+  Check,
+  Copy,
+  Globe,
+  Lock,
+  LogIn,
+  LogOut,
+  Mic,
+  MicOff,
+  Play,
+  Plus,
+  Send,
+  Shield,
+  Sparkles,
+  Swords,
+  UserCheck,
+  UserPlus,
+  Users,
+  Wifi,
+  X,
+} from 'lucide-react';
 import {
+  MatchFormatMode,
   MultiplayerRoomState,
   MultiplayerSlot,
-  TeamConfig,
+  OnlineUserProfile,
+  RoomVisibility,
 } from '../types/game';
-import { INITIAL_AWAY_PLAYERS, INITIAL_HOME_PLAYERS } from '../game/rules';
+import { getRoomParticipantCounts } from '../services/botService';
+import {
+  ALL_CHARACTERS,
+  createOnlineRoom,
+  FriendRequestDoc,
+  getCurrentAuthUser,
+  joinOnlineRoom,
+  leaveOnlineRoom,
+  linkGoogleAccount,
+  respondToFriendRequest,
+  selectRoomCharacter,
+  sendFriendRequestByTag,
+  sendRoomInviteToFriend,
+  startOnlineMatch,
+  subscribeToFriendsProfiles,
+  subscribeToIncomingRequests,
+  subscribeToMyProfile,
+  subscribeToOnlinePlayers,
+  subscribeToPublicRooms,
+  subscribeToRoom,
+  togglePlayerReadyInRoom,
+  updateNickname,
+} from '../services/firebase';
+import { filterRoomsByMode, quickMatchOrCreateWithBots } from '../services/matchmakingService';
+import { formatPlayerCareerSummary } from '../services/playerService';
+import { presenceService } from '../services/presenceService';
+import { isRoomJoinable } from '../services/roomService';
+import { sessionCleanupService } from '../services/sessionCleanupService';
+import { voiceChatService } from '../services/voiceChatService';
+import { MatchLoadingOverlay } from './MatchLoadingOverlay';
+import { VoiceControlsBar } from './VoiceControlsBar';
 
 interface MultiplayerLobbyModalProps {
-  initialTab: 'lobby' | 'friends' | 'diagnostic';
-  homeTeam: TeamConfig;
-  awayTeam: TeamConfig;
-  activeRoom: MultiplayerRoomState | null;
-  controlledCharacterId: string;
-  onRoomUpdated: (
-    room: MultiplayerRoomState | null,
-    myCharId: string
-  ) => void;
-  onStartMultiplayerGame: () => void;
+  homeTeamId: string;
+  awayTeamId: string;
+  halfDurationSeconds: number;
+  activeRoomCode: string | null;
+  onRoomJoined: (room: MultiplayerRoomState) => void;
+  onRoomLeft: () => void;
+  onStartMultiplayerMatch: (room: MultiplayerRoomState) => void;
   onClose: () => void;
 }
 
 export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
-  initialTab,
-  homeTeam,
-  awayTeam,
-  activeRoom,
-  controlledCharacterId,
-  onRoomUpdated,
-  onStartMultiplayerGame,
+  homeTeamId,
+  awayTeamId,
+  halfDurationSeconds,
+  activeRoomCode,
+  onRoomJoined,
+  onRoomLeft,
+  onStartMultiplayerMatch,
   onClose,
 }) => {
-  const [tab, setTab] = useState<'lobby' | 'friends' | 'diagnostic'>(
-    initialTab
-  );
-  const [profile, setProfile] = useState<OnlineUserProfile | null>(null);
-  const [nameInput, setNameInput] = useState('');
-  const [roomCodeInput, setRoomCodeInput] = useState('');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-
-  // Diagnostic state
-  const [connected, setConnected] = useState(false);
-  const [pingMs, setPingMs] = useState(22);
-  const [authError, setAuthError] = useState<string | null>(null);
-
-  // Lists
-  const [openRooms, setOpenRooms] = useState<
-    Array<{
-      roomCode: string;
-      hostName: string;
-      status: string;
-      humanCount: number;
-      homeScore: number;
-      awayScore: number;
-    }>
-  >([]);
-  const [onlineUsers, setOnlineUsers] = useState<OnlineUserProfile[]>([]);
-  const [friendRequests, setFriendRequests] = useState<FriendRequestRecord[]>(
-    []
+  const [tab, setTab] = useState<'modes' | 'public_rooms' | 'private_room' | 'room' | 'friends'>(
+    activeRoomCode ? 'room' : 'modes'
   );
 
-  // Initialize Auth & Connection test on mount and whenever Auth state changes
+  // Modalidade selecionada: 2 CONTRA 2 ou 4 CONTRA 4
+  const [selectedMode, setSelectedMode] = useState<MatchFormatMode>('4v4');
+
+  const [myProfile, setMyProfile] = useState<(OnlineUserProfile & { friends: string[] }) | null>(
+    null
+  );
+  const [nicknameInput, setNicknameInput] = useState('');
+  const [savingName, setSavingName] = useState(false);
+
+  // Salas públicas e privadas
+  const [publicRooms, setPublicRooms] = useState<MultiplayerRoomState[]>([]);
+  const [currentRoom, setCurrentRoom] = useState<MultiplayerRoomState | null>(null);
+
+  // Criação de sala (pública ou privada)
+  const [createRoomName, setCreateRoomName] = useState('');
+  const [createVisibility, setCreateVisibility] = useState<RoomVisibility>('public');
+  const [createPassword, setCreatePassword] = useState('');
+  const [createMaxHumans, setCreateMaxHumans] = useState<number>(8);
+  const [createAutoFillBots, setCreateAutoFillBots] = useState<boolean>(true);
+
+  // Entrada por código / senha
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [joinPasswordInput, setJoinPasswordInput] = useState('');
+  const [passwordModalRoom, setPasswordModalRoom] = useState<MultiplayerRoomState | null>(null);
+  const [modalPasswordInput, setModalPasswordInput] = useState('');
+
+  // Estados de carregamento e feedback
+  const [loadingOverlayType, setLoadingOverlayType] = useState<
+    'connecting_lobby' | 'joining_room' | null
+  >(null);
+  const [loadingOverlayMessage, setLoadingOverlayMessage] = useState('');
+  const [feedbackMsg, setFeedbackMsg] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [copiedCode, setCopiedCode] = useState(false);
+
+  // Amigos e convites
+  const [onlinePlayers, setOnlinePlayers] = useState<OnlineUserProfile[]>([]);
+  const [friendsList, setFriendsList] = useState<OnlineUserProfile[]>([]);
+  const [incomingRequests, setIncomingRequests] = useState<FriendRequestDoc[]>([]);
+  const [friendSearchInput, setFriendSearchInput] = useState('');
+
+  // Atualiza maxHumans padrão ao trocar entre 2v2 e 4v4
   useEffect(() => {
-    let mounted = true;
-    const syncLobbyData = async () => {
-      const conn = await testFirebaseConnection();
-      if (!mounted) return;
-      setConnected(conn.connected);
-      setPingMs(conn.pingMs);
+    setCreateMaxHumans(selectedMode === '2v2' ? 4 : 8);
+  }, [selectedMode]);
 
-      const { profile: userProf, authError: aErr } =
-        await ensureAuthenticatedUser();
-      if (!mounted) return;
-      setProfile(userProf);
-      setNameInput(userProf.displayName);
-      if (aErr) setAuthError(aErr);
-
-      const [rooms, users] = await Promise.all([
-        listActiveRooms(),
-        listOnlineUsers(),
-      ]);
-      if (!mounted) return;
-      setOpenRooms(rooms);
-      setOnlineUsers(users);
-    };
-
-    syncLobbyData();
-
-    const unsubAuth = onAuthStateChanged(auth, () => {
-      if (mounted) {
-        syncLobbyData();
+  useEffect(() => {
+    sessionCleanupService.startPeriodicCleanup();
+    const unsubProfile = subscribeToMyProfile((prof) => {
+      setMyProfile(prof);
+      if (prof && !nicknameInput) {
+        setNicknameInput(prof.displayName);
       }
+    });
+    const unsubRooms = subscribeToPublicRooms((rooms) => {
+      setPublicRooms(rooms);
+    });
+    const unsubOnline = subscribeToOnlinePlayers((players) => {
+      setOnlinePlayers(players);
+    });
+    const unsubReqs = subscribeToIncomingRequests((reqs) => {
+      setIncomingRequests(reqs);
     });
 
     return () => {
-      mounted = false;
-      unsubAuth();
+      unsubProfile();
+      unsubRooms();
+      unsubOnline();
+      unsubReqs();
     };
   }, []);
 
-  // Subscribe to active room updates via Firestore onSnapshot when authenticated
   useEffect(() => {
-    if (!activeRoom?.roomCode || !auth.currentUser) return;
-    const roomRef = doc(db, 'rooms', activeRoom.roomCode);
-    const unsub = onSnapshot(
-      roomRef,
-      (snap) => {
-        if (!snap.exists()) {
-          onRoomUpdated(null, 'home_1');
-          return;
-        }
-        const d = snap.data();
-        const slots: Record<string, MultiplayerSlot> =
-          d.assignedSlots || d.slots || {};
-        const myUid = auth.currentUser?.uid;
-        const mySlot = Object.values(slots).find((s) => s.uid === myUid);
-        const myChar = mySlot?.characterId || controlledCharacterId;
+    if (!myProfile || !myProfile.friends || myProfile.friends.length === 0) {
+      setFriendsList([]);
+      return;
+    }
+    const unsubFriends = subscribeToFriendsProfiles(myProfile.friends, (friends) => {
+      setFriendsList(friends);
+    });
+    return () => unsubFriends();
+  }, [myProfile?.friends?.join(',')]);
 
-        const roomState: MultiplayerRoomState = {
-          roomCode: d.roomCode,
-          hostUid: d.hostUid,
-          hostName: d.hostName,
-          status: d.status,
-          homeTeamId: d.homeTeamId || homeTeam.id,
-          awayTeamId: d.awayTeamId || awayTeam.id,
-          homeScore: d.homeGoals ?? d.homeScore ?? 0,
-          awayScore: d.awayGoals ?? d.awayScore ?? 0,
-          half: d.half || 1,
-          remainingSeconds: d.remainingSeconds ?? 300,
-          slots,
-          matchState: d.syncState || d.matchState || null,
-        };
-
-        onRoomUpdated(roomState, myChar);
-
-        if (d.status === 'playing') {
-          onStartMultiplayerGame();
-        }
-      },
-      (err) => {
-        setErrorMessage(`Erro de sincronização da sala: ${err.message}`);
+  useEffect(() => {
+    if (!activeRoomCode) {
+      setCurrentRoom(null);
+      return;
+    }
+    const unsub = subscribeToRoom(activeRoomCode, (room) => {
+      if (!room) {
+        setCurrentRoom(null);
+        presenceService.stopRoomPresence();
+        voiceChatService.leaveRoomVoice();
+        onRoomLeft();
+        setTab('modes');
+        return;
       }
-    );
+      setCurrentRoom(room);
+      presenceService.startRoomPresence(
+        room.roomCode,
+        room.status === 'playing' ? 'playing' : 'in_room'
+      );
+      voiceChatService.joinRoomVoice(room.roomCode, room.slots || {});
+      onRoomJoined(room);
+
+      if (room.status === 'playing') {
+        onStartMultiplayerMatch(room);
+      }
+    });
     return () => unsub();
-  }, [activeRoom?.roomCode]);
+  }, [activeRoomCode]);
 
-  // Subscribe to incoming/outgoing friend requests & room invites
-  useEffect(() => {
-    const myUid = auth.currentUser?.uid;
-    if (!myUid) return;
+  const showToast = (text: string, isError = false) => {
+    setFeedbackMsg({ text, isError });
+    window.setTimeout(() => {
+      setFeedbackMsg((prev) => (prev?.text === text ? null : prev));
+    }, 4000);
+  };
 
-    const qIncoming = query(
-      collection(db, 'friendRequests'),
-      where('toUid', '==', myUid)
-    );
-    const qOutgoing = query(
-      collection(db, 'friendRequests'),
-      where('fromUid', '==', myUid)
-    );
-
-    let inList: FriendRequestRecord[] = [];
-    let outList: FriendRequestRecord[] = [];
-
-    const merge = () => {
-      const map = new Map<string, FriendRequestRecord>();
-      [...inList, ...outList].forEach((r) => map.set(r.id, r));
-      setFriendRequests(Array.from(map.values()));
-    };
-
-    const unsubIn = onSnapshot(
-      qIncoming,
-      (snap) => {
-        inList = snap.docs.map((d) => {
-          const raw = d.data();
-          return {
-            id: d.id,
-            fromUid: raw.fromUid,
-            fromName: raw.fromName,
-            fromTag: raw.fromTag,
-            toUid: raw.toUid,
-            toName: raw.toName,
-            status: raw.status,
-            roomInviteCode: raw.inviteRoomCode || raw.roomInviteCode || '',
-          };
-        });
-        merge();
-      },
-      () => {}
-    );
-
-    const unsubOut = onSnapshot(
-      qOutgoing,
-      (snap) => {
-        outList = snap.docs.map((d) => {
-          const raw = d.data();
-          return {
-            id: d.id,
-            fromUid: raw.fromUid,
-            fromName: raw.fromName,
-            fromTag: raw.fromTag,
-            toUid: raw.toUid,
-            toName: raw.toName,
-            status: raw.status,
-            roomInviteCode: raw.inviteRoomCode || raw.roomInviteCode || '',
-          };
-        });
-        merge();
-      },
-      () => {}
-    );
-
-    return () => {
-      unsubIn();
-      unsubOut();
-    };
-  }, [profile?.uid]);
-
-  const handleSaveName = async () => {
-    if (!nameInput.trim()) return;
-    const updated = await updateUserProfileName(nameInput);
-    if (updated) {
-      setProfile(updated);
-      setStatusMessage('Nome de jogador atualizado com sucesso!');
-      setTimeout(() => setStatusMessage(null), 2500);
+  const handleSaveNickname = async () => {
+    if (!nicknameInput.trim()) return;
+    setSavingName(true);
+    try {
+      await updateNickname(nicknameInput);
+      showToast('Apelido atualizado com sucesso!');
+    } catch {
+      showToast('Não foi possível atualizar o apelido.', true);
+    } finally {
+      setSavingName(false);
     }
   };
 
   const handleGoogleLogin = async () => {
-    setErrorMessage(null);
-    setIsLoading(true);
-    const { user, error } = await signInOrLinkWithGoogle();
-    setIsLoading(false);
-    if (error) {
-      setErrorMessage(`Não foi possível autenticar com Google: ${error}`);
-    } else if (user) {
-      const { profile: updatedProf } = await ensureAuthenticatedUser(
-        user.displayName || undefined
-      );
-      setProfile(updatedProf);
-      setNameInput(updatedProf.displayName);
-      setAuthError(null);
-      const [rooms, users] = await Promise.all([
-        listActiveRooms(),
-        listOnlineUsers(),
-      ]);
-      setOpenRooms(rooms);
-      setOnlineUsers(users);
-      setStatusMessage('Conta Google conectada ao Firebase com sucesso!');
-    }
-  };
-
-  const handleCreateRoom = async () => {
-    if (!profile) return;
-    setErrorMessage(null);
-    setIsLoading(true);
     try {
-      const code = await createMultiplayerRoom(
-        profile,
-        homeTeam.name,
-        awayTeam.name,
-        'home_1'
-      );
-      setRoomCodeInput(code);
-      const savedLocal =
-        typeof localStorage !== 'undefined'
-          ? localStorage.getItem(`varzea_room_${code}`)
-          : null;
-      const parsedSlots = savedLocal ? JSON.parse(savedLocal).slots : {};
-      onRoomUpdated(
-        {
-          roomCode: code,
-          hostUid: auth.currentUser?.uid || profile.uid,
-          hostName: profile.displayName,
-          status: 'waiting',
-          homeTeamId: homeTeam.id,
-          awayTeamId: awayTeam.id,
-          homeScore: 0,
-          awayScore: 0,
-          half: 1,
-          remainingSeconds: 300,
-          slots: parsedSlots,
-          matchState: null,
-        },
-        'home_1'
-      );
-      setStatusMessage(
-        `Sala ${code} criada! Compartilhe o código com seus amigos.`
-      );
-    } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Erro ao criar sala.'
-      );
-    } finally {
-      setIsLoading(false);
+      await linkGoogleAccount();
+      showToast('Conta Google conectada com sucesso!');
+    } catch {
+      showToast('Login Google cancelado ou indisponível.', true);
     }
   };
 
-  const handleJoinRoom = async (codeToJoin?: string) => {
-    const targetCode = (codeToJoin || roomCodeInput).trim().toUpperCase();
-    if (!targetCode || !profile) return;
-    setErrorMessage(null);
-    setIsLoading(true);
-    try {
-      const { roomCode, assignedCharacterId } = await joinMultiplayerRoom(
-        targetCode,
-        profile
-      );
-      onRoomUpdated(
-        {
-          roomCode,
-          hostUid: '',
-          hostName: '',
-          status: 'waiting',
-          homeTeamId: homeTeam.id,
-          awayTeamId: awayTeam.id,
-          homeScore: 0,
-          awayScore: 0,
-          half: 1,
-          remainingSeconds: 300,
-          slots: {},
-          matchState: null,
-        },
-        assignedCharacterId
-      );
-      setStatusMessage(`Conectado à sala ${roomCode}!`);
-    } catch (err) {
-      setErrorMessage(
-        err instanceof Error ? err.message : 'Erro ao entrar na sala.'
-      );
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const handleCreateRoom = async (
+    overrideVisibility?: RoomVisibility,
+    overrideMode?: MatchFormatMode
+  ) => {
+    const modeToUse = overrideMode || selectedMode;
+    const visToUse = overrideVisibility || createVisibility;
 
-  const handleCopyRoomCode = (code: string) => {
-    if (navigator.clipboard) {
-      navigator.clipboard.writeText(code).catch(() => {});
-      setStatusMessage(`Código ${code} copiado para a área de transferência!`);
-      setTimeout(() => setStatusMessage(null), 2500);
-    }
-  };
-
-  const handleSelectCharacter = async (charId: string) => {
-    if (!activeRoom || !profile) return;
-    const slotsCopy = { ...(activeRoom.slots || {}) };
-    const targetSlot = slotsCopy[charId];
-    const myUid = auth.currentUser?.uid || profile.uid;
-    if (targetSlot && !targetSlot.isBot && targetSlot.uid && targetSlot.uid !== myUid) {
-      setErrorMessage('Este jogador já está sendo controlado por outro humano!');
-      setTimeout(() => setErrorMessage(null), 2500);
+    if (visToUse === 'private' && !createPassword.trim()) {
+      showToast('Defina uma senha para proteger sua Sala Privada.', true);
       return;
     }
 
-    for (const k of Object.keys(slotsCopy)) {
-      if (slotsCopy[k].uid === myUid) {
-        slotsCopy[k] = {
-          ...slotsCopy[k],
-          uid: null,
-          displayName: `Bot (${slotsCopy[k].characterName})`,
-          isBot: true,
-        };
-      }
-    }
-    if (slotsCopy[charId]) {
-      slotsCopy[charId] = {
-        ...slotsCopy[charId],
-        uid: myUid,
-        displayName: profile.displayName,
-        isBot: false,
-      };
-    }
-
-    onRoomUpdated({ ...activeRoom, slots: slotsCopy }, charId);
-    if (auth.currentUser) {
-      await selectCharacterInRoom(activeRoom.roomCode, profile, charId);
-    }
-  };
-
-  const handleRefreshLists = async () => {
-    setIsLoading(true);
-    const [conn, rooms, users] = await Promise.all([
-      testFirebaseConnection(),
-      listActiveRooms(),
-      listOnlineUsers(),
-    ]);
-    setConnected(conn.connected);
-    setPingMs(conn.pingMs);
-    setOpenRooms(rooms);
-    setOnlineUsers(users);
-    setIsLoading(false);
-  };
-
-  const filteredUsers = onlineUsers.filter((u) => {
-    if (!searchQuery.trim()) return true;
-    const q = searchQuery.toLowerCase();
-    return (
-      u.displayName.toLowerCase().includes(q) ||
-      u.tagCode.toLowerCase().includes(q)
+    setLoadingOverlayType('joining_room');
+    setLoadingOverlayMessage(
+      `Criando sala ${modeToUse === '2v2' ? '2 CONTRA 2' : '4 CONTRA 4'}...`
     );
-  });
 
-  const allSlotsList = [
-    ...INITIAL_HOME_PLAYERS.map((p) => ({
-      id: p.id,
-      name: p.name,
-      role: p.role,
-      team: 'home' as const,
-    })),
-    ...INITIAL_AWAY_PLAYERS.map((p) => ({
-      id: p.id,
-      name: p.name,
-      role: p.role,
-      team: 'away' as const,
-    })),
-  ];
+    try {
+      const room = await createOnlineRoom(homeTeamId, awayTeamId, halfDurationSeconds, {
+        roomName:
+          createRoomName.trim() ||
+          `SEM TERRA FC — SALA #${Math.floor(100 + Math.random() * 900)}`,
+        mode: modeToUse,
+        visibility: visToUse,
+        password: visToUse === 'private' ? createPassword.trim() : '',
+        maxHumans: Math.min(modeToUse === '2v2' ? 4 : 8, createMaxHumans),
+        autoFillBots: createAutoFillBots,
+      });
+      setCurrentRoom(room);
+      onRoomJoined(room);
+      setTab('room');
+      showToast(
+        `Sala ${room.roomCode} (${modeToUse.toUpperCase()}) criada! Bots prontos nas vagas livres.`
+      );
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? e.message : 'Erro ao criar sala.', true);
+    } finally {
+      setLoadingOverlayType(null);
+    }
+  };
+
+  const handleQuickPlayMode = async (mode: MatchFormatMode) => {
+    setSelectedMode(mode);
+    setLoadingOverlayType('joining_room');
+    setLoadingOverlayMessage(
+      `Buscando sala ${mode === '2v2' ? '2 CONTRA 2' : '4 CONTRA 4'} disponível...`
+    );
+    try {
+      const { room, createdNew } = await quickMatchOrCreateWithBots(
+        publicRooms,
+        mode,
+        homeTeamId,
+        awayTeamId,
+        halfDurationSeconds
+      );
+      setCurrentRoom(room);
+      onRoomJoined(room);
+      setTab('room');
+      showToast(
+        createdNew
+          ? `Nova sala ${mode.toUpperCase()} (${room.roomCode}) criada com bots automáticos!`
+          : `Você entrou na sala ${room.roomCode} (${mode.toUpperCase()})!`
+      );
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? e.message : 'Erro na busca rápida.', true);
+    } finally {
+      setLoadingOverlayType(null);
+    }
+  };
+
+  const handleJoinRoom = async (
+    code: string,
+    password?: string,
+    expectedMode?: MatchFormatMode
+  ) => {
+    if (!code.trim()) {
+      showToast('Digite o código da sala.', true);
+      return;
+    }
+
+    setLoadingOverlayType('joining_room');
+    setLoadingOverlayMessage(`Entrando na sala ${code.trim().toUpperCase()}...`);
+    try {
+      const room = await joinOnlineRoom(code, password, expectedMode);
+      if (room) {
+        setPasswordModalRoom(null);
+        setModalPasswordInput('');
+        setCurrentRoom(room);
+        onRoomJoined(room);
+        setTab('room');
+        showToast(`Conectado à sala ${room.roomCode}!`);
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Não foi possível entrar na sala.';
+      if (msg.includes('SENHA_OBRIGATORIA')) {
+        const target = publicRooms.find((r) => r.roomCode === code.trim().toUpperCase());
+        if (target) {
+          setPasswordModalRoom(target);
+        } else {
+          showToast('Esta sala é privada. Informe a senha da sala para entrar.', true);
+        }
+      } else {
+        showToast(msg, true);
+      }
+    } finally {
+      setLoadingOverlayType(null);
+    }
+  };
+
+  const handleLeaveCurrentRoom = async () => {
+    if (!currentRoom) return;
+    const code = currentRoom.roomCode;
+    presenceService.stopRoomPresence();
+    voiceChatService.leaveRoomVoice();
+    await leaveOnlineRoom(code);
+    setCurrentRoom(null);
+    onRoomLeft();
+    setTab('modes');
+    showToast('Você saiu da sala. Microfone e sessão desconectados.');
+  };
+
+  const handlePickCharacter = async (characterId: string) => {
+    if (!currentRoom) return;
+    const res = await selectRoomCharacter(currentRoom.roomCode, characterId);
+    if (!res.ok && res.message) {
+      showToast(res.message, true);
+    }
+  };
+
+  const handleToggleReady = async () => {
+    if (!currentRoom) return;
+    await togglePlayerReadyInRoom(currentRoom.roomCode);
+  };
+
+  const handleHostStartMatch = async () => {
+    if (!currentRoom) return;
+    setLoadingOverlayType('joining_room');
+    setLoadingOverlayMessage('Preparando o campinho e sincronizando bots...');
+    try {
+      await startOnlineMatch(currentRoom.roomCode);
+    } catch {
+      showToast('Erro ao iniciar a partida.', true);
+    } finally {
+      setLoadingOverlayType(null);
+    }
+  };
+
+  const handleCopyCode = (code: string) => {
+    navigator.clipboard?.writeText(code).catch(() => {});
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const handleAddFriend = async () => {
+    if (!friendSearchInput.trim()) return;
+    const res = await sendFriendRequestByTag(friendSearchInput);
+    showToast(res.message, !res.ok);
+    if (res.ok) setFriendSearchInput('');
+  };
+
+  const handleInviteFriendToRoom = async (friend: OnlineUserProfile) => {
+    if (!currentRoom) {
+      showToast('Crie ou entre em uma sala primeiro para convidar amigos!', true);
+      return;
+    }
+    await sendRoomInviteToFriend(friend.uid, friend.displayName, currentRoom.roomCode);
+    showToast(`Convite da sala ${currentRoom.roomCode} enviado para ${friend.displayName}!`);
+  };
+
+  const handleRespondRequest = async (req: FriendRequestDoc, accept: boolean) => {
+    await respondToFriendRequest(req, accept);
+    if (accept && req.type === 'room_invite' && req.roomCode) {
+      await handleJoinRoom(req.roomCode);
+    } else {
+      showToast(accept ? 'Solicitação aceita!' : 'Solicitação recusada.');
+    }
+  };
+
+  const currentUid = getCurrentAuthUser()?.uid || myProfile?.uid || '';
+  const isHost = Boolean(currentRoom && currentRoom.hostUid === currentUid);
+  const mySlotInRoom: MultiplayerSlot | undefined = currentRoom
+    ? Object.values(currentRoom.slots || {}).find((s) => s.uid === currentUid)
+    : undefined;
+
+  const filteredRooms = filterRoomsByMode(publicRooms, selectedMode);
+  const career = formatPlayerCareerSummary(myProfile);
+  const pendingRoomInvites = incomingRequests.filter((r) => r.type === 'room_invite');
 
   return (
-    <div className="pointer-events-auto fixed inset-0 z-40 flex items-center justify-center bg-stone-950/85 p-3 sm:p-6 overflow-y-auto">
-      <div className="w-full max-w-4xl bg-stone-950 border-2 border-amber-500/80 rounded-2xl p-4 sm:p-6 shadow-2xl text-stone-100 my-auto max-h-[92vh] flex flex-col">
-        {/* Top Modal Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 mb-4 border-b border-stone-800 shrink-0">
-          <div className="flex items-center gap-3">
-            <span className="px-2.5 py-1 rounded-md bg-amber-500 text-stone-950 font-extrabold text-xs uppercase tracking-wider">
-              ONLINE 4x4
-            </span>
-            <h2 className="text-lg sm:text-2xl font-extrabold text-amber-400 tracking-wide uppercase">
-              Central Multiplayer &amp; Amigos
-            </h2>
+    <div className="fixed inset-0 z-50 bg-stone-950/90 backdrop-blur-md flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
+      {loadingOverlayType && (
+        <MatchLoadingOverlay
+          type={loadingOverlayType}
+          customMessage={loadingOverlayMessage}
+          onRetryOrCancel={() => setLoadingOverlayType(null)}
+        />
+      )}
+
+      {/* Modal de Senha para Sala Privada */}
+      {passwordModalRoom && (
+        <div className="fixed inset-0 z-[65] bg-stone-950/85 flex items-center justify-center p-4">
+          <div className="w-full max-w-sm bg-stone-900 border-2 border-amber-500 rounded p-5 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-amber-400 font-black uppercase text-sm">
+                <Lock className="w-4 h-4" />
+                Sala Privada ({passwordModalRoom.roomCode})
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setPasswordModalRoom(null);
+                  setModalPasswordInput('');
+                }}
+                className="text-stone-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-stone-300">
+              Digite a senha definida por <strong>{passwordModalRoom.hostName}</strong> para entrar em{' '}
+              <strong>{passwordModalRoom.roomName}</strong>:
+            </p>
+            <input
+              type="password"
+              value={modalPasswordInput}
+              onChange={(e) => setModalPasswordInput(e.target.value)}
+              placeholder="Senha da sala..."
+              className="w-full bg-stone-950 border border-stone-700 px-3 py-2 text-sm text-white rounded focus:outline-none focus:border-amber-500"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setPasswordModalRoom(null);
+                  setModalPasswordInput('');
+                }}
+                className="px-3 py-1.5 bg-stone-800 text-stone-300 text-xs font-bold uppercase rounded cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  handleJoinRoom(
+                    passwordModalRoom.roomCode,
+                    modalPasswordInput,
+                    passwordModalRoom.mode
+                  )
+                }
+                className="px-4 py-1.5 bg-amber-500 hover:bg-amber-400 text-stone-950 text-xs font-black uppercase rounded cursor-pointer"
+              >
+                Entrar na Sala
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="w-full max-w-5xl bg-stone-900 border-2 border-stone-700 shadow-2xl overflow-hidden flex flex-col max-h-[94vh]">
+        {/* Top Bar */}
+        <div className="bg-stone-950 px-4 py-3 border-b border-stone-800 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded bg-amber-500 text-stone-950 font-black text-xs flex items-center justify-center">
+              STF
+            </div>
+            <div>
+              <h2 className="text-base sm:text-lg font-black uppercase tracking-tight text-white">
+                SEM TERRA FC — MULTIPLAYER ONLINE
+              </h2>
+              <p className="text-[11px] text-stone-400">
+                Salas Públicas e Privadas · 2 contra 2 e 4 contra 4 · Bots Automáticos & Voz WebRTC
+              </p>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Connection & Ping Badge */}
-            <div className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-stone-900 border border-stone-800 text-xs font-mono">
-              <span
-                className={`w-2.5 h-2.5 rounded-full ${
-                  connected ? 'bg-emerald-400' : 'bg-red-500'
-                }`}
-              />
-              <span className="text-stone-300">
-                {connected ? 'Firebase Online' : 'Offline'}
-              </span>
-              <span className="text-amber-400 font-bold">{pingMs} ms</span>
-            </div>
-
+            {myProfile && (
+              <div className="hidden md:flex items-center gap-2 bg-stone-900 border border-stone-800 px-2.5 py-1 rounded text-xs">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="font-bold text-white">{myProfile.displayName}</span>
+                <span className="font-mono text-amber-400 font-bold">{myProfile.tagCode}</span>
+                <span className="text-stone-500">|</span>
+                <span className="text-emerald-400 font-bold">{career.wins}V</span>
+                <span className="text-stone-400">{career.draws}E</span>
+                <span className="text-red-400">{career.losses}D</span>
+              </div>
+            )}
             <button
               type="button"
               onClick={onClose}
-              className="px-3 py-1.5 bg-stone-800 hover:bg-stone-700 text-stone-200 rounded-lg text-xs font-bold cursor-pointer"
+              className="p-1.5 bg-stone-800 hover:bg-stone-700 text-stone-300 rounded cursor-pointer"
+              title="Fechar Lobby"
             >
-              Fechar
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Banner de Convite de Sala Recebido */}
+        {pendingRoomInvites.length > 0 && (
+          <div className="bg-amber-500/20 border-b border-amber-500/50 px-4 py-2 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-xs font-bold text-amber-200">
+              <Sparkles className="w-4 h-4 text-amber-400 animate-bounce" />
+              <span>
+                <strong>{pendingRoomInvites[0].fromName}</strong> convidou você para jogar na sala{' '}
+                <strong className="font-mono text-amber-300">
+                  {pendingRoomInvites[0].roomCode}
+                </strong>
+                !
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => handleRespondRequest(pendingRoomInvites[0], true)}
+                className="bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-[11px] uppercase px-3 py-1 rounded cursor-pointer"
+              >
+                Aceitar e Entrar
+              </button>
+              <button
+                type="button"
+                onClick={() => handleRespondRequest(pendingRoomInvites[0], false)}
+                className="bg-stone-800 hover:bg-stone-700 text-stone-300 font-bold text-[11px] uppercase px-2.5 py-1 rounded cursor-pointer"
+              >
+                Recusar
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Profile & Mode Selector Bar */}
+        <div className="bg-stone-900/90 px-4 py-2.5 border-b border-stone-800 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-stone-400">
+              Seu Nome:
+            </span>
+            <input
+              type="text"
+              value={nicknameInput}
+              onChange={(e) => setNicknameInput(e.target.value)}
+              maxLength={24}
+              placeholder="Seu apelido na várzea"
+              className="bg-stone-950 border border-stone-700 px-2.5 py-1 text-xs text-white font-bold rounded focus:outline-none focus:border-amber-500 w-36 sm:w-44"
+            />
+            <button
+              type="button"
+              onClick={handleSaveNickname}
+              disabled={savingName}
+              className="bg-stone-800 hover:bg-stone-700 text-amber-400 border border-amber-500/40 px-2.5 py-1 text-xs font-bold uppercase rounded cursor-pointer"
+            >
+              {savingName ? '...' : 'Salvar'}
+            </button>
+            {myProfile && (
+              <span className="text-[11px] text-stone-400 font-mono">
+                Tag: <strong className="text-amber-300">{myProfile.tagCode}</strong>
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleGoogleLogin}
+              className="flex items-center gap-1.5 bg-stone-800 hover:bg-stone-700 text-stone-200 border border-stone-700 px-2.5 py-1 text-xs font-bold rounded cursor-pointer"
+            >
+              <LogIn className="w-3.5 h-3.5 text-amber-400" />
+              Vincular Conta Google
             </button>
           </div>
         </div>
 
         {/* Navigation Tabs */}
-        <div className="grid grid-cols-3 gap-2 mb-4 bg-stone-900 p-1.5 rounded-xl shrink-0">
+        <div className="flex border-b border-stone-800 bg-stone-950/60 px-4 gap-1 overflow-x-auto">
           <button
             type="button"
-            onClick={() => setTab('lobby')}
-            className={`py-2 px-3 rounded-lg text-xs sm:text-sm font-extrabold uppercase tracking-wider transition-colors cursor-pointer ${
-              tab === 'lobby'
-                ? 'bg-amber-500 text-stone-950'
-                : 'text-stone-300 hover:text-white'
+            onClick={() => setTab('modes')}
+            className={`px-3.5 py-2.5 text-xs font-black uppercase tracking-wider border-b-2 transition-colors cursor-pointer whitespace-nowrap ${
+              tab === 'modes'
+                ? 'border-amber-500 text-amber-400 bg-stone-900/60'
+                : 'border-transparent text-stone-400 hover:text-stone-200'
             }`}
           >
-            Lobby Multiplayer
+            1. Modalidades (2v2 / 4v4)
           </button>
+
+          <button
+            type="button"
+            onClick={() => setTab('public_rooms')}
+            className={`px-3.5 py-2.5 text-xs font-black uppercase tracking-wider border-b-2 transition-colors cursor-pointer whitespace-nowrap ${
+              tab === 'public_rooms'
+                ? 'border-amber-500 text-amber-400 bg-stone-900/60'
+                : 'border-transparent text-stone-400 hover:text-stone-200'
+            }`}
+          >
+            2. Salas Públicas ({filteredRooms.length})
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setTab('private_room')}
+            className={`px-3.5 py-2.5 text-xs font-black uppercase tracking-wider border-b-2 transition-colors cursor-pointer whitespace-nowrap ${
+              tab === 'private_room'
+                ? 'border-amber-500 text-amber-400 bg-stone-900/60'
+                : 'border-transparent text-stone-400 hover:text-stone-200'
+            }`}
+          >
+            3. Salas Privadas
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setTab('room')}
+            className={`px-3.5 py-2.5 text-xs font-black uppercase tracking-wider border-b-2 transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+              tab === 'room'
+                ? 'border-amber-500 text-amber-400 bg-stone-900/60'
+                : 'border-transparent text-stone-400 hover:text-stone-200'
+            }`}
+          >
+            4. Sala de Equipes
+            {currentRoom && (
+              <span className="bg-emerald-500 text-stone-950 text-[10px] font-black px-1.5 py-0.2 rounded">
+                {currentRoom.roomCode}
+              </span>
+            )}
+          </button>
+
           <button
             type="button"
             onClick={() => setTab('friends')}
-            className={`py-2 px-3 rounded-lg text-xs sm:text-sm font-extrabold uppercase tracking-wider transition-colors cursor-pointer ${
+            className={`px-3.5 py-2.5 text-xs font-black uppercase tracking-wider border-b-2 transition-colors cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
               tab === 'friends'
-                ? 'bg-amber-500 text-stone-950'
-                : 'text-stone-300 hover:text-white'
+                ? 'border-amber-500 text-amber-400 bg-stone-900/60'
+                : 'border-transparent text-stone-400 hover:text-stone-200'
             }`}
           >
-            Amigos &amp; Jogadores Online
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab('diagnostic')}
-            className={`py-2 px-3 rounded-lg text-xs sm:text-sm font-extrabold uppercase tracking-wider transition-colors cursor-pointer ${
-              tab === 'diagnostic'
-                ? 'bg-amber-500 text-stone-950'
-                : 'text-stone-300 hover:text-white'
-            }`}
-          >
-            Diagnóstico Firebase
+            5. Amigos & Convites
+            {incomingRequests.length > 0 && (
+              <span className="bg-red-500 text-white text-[10px] font-black px-1.5 py-0.2 rounded-full">
+                {incomingRequests.length}
+              </span>
+            )}
           </button>
         </div>
 
-        {/* Status / Error Alerts */}
-        {statusMessage && (
-          <div className="mb-3 px-4 py-2 rounded-xl bg-emerald-950/90 border border-emerald-500/60 text-emerald-200 text-xs font-semibold shrink-0">
-            {statusMessage}
-          </div>
-        )}
-        {errorMessage && (
-          <div className="mb-3 px-4 py-2 rounded-xl bg-red-950/90 border border-red-500/60 text-red-200 text-xs font-semibold shrink-0">
-            {errorMessage}
-          </div>
-        )}
-
-        {/* Player Identity Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3 bg-stone-900/90 border border-stone-800 rounded-xl p-3 mb-4 shrink-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs text-stone-400 font-semibold">
-              Seu Craque:
-            </span>
-            <input
-              type="text"
-              maxLength={24}
-              value={nameInput}
-              onChange={(e) => setNameInput(e.target.value)}
-              aria-label="Seu nome de jogador online"
-              className="px-2.5 py-1 bg-stone-950 border border-stone-700 rounded-lg text-xs font-bold text-white w-36 sm:w-44"
-            />
+        {/* Toast Feedback */}
+        {feedbackMsg && (
+          <div
+            className={`px-4 py-2 text-xs font-bold flex items-center justify-between ${
+              feedbackMsg.isError
+                ? 'bg-red-950/90 text-red-200 border-b border-red-800'
+                : 'bg-emerald-950/90 text-emerald-200 border-b border-emerald-800'
+            }`}
+          >
+            <span>{feedbackMsg.text}</span>
             <button
               type="button"
-              onClick={handleSaveName}
-              className="px-2.5 py-1 bg-stone-800 hover:bg-stone-700 text-amber-300 rounded-lg text-xs font-bold cursor-pointer"
+              onClick={() => setFeedbackMsg(null)}
+              className="text-stone-400 hover:text-white cursor-pointer"
             >
-              Salvar Nome
+              <X className="w-3.5 h-3.5" />
             </button>
-            {profile?.tagCode && (
-              <span className="px-2 py-0.5 rounded bg-stone-950 border border-stone-700 font-mono text-xs text-amber-400">
-                Código: {profile.tagCode}
-              </span>
-            )}
           </div>
+        )}
 
-          <div className="flex items-center gap-2">
-            {!auth.currentUser || auth.currentUser.isAnonymous ? (
-              <button
-                type="button"
-                onClick={handleGoogleLogin}
-                disabled={isLoading}
-                className="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
-              >
-                Vincular / Entrar com Google
-              </button>
-            ) : (
-              <span className="text-xs text-emerald-400 font-semibold">
-                ✓ Conta Google Verificada
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Scrollable Content Area */}
-        <div className="overflow-y-auto flex-1 pr-1 space-y-4">
-          {/* TAB 1: LOBBY MULTIPLAYER */}
-          {tab === 'lobby' && (
+        {/* Main Content Area */}
+        <div className="p-4 overflow-y-auto flex-1 space-y-4">
+          {/* TAB 1: ESCOLHA DE MODALIDADE (2 CONTRA 2 vs 4 CONTRA 4) */}
+          {tab === 'modes' && (
             <div className="space-y-4">
-              {!activeRoom ? (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Create or Join Room Box */}
-                  <div className="bg-stone-900/70 border border-stone-800 rounded-xl p-4 space-y-4">
-                    <h3 className="text-sm font-extrabold text-amber-400 uppercase tracking-wider">
-                      Criar ou Entrar em uma Sala 4x4
-                    </h3>
-                    <p className="text-xs text-stone-300 leading-relaxed">
-                      Crie uma sala de várzea para gerar um código único ou
-                      digite o código enviado pelo seu amigo. Posições sem
-                      humanos são preenchidas por Inteligência Artificial (1x1,
-                      2x2, 3x3 ou 4x4).
-                    </p>
+              <div className="bg-stone-950/80 border border-stone-800 p-4 rounded">
+                <h3 className="text-sm font-black uppercase tracking-wider text-amber-400">
+                  Escolha o Formato da Partida Online
+                </h3>
+                <p className="text-xs text-stone-300 mt-1">
+                  Cada modalidade possui salas independentes. Os bots completam automaticamente todas
+                  as vagas sem jogadores humanos — você pode iniciar mesmo jogando sozinho!
+                </p>
+              </div>
 
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Card 2 CONTRA 2 */}
+                <div
+                  onClick={() => setSelectedMode('2v2')}
+                  className={`p-5 rounded border-2 transition-all cursor-pointer flex flex-col justify-between ${
+                    selectedMode === '2v2'
+                      ? 'bg-amber-500/10 border-amber-500 shadow-xl'
+                      : 'bg-stone-950/70 border-stone-800 hover:border-stone-700'
+                  }`}
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-black uppercase tracking-widest px-2.5 py-0.5 rounded bg-amber-500 text-stone-950">
+                        DUPLAS NA TERRA
+                      </span>
+                      <span className="text-xs font-mono font-bold text-stone-400">
+                        Até 4 Humanos · 4 em Campo
+                      </span>
+                    </div>
+                    <h4 className="text-2xl font-black uppercase text-white tracking-tight">
+                      2 CONTRA 2
+                    </h4>
+                    <p className="text-xs text-stone-300 leading-relaxed">
+                      Dois jogadores em cada equipe (livre escolha de 2 entre os 4 personagens por
+                      time). Ritmo acelerado nas travinhas de mini campo, com bots completando as
+                      vagas restantes.
+                    </p>
+                  </div>
+
+                  <div className="pt-4 mt-4 border-t border-stone-800/80 flex flex-wrap gap-2">
                     <button
                       type="button"
-                      onClick={handleCreateRoom}
-                      disabled={isLoading}
-                      className="w-full py-3 px-4 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold text-sm rounded-xl shadow-lg transition-colors cursor-pointer"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleQuickPlayMode('2v2');
+                      }}
+                      className="flex-1 bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase py-2.5 px-3 rounded flex items-center justify-center gap-1.5 cursor-pointer"
                     >
-                      CRIAR SALA ONLINE
+                      <Play className="w-4 h-4 fill-stone-950" />
+                      Jogar 2v2 Agora
                     </button>
-
-                    <div className="pt-3 border-t border-stone-800">
-                      <label
-                        htmlFor="join-room-code-input"
-                        className="block text-xs text-stone-400 mb-1.5 font-semibold"
-                      >
-                        Entrar com Código da Sala:
-                      </label>
-                      <div className="flex gap-2">
-                        <input
-                          id="join-room-code-input"
-                          type="text"
-                          placeholder="Ex: VRZ-4821"
-                          value={roomCodeInput}
-                          onChange={(e) =>
-                            setRoomCodeInput(e.target.value.toUpperCase())
-                          }
-                          className="flex-1 px-3 py-2 bg-stone-950 border border-stone-700 rounded-xl text-sm font-mono font-bold text-amber-400 uppercase"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => handleJoinRoom()}
-                          disabled={isLoading || !roomCodeInput.trim()}
-                          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-extrabold text-xs rounded-xl cursor-pointer"
-                        >
-                          ENTRAR NA SALA
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Open Rooms List */}
-                  <div className="bg-stone-900/70 border border-stone-800 rounded-xl p-4 flex flex-col justify-between">
-                    <div>
-                      <div className="flex items-center justify-between mb-3">
-                        <h3 className="text-sm font-extrabold text-amber-400 uppercase tracking-wider">
-                          Salas Abertas no Terreirão
-                        </h3>
-                        <button
-                          type="button"
-                          onClick={handleRefreshLists}
-                          className="text-xs text-stone-400 hover:text-white underline cursor-pointer"
-                        >
-                          Atualizar
-                        </button>
-                      </div>
-
-                      {openRooms.length === 0 ? (
-                        <div className="py-8 text-center text-xs text-stone-400">
-                          Nenhuma sala aberta no momento. Clique em{' '}
-                          <strong className="text-amber-400">
-                            CRIAR SALA ONLINE
-                          </strong>{' '}
-                          para puxar a pelada!
-                        </div>
-                      ) : (
-                        <div className="space-y-2 max-h-56 overflow-y-auto">
-                          {openRooms.map((r) => (
-                            <div
-                              key={r.roomCode}
-                              className="flex items-center justify-between p-2.5 rounded-lg bg-stone-950 border border-stone-800"
-                            >
-                              <div>
-                                <div className="flex items-center gap-2">
-                                  <span className="font-mono font-extrabold text-xs text-amber-400">
-                                    {r.roomCode}
-                                  </span>
-                                  <span className="text-xs font-bold text-stone-200">
-                                    Host: {r.hostName}
-                                  </span>
-                                </div>
-                                <div className="text-[11px] text-stone-400">
-                                  Jogadores Humanos: {r.humanCount}/8 · Status:{' '}
-                                  {r.status === 'waiting'
-                                    ? 'Aguardando'
-                                    : `Jogando (${r.homeScore}x${r.awayScore})`}
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => handleJoinRoom(r.roomCode)}
-                                className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold text-xs rounded-lg cursor-pointer"
-                              >
-                                Entrar
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedMode('2v2');
+                        setTab('public_rooms');
+                      }}
+                      className="bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold text-xs uppercase py-2.5 px-3 rounded cursor-pointer"
+                    >
+                      Ver Salas 2v2
+                    </button>
                   </div>
                 </div>
-              ) : (
-                /* ACTIVE ROOM LOBBY: Select Team & Character (Yuri, Josué, Careca, Bode vs Primo, Bicudo, Ismael, Felipe) */
-                <div className="bg-stone-900/80 border border-amber-500/50 rounded-xl p-4 space-y-4">
-                  <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-stone-800">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs uppercase font-bold text-stone-400">
-                          Código da Sala:
-                        </span>
-                        <span className="font-mono font-extrabold text-lg text-amber-400">
-                          {activeRoom.roomCode}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopyRoomCode(activeRoom.roomCode)
-                          }
-                          className="px-2.5 py-1 bg-stone-800 hover:bg-stone-700 text-amber-300 rounded text-xs font-bold cursor-pointer"
-                        >
-                          Copiar Código
-                        </button>
-                      </div>
-                      <p className="text-xs text-stone-400 mt-0.5">
-                        Escolha seu jogador abaixo. Dois humanos não podem
-                        controlar o mesmo personagem (os demais jogam com IA).
-                      </p>
-                    </div>
 
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          await leaveMultiplayerRoom(activeRoom.roomCode);
-                          onRoomUpdated(null, 'home_1');
-                        }}
-                        className="px-3 py-2 bg-stone-800 hover:bg-red-950 text-stone-300 hover:text-red-300 rounded-xl text-xs font-bold cursor-pointer"
-                      >
-                        Sair da Sala
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          await startMultiplayerMatchInRoom(
-                            activeRoom.roomCode
-                          );
-                          onStartMultiplayerGame();
-                        }}
-                        className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold text-sm rounded-xl shadow-lg cursor-pointer"
-                      >
-                        INICIAR PARTIDA ONLINE
-                      </button>
+                {/* Card 4 CONTRA 4 */}
+                <div
+                  onClick={() => setSelectedMode('4v4')}
+                  className={`p-5 rounded border-2 transition-all cursor-pointer flex flex-col justify-between ${
+                    selectedMode === '4v4'
+                      ? 'bg-amber-500/10 border-amber-500 shadow-xl'
+                      : 'bg-stone-950/70 border-stone-800 hover:border-stone-700'
+                  }`}
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-black uppercase tracking-widest px-2.5 py-0.5 rounded bg-emerald-500 text-stone-950">
+                        CLÁSSICO COMPLETO
+                      </span>
+                      <span className="text-xs font-mono font-bold text-stone-400">
+                        Até 8 Humanos · 8 em Campo
+                      </span>
                     </div>
+                    <h4 className="text-2xl font-black uppercase text-white tracking-tight">
+                      4 CONTRA 4
+                    </h4>
+                    <p className="text-xs text-stone-300 leading-relaxed">
+                      Quatro jogadores em cada equipe: Time 1 (Yuri, Josué, Careca e Bode) contra
+                      Time 2 (Primo, Bicudo, Ismael e Felipe). Bots assumem todas as vagas não
+                      preenchidas por humanos.
+                    </p>
                   </div>
 
-                  {/* 4v4 Character Slot Grid */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* Team 1: Yuri, Josué, Careca, Bode */}
-                    <div className="bg-stone-950/90 border border-stone-800 rounded-xl p-3">
-                      <div className="text-xs font-extrabold text-amber-400 uppercase tracking-wider mb-2.5">
-                        Time 1 ({homeTeam.name}) — Yuri, Josué, Careca, Bode
-                      </div>
-                      <div className="space-y-2">
-                        {allSlotsList
-                          .filter((s) => s.team === 'home')
-                          .map((char) => {
-                            const slot = activeRoom.slots?.[char.id];
-                            const isMe = char.id === controlledCharacterId;
-                            const isOtherHuman =
-                              slot && !slot.isBot && slot.uid && !isMe;
-                            return (
-                              <div
-                                key={char.id}
-                                className={`flex items-center justify-between p-2.5 rounded-lg border ${
-                                  isMe
-                                    ? 'bg-amber-500/15 border-amber-400'
-                                    : 'bg-stone-900 border-stone-800'
-                                }`}
-                              >
-                                <div>
-                                  <div className="font-bold text-sm text-stone-100">
-                                    {char.name}{' '}
-                                    <span className="text-[10px] font-mono text-stone-400 uppercase">
-                                      ({char.role})
-                                    </span>
-                                  </div>
-                                  <div className="text-xs text-stone-400">
-                                    {isMe
-                                      ? `Você (${profile?.displayName})`
-                                      : isOtherHuman
-                                      ? `Humano: ${slot.displayName}`
-                                      : 'Controlado por Bot (IA)'}
-                                  </div>
-                                </div>
-                                <button
-                                  type="button"
-                                  disabled={Boolean(isOtherHuman)}
-                                  onClick={() => handleSelectCharacter(char.id)}
-                                  className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer ${
-                                    isMe
-                                      ? 'bg-amber-500 text-stone-950'
-                                      : isOtherHuman
-                                      ? 'bg-stone-800 text-stone-500 cursor-not-allowed'
-                                      : 'bg-stone-800 hover:bg-stone-700 text-stone-200'
-                                  }`}
-                                >
-                                  {isMe
-                                    ? 'Selecionado'
-                                    : isOtherHuman
-                                    ? 'Ocupado'
-                                    : 'Assumir'}
-                                </button>
-                              </div>
-                            );
-                          })}
-                      </div>
-                    </div>
-
-                    {/* Team 2: Primo, Bicudo, Ismael, Felipe */}
-                    <div className="bg-stone-950/90 border border-stone-800 rounded-xl p-3">
-                      <div className="text-xs font-extrabold text-red-400 uppercase tracking-wider mb-2.5">
-                        Time 2 ({awayTeam.name}) — Primo, Bicudo, Ismael, Felipe
-                      </div>
-                      <div className="space-y-2">
-                        {allSlotsList
-                          .filter((s) => s.team === 'away')
-                          .map((char) => {
-                            const slot = activeRoom.slots?.[char.id];
-                            const isMe = char.id === controlledCharacterId;
-                            const isOtherHuman =
-                              slot && !slot.isBot && slot.uid && !isMe;
-                            return (
-                              <div
-                                key={char.id}
-                                className={`flex items-center justify-between p-2.5 rounded-lg border ${
-                                  isMe
-                                    ? 'bg-amber-500/15 border-amber-400'
-                                    : 'bg-stone-900 border-stone-800'
-                                }`}
-                              >
-                                <div>
-                                  <div className="font-bold text-sm text-stone-100">
-                                    {char.name}{' '}
-                                    <span className="text-[10px] font-mono text-stone-400 uppercase">
-                                      ({char.role})
-                                    </span>
-                                  </div>
-                                  <div className="text-xs text-stone-400">
-                                    {isMe
-                                      ? `Você (${profile?.displayName})`
-                                      : isOtherHuman
-                                      ? `Humano: ${slot.displayName}`
-                                      : 'Controlado por Bot (IA)'}
-                                  </div>
-                                </div>
-                                <button
-                                  type="button"
-                                  disabled={Boolean(isOtherHuman)}
-                                  onClick={() => handleSelectCharacter(char.id)}
-                                  className={`px-3 py-1 rounded-lg text-xs font-bold cursor-pointer ${
-                                    isMe
-                                      ? 'bg-amber-500 text-stone-950'
-                                      : isOtherHuman
-                                      ? 'bg-stone-800 text-stone-500 cursor-not-allowed'
-                                      : 'bg-stone-800 hover:bg-stone-700 text-stone-200'
-                                  }`}
-                                >
-                                  {isMe
-                                    ? 'Selecionado'
-                                    : isOtherHuman
-                                    ? 'Ocupado'
-                                    : 'Assumir'}
-                                </button>
-                              </div>
-                            );
-                          })}
-                      </div>
-                    </div>
+                  <div className="pt-4 mt-4 border-t border-stone-800/80 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleQuickPlayMode('4v4');
+                      }}
+                      className="flex-1 bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase py-2.5 px-3 rounded flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Play className="w-4 h-4 fill-stone-950" />
+                      Jogar 4v4 Agora
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedMode('4v4');
+                        setTab('public_rooms');
+                      }}
+                      className="bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold text-xs uppercase py-2.5 px-3 rounded cursor-pointer"
+                    >
+                      Ver Salas 4v4
+                    </button>
                   </div>
                 </div>
-              )}
+              </div>
             </div>
           )}
 
-          {/* TAB 2: AMIGOS & JOGADORES ONLINE */}
-          {tab === 'friends' && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Search & Online Players */}
-              <div className="bg-stone-900/70 border border-stone-800 rounded-xl p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-extrabold text-amber-400 uppercase tracking-wider">
-                    Buscar Jogadores por Nome ou Código
-                  </h3>
+          {/* TAB 2: SALAS PÚBLICAS */}
+          {tab === 'public_rooms' && (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-stone-950/80 border border-stone-800 p-3.5 rounded">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-black uppercase text-stone-300">
+                    Filtrar Modalidade:
+                  </span>
                   <button
                     type="button"
-                    onClick={handleRefreshLists}
-                    className="text-xs text-stone-400 hover:text-white underline cursor-pointer"
+                    onClick={() => setSelectedMode('2v2')}
+                    className={`px-3 py-1.5 rounded text-xs font-black uppercase cursor-pointer ${
+                      selectedMode === '2v2'
+                        ? 'bg-amber-500 text-stone-950'
+                        : 'bg-stone-800 text-stone-300 hover:bg-stone-700'
+                    }`}
                   >
-                    Atualizar
+                    2 CONTRA 2
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMode('4v4')}
+                    className={`px-3 py-1.5 rounded text-xs font-black uppercase cursor-pointer ${
+                      selectedMode === '4v4'
+                        ? 'bg-amber-500 text-stone-950'
+                        : 'bg-stone-800 text-stone-300 hover:bg-stone-700'
+                    }`}
+                  >
+                    4 CONTRA 4
                   </button>
                 </div>
 
-                <input
-                  type="text"
-                  placeholder="Buscar por nome ou código (ex: VZR-7A2B)..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full px-3 py-2 bg-stone-950 border border-stone-700 rounded-xl text-xs text-white"
-                />
-
-                <div className="space-y-2 max-h-60 overflow-y-auto">
-                  {filteredUsers.length === 0 ? (
-                    <div className="py-6 text-center text-xs text-stone-400">
-                      Nenhum jogador encontrado com esse filtro.
-                    </div>
-                  ) : (
-                    filteredUsers.map((u) => {
-                      const isSelf = u.uid === profile?.uid;
-                      return (
-                        <div
-                          key={u.uid}
-                          className="flex items-center justify-between p-2.5 rounded-lg bg-stone-950 border border-stone-800"
-                        >
-                          <div>
-                            <div className="flex items-center gap-1.5">
-                              <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                              <span className="font-bold text-xs text-stone-100">
-                                {u.displayName} {isSelf && '(Você)'}
-                              </span>
-                              <span className="font-mono text-[10px] text-amber-400">
-                                {u.tagCode}
-                              </span>
-                            </div>
-                            <div className="text-[11px] text-stone-400">
-                              {u.currentRoomCode
-                                ? `Na sala ${u.currentRoomCode}`
-                                : 'Disponível no Lobby'}
-                            </div>
-                          </div>
-
-                          {!isSelf && profile && (
-                            <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                onClick={async () => {
-                                  await sendFriendRequestOrInvite(
-                                    profile,
-                                    u,
-                                    activeRoom?.roomCode || ''
-                                  );
-                                  setStatusMessage(
-                                    activeRoom?.roomCode
-                                      ? `Convite para sala ${activeRoom.roomCode} enviado a ${u.displayName}!`
-                                      : `Pedido de amizade enviado para ${u.displayName}!`
-                                  );
-                                }}
-                                className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-stone-950 font-bold text-xs rounded-lg cursor-pointer"
-                              >
-                                {activeRoom?.roomCode
-                                  ? 'Convidar p/ Sala'
-                                  : '+ Amigo'}
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })
-                  )}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleCreateRoom('public', selectedMode)}
+                    className="bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs uppercase px-3.5 py-2 rounded flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Plus className="w-4 h-4" />
+                    Criar Sala Pública ({selectedMode.toUpperCase()})
+                  </button>
                 </div>
               </div>
 
-              {/* Friend Requests & Room Invites */}
-              <div className="bg-stone-900/70 border border-stone-800 rounded-xl p-4 space-y-3">
-                <h3 className="text-sm font-extrabold text-amber-400 uppercase tracking-wider">
-                  Lista de Amigos &amp; Convites de Partida
-                </h3>
-
-                {friendRequests.length === 0 ? (
-                  <div className="py-8 text-center text-xs text-stone-400">
-                    Você ainda não tem pedidos de amizade ou convites pendentes.
-                    Adicione jogadores ao lado para jogar junto!
+              <div className="space-y-2.5">
+                {filteredRooms.length === 0 ? (
+                  <div className="bg-stone-950/60 border border-stone-800/80 p-8 text-center rounded space-y-3">
+                    <Globe className="w-8 h-8 text-stone-600 mx-auto" />
+                    <div className="text-sm font-bold text-stone-300">
+                      Nenhuma sala na modalidade {selectedMode.toUpperCase()} aberta no momento.
+                    </div>
+                    <p className="text-xs text-stone-500 max-w-md mx-auto">
+                      Crie uma sala pública agora mesmo e jogue imediatamente com bots enquanto
+                      outros jogadores entram!
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleCreateRoom('public', selectedMode)}
+                      className="bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase px-4 py-2 rounded inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Criar Sala {selectedMode.toUpperCase()} com Bots
+                    </button>
                   </div>
                 ) : (
-                  <div className="space-y-2 max-h-60 overflow-y-auto">
-                    {friendRequests.map((req) => {
-                      const isIncoming = req.toUid === auth.currentUser?.uid;
-                      const friendName = isIncoming
-                        ? req.fromName
-                        : req.toName;
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {filteredRooms.map((room) => {
+                      const counts = getRoomParticipantCounts(room);
+                      const joinStatus = isRoomJoinable(room);
+                      const isPrivate = room.visibility === 'private' || room.hasPassword;
+
                       return (
                         <div
-                          key={req.id}
-                          className="p-2.5 rounded-lg bg-stone-950 border border-stone-800 flex items-center justify-between gap-2"
+                          key={room.roomCode}
+                          className="bg-stone-950 border border-stone-800 hover:border-amber-500/50 p-4 rounded flex flex-col justify-between gap-3 transition-colors"
                         >
-                          <div>
-                            <div className="font-bold text-xs text-stone-100">
-                              {friendName}
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-black text-sm uppercase text-white truncate">
+                                {room.roomName || `SEM TERRA FC — SALA #${room.roomCode}`}
+                              </span>
+                              <span className="font-mono font-black text-xs text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded">
+                                {room.roomCode}
+                              </span>
                             </div>
-                            <div className="text-[11px] text-stone-400">
-                              Status:{' '}
-                              {req.status === 'accepted'
-                                ? 'Amigo Confirmado'
-                                : req.status === 'pending'
-                                ? 'Pedido Pendente'
-                                : 'Recusado'}
-                              {req.roomInviteCode &&
-                                ` · Sala: ${req.roomInviteCode}`}
+
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] font-bold">
+                              <span className="px-2 py-0.5 rounded bg-stone-800 text-amber-300 uppercase">
+                                MODO: {counts.mode === '2v2' ? '2 CONTRA 2' : '4 CONTRA 4'}
+                              </span>
+                              <span className="px-2 py-0.5 rounded bg-stone-800 text-stone-200">
+                                {counts.humanCount}/{counts.maxHumans} JOGADORES
+                              </span>
+                              <span className="px-2 py-0.5 rounded bg-stone-900 text-stone-400 border border-stone-800">
+                                +{counts.botCount} Bots
+                              </span>
+                              {isPrivate && (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-700/50">
+                                  <Lock className="w-3 h-3" /> Privada
+                                </span>
+                              )}
                             </div>
-                          </div>
 
-                          <div className="flex items-center gap-1.5">
-                            {isIncoming && req.status === 'pending' && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    respondToFriendRequest(req.id, 'accepted')
-                                  }
-                                  className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded cursor-pointer"
-                                >
-                                  Aceitar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    respondToFriendRequest(req.id, 'declined')
-                                  }
-                                  className="px-2 py-1 bg-stone-800 hover:bg-stone-700 text-stone-300 text-xs rounded cursor-pointer"
-                                >
-                                  Recusar
-                                </button>
-                              </>
-                            )}
-
-                            {req.roomInviteCode && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setTab('lobby');
-                                  handleJoinRoom(req.roomInviteCode);
-                                }}
-                                className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-stone-950 text-xs font-extrabold rounded cursor-pointer"
+                            <div className="flex items-center justify-between text-[11px] text-stone-400 pt-1">
+                              <span>Anfitrião: {room.hostName}</span>
+                              <span
+                                className={
+                                  room.status === 'waiting'
+                                    ? 'text-emerald-400 font-bold'
+                                    : 'text-amber-400 font-bold'
+                                }
                               >
-                                Entrar na Sala
-                              </button>
-                            )}
+                                Status:{' '}
+                                {room.status === 'waiting'
+                                  ? 'Aguardando jogadores'
+                                  : 'Em andamento'}
+                              </span>
+                            </div>
                           </div>
+
+                          <button
+                            type="button"
+                            disabled={!joinStatus.joinable}
+                            onClick={() => {
+                              if (isPrivate) {
+                                setPasswordModalRoom(room);
+                              } else {
+                                handleJoinRoom(room.roomCode, undefined, counts.mode);
+                              }
+                            }}
+                            className={`w-full py-2 rounded font-black text-xs uppercase tracking-wider transition-colors ${
+                              joinStatus.joinable
+                                ? 'bg-amber-500 hover:bg-amber-400 text-stone-950 cursor-pointer'
+                                : 'bg-stone-800 text-stone-500 cursor-not-allowed'
+                            }`}
+                          >
+                            {joinStatus.joinable
+                              ? 'ENTRAR NA SALA'
+                              : joinStatus.reason || 'Indisponível'}
+                          </button>
                         </div>
                       );
                     })}
@@ -1051,82 +965,757 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
             </div>
           )}
 
-          {/* TAB 3: DIAGNÓSTICO FIREBASE */}
-          {tab === 'diagnostic' && (
-            <div className="bg-stone-900/70 border border-stone-800 rounded-xl p-4 space-y-4 text-xs">
-              <h3 className="text-sm font-extrabold text-amber-400 uppercase tracking-wider">
-                Status de Conexão e Diagnóstico Firebase
-              </h3>
+          {/* TAB 3: SALAS PRIVADAS (CRIAR COM SENHA OU ENTRAR POR CÓDIGO) */}
+          {tab === 'private_room' && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Criar Sala Personalizada / Privada */}
+              <div className="bg-stone-950/90 border border-stone-800 p-4 rounded space-y-3.5">
+                <div className="flex items-center gap-2 text-amber-400 font-black uppercase text-sm">
+                  <Lock className="w-4 h-4" />
+                  Criar Sala Privada ou Personalizada
+                </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="p-3 rounded-lg bg-stone-950 border border-stone-800">
-                  <div className="text-stone-400">Conexão Firestore</div>
-                  <div
-                    className={`font-extrabold text-sm mt-1 ${
-                      connected ? 'text-emerald-400' : 'text-red-400'
-                    }`}
-                  >
-                    {connected ? 'CONECTADO (ONLINE)' : 'OFFLINE'}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold uppercase text-stone-400">
+                    Nome da Sala
+                  </label>
+                  <input
+                    type="text"
+                    value={createRoomName}
+                    onChange={(e) => setCreateRoomName(e.target.value)}
+                    placeholder="Ex: SEM TERRA FC — Racha dos Amigos"
+                    maxLength={48}
+                    className="w-full bg-stone-900 border border-stone-700 px-3 py-2 text-xs text-white rounded focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold uppercase text-stone-400">
+                      Modalidade
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedMode('2v2')}
+                        className={`py-1.5 text-xs font-black uppercase rounded cursor-pointer ${
+                          selectedMode === '2v2'
+                            ? 'bg-amber-500 text-stone-950'
+                            : 'bg-stone-900 text-stone-400 border border-stone-800'
+                        }`}
+                      >
+                        2v2
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedMode('4v4')}
+                        className={`py-1.5 text-xs font-black uppercase rounded cursor-pointer ${
+                          selectedMode === '4v4'
+                            ? 'bg-amber-500 text-stone-950'
+                            : 'bg-stone-900 text-stone-400 border border-stone-800'
+                        }`}
+                      >
+                        4v4
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold uppercase text-stone-400">
+                      Tipo de Sala
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setCreateVisibility('private')}
+                        className={`py-1.5 text-xs font-black uppercase rounded cursor-pointer ${
+                          createVisibility === 'private'
+                            ? 'bg-amber-500 text-stone-950'
+                            : 'bg-stone-900 text-stone-400 border border-stone-800'
+                        }`}
+                      >
+                        Privada
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setCreateVisibility('public')}
+                        className={`py-1.5 text-xs font-black uppercase rounded cursor-pointer ${
+                          createVisibility === 'public'
+                            ? 'bg-emerald-500 text-stone-950'
+                            : 'bg-stone-900 text-stone-400 border border-stone-800'
+                        }`}
+                      >
+                        Pública
+                      </button>
+                    </div>
                   </div>
                 </div>
 
-                <div className="p-3 rounded-lg bg-stone-950 border border-stone-800">
-                  <div className="text-stone-400">Latência / Ping</div>
-                  <div className="font-mono font-extrabold text-sm text-amber-400 mt-1">
-                    {pingMs} ms
+                {createVisibility === 'private' && (
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold uppercase text-stone-400">
+                      Senha da Sala Privada
+                    </label>
+                    <input
+                      type="password"
+                      value={createPassword}
+                      onChange={(e) => setCreatePassword(e.target.value)}
+                      placeholder="Digite uma senha para os convidados..."
+                      maxLength={32}
+                      className="w-full bg-stone-900 border border-stone-700 px-3 py-2 text-xs text-white rounded focus:outline-none focus:border-amber-500"
+                    />
                   </div>
-                </div>
+                )}
 
-                <div className="p-3 rounded-lg bg-stone-950 border border-stone-800">
-                  <div className="text-stone-400">Autenticação Atual</div>
-                  <div className="font-extrabold text-sm text-stone-100 mt-1">
-                    {auth.currentUser
-                      ? auth.currentUser.isAnonymous
-                        ? 'Anônima Ativa'
-                        : 'Google OAuth Ativo'
-                      : 'Modo Convidado Local'}
+                <div className="flex items-center justify-between bg-stone-900 px-3 py-2 rounded border border-stone-800">
+                  <div>
+                    <div className="text-xs font-bold text-stone-200">
+                      Preenchimento Automático com Bots
+                    </div>
+                    <div className="text-[10px] text-stone-400">
+                      Bots completam as vagas livres para {selectedMode === '2v2' ? '4' : '8'} jogadores
+                    </div>
                   </div>
+                  <input
+                    type="checkbox"
+                    checked={createAutoFillBots}
+                    onChange={(e) => setCreateAutoFillBots(e.target.checked)}
+                    className="w-4 h-4 accent-amber-500 cursor-pointer"
+                  />
                 </div>
-              </div>
 
-              <div className="p-3 rounded-lg bg-stone-950 border border-stone-800 space-y-1.5 font-mono text-[11px] text-stone-300">
-                <div>
-                  <span className="text-stone-500">Projeto Firebase:</span>{' '}
-                  {FIREBASE_PROJECT_INFO.projectId}
-                </div>
-                <div>
-                  <span className="text-stone-500">Banco Firestore:</span>{' '}
-                  {FIREBASE_PROJECT_INFO.databaseId}
-                </div>
-                <div>
-                  <span className="text-stone-500">UID do Jogador:</span>{' '}
-                  {auth.currentUser?.uid || profile?.uid || 'N/A'}
-                </div>
-              </div>
-
-              {authError && (
-                <div className="p-3 rounded-lg bg-amber-950/60 border border-amber-500/50 text-amber-200 space-y-1">
-                  <div className="font-bold">
-                    Aviso de Configuração de Login Anônimo:
-                  </div>
-                  <p>
-                    O provedor Anônimo retornou: <code>{authError}</code>. Você
-                    pode clicar em <strong>Vincular / Entrar com Google</strong>{' '}
-                    acima para autenticar imediatamente, ou ativar o provedor{' '}
-                    <em>Anonymous</em> em Firebase Console &rarr; Authentication
-                    &rarr; Sign-in method.
-                  </p>
-                </div>
-              )}
-
-              <div className="flex justify-end">
                 <button
                   type="button"
-                  onClick={handleRefreshLists}
-                  className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold rounded-lg cursor-pointer"
+                  onClick={() => handleCreateRoom(createVisibility, selectedMode)}
+                  className="w-full bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase py-2.5 rounded flex items-center justify-center gap-2 cursor-pointer shadow-lg"
                 >
-                  Testar Conexão Novamente
+                  <Plus className="w-4 h-4" />
+                  Criar Sala {createVisibility === 'private' ? 'Privada' : 'Pública'} (
+                  {selectedMode.toUpperCase()})
                 </button>
+              </div>
+
+              {/* Entrar em Sala Privada por Código + Senha */}
+              <div className="bg-stone-950/90 border border-stone-800 p-4 rounded space-y-3.5 flex flex-col justify-between">
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-emerald-400 font-black uppercase text-sm">
+                    <Swords className="w-4 h-4" />
+                    Entrar com Código da Sala
+                  </div>
+                  <p className="text-xs text-stone-400">
+                    Recebeu o código exclusivo de um amigo? Digite o código e a senha (caso seja
+                    uma sala privada) para entrar direto no lobby:
+                  </p>
+
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold uppercase text-stone-400">
+                      Código da Sala (Ex: STF-8421)
+                    </label>
+                    <input
+                      type="text"
+                      value={joinCodeInput}
+                      onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
+                      placeholder="STF-XXXX"
+                      maxLength={12}
+                      className="w-full bg-stone-900 border border-stone-700 px-3 py-2 text-xs font-mono uppercase text-white rounded focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold uppercase text-stone-400">
+                      Senha da Sala (se for privada)
+                    </label>
+                    <input
+                      type="password"
+                      value={joinPasswordInput}
+                      onChange={(e) => setJoinPasswordInput(e.target.value)}
+                      placeholder="Deixe em branco se for pública"
+                      maxLength={32}
+                      className="w-full bg-stone-900 border border-stone-700 px-3 py-2 text-xs text-white rounded focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => handleJoinRoom(joinCodeInput, joinPasswordInput)}
+                  className="w-full bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs uppercase py-2.5 rounded flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <LogIn className="w-4 h-4" />
+                  Validar e Entrar na Sala
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 4: SALA DE EQUIPES (LOBBY DA PARTIDA) */}
+          {tab === 'room' && (
+            <div>
+              {!currentRoom ? (
+                <div className="bg-stone-950/70 border border-stone-800 p-8 text-center rounded space-y-3">
+                  <p className="text-sm text-stone-400 font-bold">
+                    Você ainda não está em nenhuma sala.
+                  </p>
+                  <div className="flex justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleQuickPlayMode('2v2')}
+                      className="bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase px-4 py-2 rounded cursor-pointer"
+                    >
+                      Criar / Entrar 2v2
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleQuickPlayMode('4v4')}
+                      className="bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs uppercase px-4 py-2 rounded cursor-pointer"
+                    >
+                      Criar / Entrar 4v4
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {/* Cabeçalho da Sala */}
+                  {(() => {
+                    const counts = getRoomParticipantCounts(currentRoom);
+                    const activeSet = new Set(currentRoom.activeCharacterIds || []);
+                    return (
+                      <>
+                        <div className="bg-stone-950 border border-stone-800 p-3.5 rounded flex flex-wrap items-center justify-between gap-3">
+                          <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-black uppercase px-2 py-0.5 rounded bg-amber-500 text-stone-950">
+                                {counts.mode === '2v2' ? '2 CONTRA 2' : '4 CONTRA 4'}
+                              </span>
+                              <span className="font-black text-base uppercase text-white">
+                                {currentRoom.roomName}
+                              </span>
+                              <span className="font-mono font-black text-sm text-amber-400">
+                                ({currentRoom.roomCode})
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyCode(currentRoom.roomCode)}
+                                className="flex items-center gap-1 bg-stone-800 hover:bg-stone-700 text-stone-200 px-2 py-0.5 text-[11px] font-bold rounded cursor-pointer"
+                              >
+                                {copiedCode ? (
+                                  <Check className="w-3 h-3 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3 h-3" />
+                                )}
+                                {copiedCode ? 'Copiado!' : 'Copiar Código'}
+                              </button>
+                            </div>
+                            <p className="text-[11px] text-stone-400">
+                              Jogadores Humanos:{' '}
+                              <strong className="text-white">
+                                {counts.humanCount}/{counts.maxHumans}
+                              </strong>{' '}
+                              · Bots Automáticos Ativos:{' '}
+                              <strong className="text-amber-400">{counts.botCount}</strong> · Clique
+                              em qualquer personagem livre para escolhê-lo.
+                            </p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            {mySlotInRoom && (
+                              <button
+                                type="button"
+                                onClick={handleToggleReady}
+                                className={`px-3.5 py-2 text-xs font-black uppercase rounded flex items-center gap-1.5 cursor-pointer transition-colors ${
+                                  mySlotInRoom.isReady
+                                    ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                                    : 'bg-stone-800 hover:bg-stone-700 text-amber-300 border border-amber-500/40'
+                                }`}
+                              >
+                                <Check className="w-4 h-4" />
+                                {mySlotInRoom.isReady ? 'PRONTO!' : 'MARCAR PRONTO'}
+                              </button>
+                            )}
+
+                            {isHost ? (
+                              <button
+                                type="button"
+                                onClick={handleHostStartMatch}
+                                className="bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase px-4 py-2 rounded flex items-center gap-1.5 shadow-lg cursor-pointer"
+                              >
+                                <Play className="w-4 h-4 fill-stone-950" />
+                                {counts.humanCount === 1
+                                  ? 'Iniciar com Bots Agora'
+                                  : 'Iniciar Partida'}
+                              </button>
+                            ) : (
+                              <div className="bg-stone-900 border border-amber-500/30 text-amber-300 px-3 py-2 text-xs font-bold rounded flex items-center gap-1.5">
+                                <Wifi className="w-3.5 h-3.5 animate-pulse" />
+                                Aguardando {currentRoom.hostName} iniciar...
+                              </div>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={handleLeaveCurrentRoom}
+                              className="bg-red-950/80 hover:bg-red-900 text-red-200 border border-red-800 px-3 py-2 text-xs font-bold uppercase rounded flex items-center gap-1 cursor-pointer"
+                            >
+                              <LogOut className="w-3.5 h-3.5" />
+                              Sair da Sala
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Controles de Voz WebRTC da Sala */}
+                        <VoiceControlsBar roomCode={currentRoom.roomCode} />
+
+                        {/* Distribuição de Equipes: TIME 1 vs TIME 2 */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {/* TIME 1 (Home) */}
+                          <div className="bg-stone-950/80 border border-amber-500/30 p-3.5 rounded space-y-2.5">
+                            <div className="flex items-center justify-between border-b border-stone-800 pb-2">
+                              <span className="text-xs font-black uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                                <Shield className="w-4 h-4" />
+                                TIME 1 — Yuri, Josué, Careca, Bode
+                              </span>
+                              <span className="text-[10px] text-stone-400 uppercase font-bold">
+                                {counts.mode === '2v2' ? '2 Ativos em Campo' : '4 Ativos em Campo'}
+                              </span>
+                            </div>
+
+                            <div className="space-y-2">
+                              {ALL_CHARACTERS.filter((c) => c.team === 'home').map((char) => {
+                                const slot = currentRoom.slots?.[char.id];
+                                const isMine = slot?.uid === currentUid;
+                                const isOccupiedByOther =
+                                  slot && !slot.isBot && slot.uid !== currentUid;
+                                const isActiveInMatch =
+                                  counts.mode === '4v4' || activeSet.has(char.id);
+
+                                return (
+                                  <button
+                                    key={char.id}
+                                    type="button"
+                                    disabled={Boolean(isOccupiedByOther)}
+                                    onClick={() => handlePickCharacter(char.id)}
+                                    className={`w-full p-2.5 rounded border text-left flex items-center justify-between transition-all ${
+                                      isMine
+                                        ? 'bg-amber-500/20 border-amber-400 text-white shadow-md'
+                                        : isOccupiedByOther
+                                        ? 'bg-stone-900/90 border-stone-700 text-stone-300 cursor-not-allowed'
+                                        : 'bg-stone-900/50 hover:bg-stone-800 border-stone-800 text-stone-300 cursor-pointer'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2.5">
+                                      <div
+                                        className="w-8 h-8 rounded-full flex items-center justify-center font-black text-xs border border-white/20"
+                                        style={{
+                                          backgroundColor: char.config.shirtPrimary,
+                                          color: '#fff',
+                                        }}
+                                      >
+                                        {char.config.number}
+                                      </div>
+                                      <div>
+                                        <div className="font-black text-xs uppercase flex items-center gap-1.5">
+                                          {char.name}
+                                          <span className="text-[10px] font-normal text-stone-400 uppercase">
+                                            ({char.config.role})
+                                          </span>
+                                          {!isActiveInMatch && (
+                                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-stone-800 text-stone-500">
+                                              Reserva 2v2
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-[11px] flex items-center gap-1.5 mt-0.5">
+                                          {slot?.isBot ? (
+                                            <span className="text-stone-400 flex items-center gap-1">
+                                              <Bot className="w-3 h-3 text-amber-500" />
+                                              {isActiveInMatch
+                                                ? `Bot ${char.name} (Automático)`
+                                                : 'Disponível p/ Escolha'}
+                                            </span>
+                                          ) : (
+                                            <span className="text-emerald-400 font-bold flex items-center gap-1">
+                                              <UserCheck className="w-3 h-3" />
+                                              {slot?.displayName} {isMine ? '(Você)' : ''}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5">
+                                      {!slot?.isBot && (
+                                        <>
+                                          {slot?.isSpeaking ? (
+                                            <span
+                                              className="p-1 rounded bg-emerald-500/20 text-emerald-400 animate-pulse"
+                                              title="Falando no microfone"
+                                            >
+                                              <Mic className="w-3.5 h-3.5" />
+                                            </span>
+                                          ) : slot?.micEnabled ? (
+                                            <span
+                                              className="p-1 rounded bg-stone-800 text-stone-300"
+                                              title="Microfone ligado"
+                                            >
+                                              <Mic className="w-3.5 h-3.5" />
+                                            </span>
+                                          ) : (
+                                            <span
+                                              className="p-1 rounded bg-stone-900 text-stone-500"
+                                              title="Microfone mutado"
+                                            >
+                                              <MicOff className="w-3.5 h-3.5" />
+                                            </span>
+                                          )}
+
+                                          <span
+                                            className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${
+                                              slot?.isReady
+                                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                                : 'bg-amber-500/20 text-amber-300'
+                                            }`}
+                                          >
+                                            {slot?.isReady ? 'PRONTO' : 'ESCOLHENDO'}
+                                          </span>
+                                        </>
+                                      )}
+
+                                      {slot?.isBot && (
+                                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 bg-stone-800 text-stone-400 rounded">
+                                          Escolher
+                                        </span>
+                                      )}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* TIME 2 (Away) */}
+                          <div className="bg-stone-950/80 border border-red-500/30 p-3.5 rounded space-y-2.5">
+                            <div className="flex items-center justify-between border-b border-stone-800 pb-2">
+                              <span className="text-xs font-black uppercase tracking-wider text-red-400 flex items-center gap-1.5">
+                                <Shield className="w-4 h-4" />
+                                TIME 2 — Primo, Bicudo, Ismael, Felipe
+                              </span>
+                              <span className="text-[10px] text-stone-400 uppercase font-bold">
+                                {counts.mode === '2v2' ? '2 Ativos em Campo' : '4 Ativos em Campo'}
+                              </span>
+                            </div>
+
+                            <div className="space-y-2">
+                              {ALL_CHARACTERS.filter((c) => c.team === 'away').map((char) => {
+                                const slot = currentRoom.slots?.[char.id];
+                                const isMine = slot?.uid === currentUid;
+                                const isOccupiedByOther =
+                                  slot && !slot.isBot && slot.uid !== currentUid;
+                                const isActiveInMatch =
+                                  counts.mode === '4v4' || activeSet.has(char.id);
+
+                                return (
+                                  <button
+                                    key={char.id}
+                                    type="button"
+                                    disabled={Boolean(isOccupiedByOther)}
+                                    onClick={() => handlePickCharacter(char.id)}
+                                    className={`w-full p-2.5 rounded border text-left flex items-center justify-between transition-all ${
+                                      isMine
+                                        ? 'bg-red-500/20 border-red-400 text-white shadow-md'
+                                        : isOccupiedByOther
+                                        ? 'bg-stone-900/90 border-stone-700 text-stone-300 cursor-not-allowed'
+                                        : 'bg-stone-900/50 hover:bg-stone-800 border-stone-800 text-stone-300 cursor-pointer'
+                                    }`}
+                                  >
+                                    <div className="flex items-center gap-2.5">
+                                      <div
+                                        className="w-8 h-8 rounded-full flex items-center justify-center font-black text-xs border border-white/20"
+                                        style={{
+                                          backgroundColor: char.config.shirtPrimary,
+                                          color: '#fff',
+                                        }}
+                                      >
+                                        {char.config.number}
+                                      </div>
+                                      <div>
+                                        <div className="font-black text-xs uppercase flex items-center gap-1.5">
+                                          {char.name}
+                                          <span className="text-[10px] font-normal text-stone-400 uppercase">
+                                            ({char.config.role})
+                                          </span>
+                                          {!isActiveInMatch && (
+                                            <span className="text-[9px] px-1.5 py-0.2 rounded bg-stone-800 text-stone-500">
+                                              Reserva 2v2
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="text-[11px] flex items-center gap-1.5 mt-0.5">
+                                          {slot?.isBot ? (
+                                            <span className="text-stone-400 flex items-center gap-1">
+                                              <Bot className="w-3 h-3 text-red-400" />
+                                              {isActiveInMatch
+                                                ? `Bot ${char.name} (Automático)`
+                                                : 'Disponível p/ Escolha'}
+                                            </span>
+                                          ) : (
+                                            <span className="text-emerald-400 font-bold flex items-center gap-1">
+                                              <UserCheck className="w-3 h-3" />
+                                              {slot?.displayName} {isMine ? '(Você)' : ''}
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-1.5">
+                                      {!slot?.isBot && (
+                                        <>
+                                          {slot?.isSpeaking ? (
+                                            <span
+                                              className="p-1 rounded bg-emerald-500/20 text-emerald-400 animate-pulse"
+                                              title="Falando no microfone"
+                                            >
+                                              <Mic className="w-3.5 h-3.5" />
+                                            </span>
+                                          ) : slot?.micEnabled ? (
+                                            <span
+                                              className="p-1 rounded bg-stone-800 text-stone-300"
+                                              title="Microfone ligado"
+                                            >
+                                              <Mic className="w-3.5 h-3.5" />
+                                            </span>
+                                          ) : (
+                                            <span
+                                              className="p-1 rounded bg-stone-900 text-stone-500"
+                                              title="Microfone mutado"
+                                            >
+                                              <MicOff className="w-3.5 h-3.5" />
+                                            </span>
+                                          )}
+
+                                          <span
+                                            className={`text-[10px] font-black uppercase px-2 py-0.5 rounded ${
+                                              slot?.isReady
+                                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                                : 'bg-amber-500/20 text-amber-300'
+                                            }`}
+                                          >
+                                            {slot?.isReady ? 'PRONTO' : 'ESCOLHENDO'}
+                                          </span>
+                                        </>
+                                      )}
+
+                                      {slot?.isBot && (
+                                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 bg-stone-800 text-stone-400 rounded">
+                                          Escolher
+                                        </span>
+                                      )}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TAB 5: AMIGOS & CONVITES */}
+          {tab === 'friends' && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* Coluna Esquerda: Adicionar Amigo + Solicitações */}
+              <div className="space-y-4">
+                <div className="bg-stone-950/80 border border-stone-800 p-3.5 rounded space-y-2.5">
+                  <h4 className="text-xs font-black uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                    <UserPlus className="w-4 h-4" />
+                    Adicionar Amigo por Tag (#STF) ou Nome
+                  </h4>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={friendSearchInput}
+                      onChange={(e) => setFriendSearchInput(e.target.value)}
+                      placeholder="Ex: #STF1A2B ou nome"
+                      className="flex-1 bg-stone-900 border border-stone-700 px-3 py-1.5 text-xs text-white rounded focus:outline-none focus:border-amber-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAddFriend}
+                      className="bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs uppercase px-3 py-1.5 rounded flex items-center gap-1 cursor-pointer"
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                      Enviar
+                    </button>
+                  </div>
+                </div>
+
+                {/* Convites e Pedidos Pendentes */}
+                <div className="bg-stone-950/80 border border-stone-800 p-3.5 rounded space-y-2.5">
+                  <h4 className="text-xs font-black uppercase tracking-wider text-stone-300">
+                    Convites e Solicitações Recebidas ({incomingRequests.length})
+                  </h4>
+                  {incomingRequests.length === 0 ? (
+                    <p className="text-xs text-stone-500 py-2">
+                      Nenhuma solicitação pendente no momento.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {incomingRequests.map((req) => (
+                        <div
+                          key={req.id}
+                          className="bg-stone-900 border border-stone-800 p-2.5 rounded flex items-center justify-between gap-2"
+                        >
+                          <div>
+                            <div className="text-xs font-bold text-white">
+                              {req.fromName}{' '}
+                              <span className="text-amber-400 font-mono text-[10px]">
+                                {req.fromTag}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-stone-400">
+                              {req.type === 'room_invite'
+                                ? `Convidou você para a sala ${req.roomCode}`
+                                : 'Quer adicionar você como amigo'}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleRespondRequest(req, true)}
+                              className="bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-[11px] uppercase px-2.5 py-1 rounded cursor-pointer"
+                            >
+                              {req.type === 'room_invite' ? 'Entrar' : 'Aceitar'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRespondRequest(req, false)}
+                              className="bg-stone-800 hover:bg-stone-700 text-stone-400 font-bold text-[11px] uppercase px-2 py-1 rounded cursor-pointer"
+                            >
+                              Recusar
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Coluna Direita: Lista de Amigos e Jogadores Online */}
+              <div className="space-y-4">
+                <div className="bg-stone-950/80 border border-stone-800 p-3.5 rounded space-y-2.5">
+                  <h4 className="text-xs font-black uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                    <Users className="w-4 h-4" />
+                    Meus Amigos ({friendsList.length})
+                  </h4>
+                  {friendsList.length === 0 ? (
+                    <p className="text-xs text-stone-500 py-2">
+                      Você ainda não adicionou amigos. Use o código #STF acima ou convide jogadores
+                      online abaixo!
+                    </p>
+                  ) : (
+                    <div className="space-y-2 max-h-48 overflow-y-auto">
+                      {friendsList.map((f) => (
+                        <div
+                          key={f.uid}
+                          className="bg-stone-900 border border-stone-800 p-2.5 rounded flex items-center justify-between"
+                        >
+                          <div>
+                            <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                              <span
+                                className={`w-2 h-2 rounded-full ${
+                                  f.status === 'playing'
+                                    ? 'bg-amber-400'
+                                    : f.status === 'in_room'
+                                    ? 'bg-emerald-400'
+                                    : 'bg-emerald-500'
+                                }`}
+                              />
+                              {f.displayName}
+                              <span className="text-[10px] font-mono text-stone-400">
+                                {f.tagCode}
+                              </span>
+                            </div>
+                            <div className="text-[10px] text-stone-400">
+                              {f.currentRoomCode ? `Na sala ${f.currentRoomCode}` : 'Online no menu'}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            {f.currentRoomCode && f.currentRoomCode !== currentRoom?.roomCode && (
+                              <button
+                                type="button"
+                                onClick={() => handleJoinRoom(f.currentRoomCode)}
+                                className="bg-stone-800 hover:bg-stone-700 text-amber-400 text-[10px] font-bold uppercase px-2 py-1 rounded cursor-pointer"
+                              >
+                                Juntar-se
+                              </button>
+                            )}
+                            {currentRoom && (
+                              <button
+                                type="button"
+                                onClick={() => handleInviteFriendToRoom(f)}
+                                className="bg-amber-500 hover:bg-amber-400 text-stone-950 text-[10px] font-black uppercase px-2.5 py-1 rounded cursor-pointer"
+                              >
+                                Convidar p/ Sala
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Jogadores Online no Campinho */}
+                <div className="bg-stone-950/80 border border-stone-800 p-3.5 rounded space-y-2.5">
+                  <h4 className="text-xs font-black uppercase tracking-wider text-stone-300">
+                    Jogadores Online Agora ({onlinePlayers.length})
+                  </h4>
+                  <div className="space-y-1.5 max-h-44 overflow-y-auto">
+                    {onlinePlayers
+                      .filter((p) => p.uid !== currentUid)
+                      .map((p) => (
+                        <div
+                          key={p.uid}
+                          className="bg-stone-900/70 border border-stone-800/80 px-2.5 py-1.5 rounded flex items-center justify-between"
+                        >
+                          <div className="text-xs text-stone-200 font-bold flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                            {p.displayName}
+                            <span className="text-[10px] font-mono text-amber-400">
+                              {p.tagCode}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            {currentRoom && (
+                              <button
+                                type="button"
+                                onClick={() => handleInviteFriendToRoom(p)}
+                                className="text-[10px] bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded font-bold uppercase cursor-pointer"
+                              >
+                                Convidar
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFriendSearchInput(p.tagCode);
+                              }}
+                              className="text-[10px] bg-stone-800 hover:bg-stone-700 text-stone-300 px-2 py-0.5 rounded font-bold cursor-pointer"
+                            >
+                              + Amigo
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                  </div>
+                </div>
               </div>
             </div>
           )}

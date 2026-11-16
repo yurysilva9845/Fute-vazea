@@ -280,12 +280,12 @@ export const INITIAL_AWAY_PLAYERS: PlayerCustomization[] = [
 export const AVAILABLE_TEAMS: TeamConfig[] = [
   {
     id: 'unidos_do_barro',
-    name: 'Unidos do Barro',
-    shortName: 'BAR',
+    name: 'Sem Terra FC',
+    shortName: 'STF',
     primaryColor: '#d97706',
     secondaryColor: '#fef3c7',
     shortsColor: '#292524',
-    description: 'O time raiz do campinho de terra: Yuri, Josué, Careca e Bode no estilo original da várzea.',
+    description: 'O time oficial SEM TERRA FC do campinho de terra: Yuri, Josué, Careca e Bode no estilo raiz da várzea.',
   },
   {
     id: 'canarinho_varzea',
@@ -316,18 +316,44 @@ export const AVAILABLE_TEAMS: TeamConfig[] = [
   },
 ];
 
-export const VARZEA_VOICE_PHRASES = {
-  callForPass: ['Toca a bola!', 'Aqui!', 'Passa, passa!'],
-  passRequest: ['Toca a bola!', 'Aqui!', 'Passa, passa!'],
-  attacking: ['Vai, vai!', 'Chuta!', 'Bora!'],
-  sprintCall: ['Vai, vai!', 'Bora!', 'Corre!'],
-  shootCall: ['Chuta!', 'Solta a bomba!', 'Bate pro gol!'],
-  defending: ['Marca ele!', 'Fecha o meio!', 'Tira daí!'],
-  defendCall: ['Marca ele!', 'Fecha o meio!', 'Tira daí!'],
-  goodPlay: ['Boa!', 'Aí sim!', 'Jogou muito!'],
-  goalScored: ['Que golaço!', 'Foi gol!', 'É caixa na várzea!'],
-  goalShout: ['Que golaço!', 'Foi gol!', 'É caixa na várzea!'],
-};
+/**
+ * Filtra os jogadores ativos para partidas 2v2 (2 jogadores por equipe = 4 em campo)
+ * ou 4v4 (4 jogadores por equipe = 8 em campo), permitindo livre escolha de quaisquer
+ * 2 personagens entre os 4 de cada time na modalidade 2v2.
+ */
+export function getActivePlayersForMode(
+  homePlayers: PlayerCustomization[],
+  awayPlayers: PlayerCustomization[],
+  mode: '2v2' | '4v4' = '4v4',
+  activeCharacterIds?: string[]
+): { home: PlayerCustomization[]; away: PlayerCustomization[] } {
+  if (mode === '4v4') {
+    return {
+      home: homePlayers.slice(0, 4),
+      away: awayPlayers.slice(0, 4),
+    };
+  }
+
+  const pickTeamTwo = (teamList: PlayerCustomization[]) => {
+    if (activeCharacterIds && activeCharacterIds.length > 0) {
+      const chosen = teamList.filter((p) => activeCharacterIds.includes(p.id));
+      if (chosen.length >= 2) {
+        return chosen.slice(0, 2);
+      }
+      if (chosen.length === 1) {
+        const fallback = teamList.find((p) => p.id !== chosen[0].id);
+        return fallback ? [chosen[0], fallback] : chosen;
+      }
+    }
+    return teamList.slice(0, 2);
+  };
+
+  return {
+    home: pickTeamTwo(homePlayers),
+    away: pickTeamTwo(awayPlayers),
+  };
+}
+
 
 export function getTerrainHeightAt(
   x: number,

@@ -19,14 +19,20 @@ import { TitleScreen } from './components/TitleScreen';
 import { GameplayHUD } from './components/GameplayHUD';
 import { StatusModals } from './components/StatusModals';
 import { MultiplayerLobbyModal } from './components/MultiplayerLobbyModal';
+import { MatchLoadingOverlay } from './components/MatchLoadingOverlay';
+import { CharacterSelect3DModal } from './components/CharacterSelect3DModal';
 import { audioEngine } from './game/audio';
 import {
-  auth,
-  ensureAuthenticatedUser,
-  onAuthStateChanged,
-  recordMatchHistory,
-  testFirebaseConnection,
+  ensureAuthenticated,
+  getCurrentAuthUser,
+  leaveOnlineRoom,
+  markPlayerMatchLoadingReady,
+  recordMatchFinished,
+  subscribeToRoom,
 } from './services/firebase';
+import { presenceService } from './services/presenceService';
+import { sessionCleanupService } from './services/sessionCleanupService';
+import { voiceChatService } from './services/voiceChatService';
 
 export default function App() {
   const [screenState, setScreenState] = useState<GameScreenState>(() => {
@@ -55,7 +61,6 @@ export default function App() {
     soundEnabled: true,
     musicEnabled: false,
     sfxVolume: 0.85,
-    voiceVolume: 0.9,
     ambientVolume: 0.65,
     musicVolume: 0.5,
     vibrationEnabled: true,
@@ -94,15 +99,13 @@ export default function App() {
 
   const [restartSignal, setRestartSignal] = useState(0);
 
-  // Online Multiplayer & Friends Modal state
-  const [multiplayerModalTab, setMultiplayerModalTab] = useState<
-    'none' | 'lobby' | 'friends' | 'diagnostic'
-  >('none');
-  const [activeRoom, setActiveRoom] = useState<MultiplayerRoomState | null>(
-    null
-  );
-  const [onlineControlledCharId, setOnlineControlledCharId] =
-    useState<string>('home_1');
+  // Online Multiplayer, Voice Chat & Pre-Match Loading state
+  const [multiplayerModalOpen, setMultiplayerModalOpen] = useState<boolean>(false);
+  const [characterSelectModalOpen, setCharacterSelectModalOpen] = useState<boolean>(false);
+  const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
+  const [activeRoom, setActiveRoom] = useState<MultiplayerRoomState | null>(null);
+  const [onlineControlledCharId, setOnlineControlledCharId] = useState<string>('home_1');
+  const [showMatchLoadingOverlay, setShowMatchLoadingOverlay] = useState<boolean>(false);
   const [pingMs, setPingMs] = useState<number>(18);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
@@ -114,24 +117,53 @@ export default function App() {
     };
   }, [inputManager]);
 
-  // Boot-time Firebase connection & presence warm-up + Fullscreen listener
+  // Boot-time Firebase auth warm-up, session cleanup & Fullscreen listener
   useEffect(() => {
-    testFirebaseConnection().then((res) => {
-      setPingMs(res.pingMs);
-    });
-    const unsubAuth = onAuthStateChanged(auth, () => {
-      ensureAuthenticatedUser().catch(() => {});
-    });
+    const startTs = performance.now();
+    ensureAuthenticated()
+      .then(() => {
+        setPingMs(Math.max(12, Math.min(95, Math.round(performance.now() - startTs))));
+        sessionCleanupService.startPeriodicCleanup();
+      })
+      .catch(() => {});
 
     const onFullscreenChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement));
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => {
-      unsubAuth();
+      sessionCleanupService.stopPeriodicCleanup();
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
+
+  // Keep activeRoom synced in real time during gameplay and detect my controlled character
+  useEffect(() => {
+    if (!activeRoomCode) {
+      setActiveRoom(null);
+      return;
+    }
+    const unsub = subscribeToRoom(activeRoomCode, (room) => {
+      if (!room) {
+        setActiveRoom(null);
+        setActiveRoomCode(null);
+        presenceService.stopRoomPresence();
+        voiceChatService.leaveRoomVoice();
+        return;
+      }
+      setActiveRoom(room);
+      voiceChatService.syncRoomSlots(room.slots || {});
+
+      const myUid = getCurrentAuthUser()?.uid;
+      if (myUid) {
+        const mySlot = Object.values(room.slots || {}).find((s) => s.uid === myUid);
+        if (mySlot) {
+          setOnlineControlledCharId(mySlot.characterId);
+        }
+      }
+    });
+    return () => unsub();
+  }, [activeRoomCode]);
 
   const hudUpdateRef = useRef<LiveHUDUpdate>({
     controlledPlayerName: 'Yuri',
@@ -189,7 +221,6 @@ export default function App() {
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
     }
-    // If on mobile, automatically attempt fullscreen & landscape lock on JOGAR click
     if (
       typeof window !== 'undefined' &&
       (window.innerWidth <= 920 || 'ontouchstart' in window)
@@ -209,7 +240,14 @@ export default function App() {
 
   // Bind Enter / Space on Title Screen to start immediately (unless modal is open)
   useEffect(() => {
-    if (screenState !== 'title' || multiplayerModalTab !== 'none') return;
+    if (
+      screenState !== 'title' ||
+      multiplayerModalOpen ||
+      characterSelectModalOpen ||
+      showMatchLoadingOverlay
+    ) {
+      return;
+    }
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (
@@ -227,29 +265,43 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [screenState, multiplayerModalTab, handleStartMatch]);
+  }, [
+    screenState,
+    multiplayerModalOpen,
+    characterSelectModalOpen,
+    showMatchLoadingOverlay,
+    handleStartMatch,
+  ]);
 
   const handleSelectHomeTeam = useCallback((team: TeamConfig) => {
     setHomeTeam(team);
     setHomePlayers((prev) =>
-      prev.map((p) => ({
-        ...p,
-        shirtPrimary: team.primaryColor,
-        shirtSecondary: team.secondaryColor,
-        shortsColor: team.shortsColor,
-      }))
+      prev.map((p) =>
+        p.lockAuthenticOutfit
+          ? p
+          : {
+              ...p,
+              shirtPrimary: team.primaryColor,
+              shirtSecondary: team.secondaryColor,
+              shortsColor: team.shortsColor,
+            }
+      )
     );
   }, []);
 
   const handleSelectAwayTeam = useCallback((team: TeamConfig) => {
     setAwayTeam(team);
     setAwayPlayers((prev) =>
-      prev.map((p) => ({
-        ...p,
-        shirtPrimary: team.primaryColor,
-        shirtSecondary: team.secondaryColor,
-        shortsColor: team.shortsColor,
-      }))
+      prev.map((p) =>
+        p.lockAuthenticOutfit
+          ? p
+          : {
+              ...p,
+              shirtPrimary: team.primaryColor,
+              shirtSecondary: team.secondaryColor,
+              shortsColor: team.shortsColor,
+            }
+      )
     );
   }, []);
 
@@ -273,7 +325,6 @@ export default function App() {
       }
       audioEngine.updateVolumes({
         sfxVolume: next.sfxVolume,
-        voiceVolume: next.voiceVolume,
         ambientVolume: next.ambientVolume,
         musicVolume: next.musicVolume,
         vibrationEnabled: next.vibrationEnabled,
@@ -311,20 +362,31 @@ export default function App() {
       document.body.dataset.state = 'gameover';
       setScreenState('gameover');
 
-      // Persist match result to Firestore /matchHistory
-      const mvp =
-        stats.scorers[0]?.playerName ||
-        (stats.homeGoals >= stats.awayGoals ? 'Yuri' : 'Primo');
-      recordMatchHistory({
-        roomCode: activeRoom?.roomCode || 'LOCAL',
-        homeTeamName: homeTeam.name,
-        awayTeamName: awayTeam.name,
-        homeGoals: stats.homeGoals,
-        awayGoals: stats.awayGoals,
-        mvpName: mvp,
-      }).catch(() => {});
+      // Record legitimate completed match in Firestore (/matchHistory & /users career stats)
+      const participantUids = activeRoom
+        ? Object.values(activeRoom.slots || {})
+            .filter((s) => !s.isBot && s.uid)
+            .map((s) => String(s.uid))
+        : [];
+      const myUid = getCurrentAuthUser()?.uid;
+      const mySlot =
+        activeRoom && myUid
+          ? Object.values(activeRoom.slots || {}).find((s) => s.uid === myUid)
+          : null;
+      const myTeam: 'home' | 'away' = mySlot?.team || 'home';
+
+      recordMatchFinished(
+        activeRoom?.roomCode || 'LOCAL',
+        homeTeam.name,
+        awayTeam.name,
+        stats.homeGoals,
+        stats.awayGoals,
+        participantUids,
+        myTeam,
+        true
+      ).catch(() => {});
     },
-    [activeRoom?.roomCode, homeTeam.name, awayTeam.name]
+    [activeRoom, homeTeam.name, awayTeam.name]
   );
 
   const handleTogglePause = useCallback(() => {
@@ -343,12 +405,45 @@ export default function App() {
     setScreenState('playing');
   }, [inputManager]);
 
+  /**
+   * Encerra a partida atual, desconecta o chat de voz WebRTC, desliga o microfone,
+   * remove o jogador da sala (ou encerra a sala se for o último) e volta ao menu inicial.
+   */
   const handleBackToTitle = useCallback(() => {
     inputManager.clearAll();
     exitFullscreenSafe();
+    setShowMatchLoadingOverlay(false);
+
+    if (activeRoomCode) {
+      const codeToLeave = activeRoomCode;
+      setActiveRoomCode(null);
+      setActiveRoom(null);
+      presenceService.stopRoomPresence();
+      voiceChatService.leaveRoomVoice();
+      leaveOnlineRoom(codeToLeave).catch(() => {});
+    }
+
     document.body.dataset.state = 'title';
     setScreenState('title');
-  }, [inputManager, exitFullscreenSafe]);
+  }, [inputManager, exitFullscreenSafe, activeRoomCode]);
+
+  const handleMultiplayerStartMatch = useCallback(
+    (room: MultiplayerRoomState) => {
+      setActiveRoom(room);
+      setActiveRoomCode(room.roomCode);
+      setMultiplayerModalOpen(false);
+      setShowMatchLoadingOverlay(true);
+      presenceService.startRoomPresence(room.roomCode, 'playing');
+      markPlayerMatchLoadingReady(room.roomCode).catch(() => {});
+    },
+    []
+  );
+
+  const handleCompleteMatchLoading = useCallback(() => {
+    setShowMatchLoadingOverlay(false);
+    setRestartSignal((s) => s + 1);
+    handleStartMatch();
+  }, [handleStartMatch]);
 
   return (
     <main className="relative w-full h-full overflow-hidden bg-stone-950 select-none">
@@ -370,8 +465,19 @@ export default function App() {
         onTogglePause={handleTogglePause}
       />
 
+      {/* Pre-Match Synchronized Loading Screen for Online Matches */}
+      {showMatchLoadingOverlay && (
+        <MatchLoadingOverlay
+          type="starting_match"
+          room={activeRoom}
+          homeTeam={homeTeam}
+          awayTeam={awayTeam}
+          onReadyToPlay={handleCompleteMatchLoading}
+        />
+      )}
+
       {/* Title Screen Overlay */}
-      {screenState === 'title' && (
+      {screenState === 'title' && !showMatchLoadingOverlay && (
         <TitleScreen
           homeTeam={homeTeam}
           awayTeam={awayTeam}
@@ -381,7 +487,7 @@ export default function App() {
           activeRoom={activeRoom}
           onStartMatch={handleStartMatch}
           onStartFullscreenMatch={handleStartFullscreenMatch}
-          onOpenMultiplayer={(tab) => setMultiplayerModalTab(tab)}
+          onOpenMultiplayer={() => setMultiplayerModalOpen(true)}
           onSelectHomeTeam={handleSelectHomeTeam}
           onSelectAwayTeam={handleSelectAwayTeam}
           onUpdatePlayer={handleUpdateHomePlayer}
@@ -389,23 +495,41 @@ export default function App() {
         />
       )}
 
-      {/* Online Multiplayer Lobby, Friends & Firebase Diagnostic Modal */}
-      {multiplayerModalTab !== 'none' && (
-        <MultiplayerLobbyModal
-          initialTab={multiplayerModalTab}
-          homeTeam={homeTeam}
-          awayTeam={awayTeam}
-          activeRoom={activeRoom}
-          controlledCharacterId={onlineControlledCharId}
-          onRoomUpdated={(room, myCharId) => {
-            setActiveRoom(room);
-            setOnlineControlledCharId(myCharId);
+      {/* 360° 3D Character Skin Selector Modal */}
+      {characterSelectModalOpen && (
+        <CharacterSelect3DModal
+          homePlayers={homePlayers}
+          awayPlayers={awayPlayers}
+          selectedCharacterId={onlineControlledCharId}
+          onSelectCharacter={(charId) => {
+            setOnlineControlledCharId(charId);
           }}
-          onStartMultiplayerGame={() => {
-            setMultiplayerModalTab('none');
+          onStartWithCharacter={(charId) => {
+            setOnlineControlledCharId(charId);
+            setCharacterSelectModalOpen(false);
             handleStartMatch();
           }}
-          onClose={() => setMultiplayerModalTab('none')}
+          onClose={() => setCharacterSelectModalOpen(false)}
+        />
+      )}
+
+      {/* Online Multiplayer Lobby (2v2 & 4v4, Public & Private Rooms, Bots, WebRTC Voice & Friends) */}
+      {multiplayerModalOpen && (
+        <MultiplayerLobbyModal
+          homeTeamId={homeTeam.id}
+          awayTeamId={awayTeam.id}
+          halfDurationSeconds={settings.halfDurationSeconds}
+          activeRoomCode={activeRoomCode}
+          onRoomJoined={(room) => {
+            setActiveRoom(room);
+            setActiveRoomCode(room.roomCode);
+          }}
+          onRoomLeft={() => {
+            setActiveRoom(null);
+            setActiveRoomCode(null);
+          }}
+          onStartMultiplayerMatch={handleMultiplayerStartMatch}
+          onClose={() => setMultiplayerModalOpen(false)}
         />
       )}
 
@@ -434,13 +558,14 @@ export default function App() {
         />
       )}
 
-      {/* Pause & Victory / Defeat / Draw Modals */}
+      {/* Pause / In-Match Exit Menu & Victory / Defeat / Draw Modals */}
       <StatusModals
         screenState={screenState}
         homeTeam={homeTeam}
         awayTeam={awayTeam}
         stats={finalStats}
         settings={settings}
+        activeRoom={activeRoom}
         onResume={handleTogglePause}
         onRestart={handleRestartMatch}
         onBackToTitle={handleBackToTitle}

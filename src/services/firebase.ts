@@ -2,17 +2,20 @@ import { initializeApp } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
-  linkWithPopup,
   onAuthStateChanged,
   signInAnonymously,
   signInWithPopup,
+  updateProfile,
   User,
 } from 'firebase/auth';
 import {
+  addDoc,
+  arrayRemove,
+  arrayUnion,
   collection,
+  deleteDoc,
   doc,
   getDoc,
-  getDocFromServer,
   getDocs,
   getFirestore,
   limit,
@@ -26,13 +29,21 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
+  MatchFormatMode,
   MultiplayerMatchSnapshot,
+  MultiplayerRoomState,
   MultiplayerSlot,
   OnlineUserProfile,
+  RoomVisibility,
 } from '../types/game';
-import { INITIAL_AWAY_PLAYERS, INITIAL_HOME_PLAYERS } from '../game/rules';
+import {
+  ALL_CHARACTERS,
+  buildInitialRoomSlots,
+  convertSlotToBot,
+  resolveActiveCharacterIdsForRoom,
+} from './botService';
+import { CreateRoomParams, hashRoomPassword } from './roomService';
 
-// Initialize Firebase SDK with provisioned configuration
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -56,12 +67,12 @@ export interface FirestoreErrorInfo {
     emailVerified: boolean | undefined;
     isAnonymous: boolean | undefined;
     tenantId: string | null | undefined;
-    providerInfo: {
+    providerInfo: Array<{
       providerId: string;
       displayName: string | null;
       email: string | null;
       photoUrl: string | null;
-    }[];
+    }>;
   };
 }
 
@@ -69,7 +80,7 @@ export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
   path: string | null
-): FirestoreErrorInfo {
+): never {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -90,786 +101,1303 @@ export function handleFirestoreError(
     path,
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
-  return errInfo;
+  throw new Error(JSON.stringify(errInfo));
 }
 
-const ALL_CHARACTER_SLOTS: Omit<
-  MultiplayerSlot,
-  'uid' | 'displayName' | 'isBot' | 'isReady' | 'pingMs'
->[] = [
-  ...INITIAL_HOME_PLAYERS.map((p) => ({
-    characterId: p.id,
-    characterName: p.name,
-    team: 'home' as const,
-  })),
-  ...INITIAL_AWAY_PLAYERS.map((p) => ({
-    characterId: p.id,
-    characterName: p.name,
-    team: 'away' as const,
-  })),
-];
+// ============================================================================
+// Authentication & User Profile
+// ============================================================================
 
-export function createDefaultRoomSlots(
-  hostUid: string,
-  hostName: string,
-  preferredCharId = 'home_1'
-): Record<string, MultiplayerSlot> {
-  const slots: Record<string, MultiplayerSlot> = {};
-  for (const item of ALL_CHARACTER_SLOTS) {
-    const isHostSlot = item.characterId === preferredCharId;
-    slots[item.characterId] = {
-      characterId: item.characterId,
-      characterName: item.characterName,
-      team: item.team,
-      uid: isHostSlot ? hostUid : null,
-      displayName: isHostSlot ? hostName : `Bot (${item.characterName})`,
-      isBot: !isHostSlot,
-      isReady: true,
-      pingMs: isHostSlot ? 18 : 0,
-    };
+let authReadyPromise: Promise<User> | null = null;
+const authReadyListeners = new Set<(user: User | null) => void>();
+
+onAuthStateChanged(auth, async (user) => {
+  if (user) {
+    try {
+      await ensureUserProfile(user);
+    } catch (e) {
+      console.warn('Could not initialize user profile yet:', e);
+    }
+    authReadyListeners.forEach((cb) => cb(user));
+  } else {
+    authReadyListeners.forEach((cb) => cb(null));
   }
-  return slots;
+});
+
+export function subscribeToAuthReady(cb: (user: User | null) => void): () => void {
+  authReadyListeners.add(cb);
+  if (auth.currentUser) {
+    cb(auth.currentUser);
+  } else {
+    ensureAuthenticated().catch(() => cb(null));
+  }
+  return () => {
+    authReadyListeners.delete(cb);
+  };
+}
+
+export function ensureAuthenticated(): Promise<User> {
+  if (auth.currentUser) {
+    return Promise.resolve(auth.currentUser);
+  }
+  if (!authReadyPromise) {
+    authReadyPromise = new Promise<User>((resolve, reject) => {
+      const unsubscribe = onAuthStateChanged(auth, async (user) => {
+        if (user) {
+          unsubscribe();
+          try {
+            await ensureUserProfile(user);
+          } catch {
+            // Ignore transient error
+          }
+          resolve(user);
+        } else {
+          try {
+            const cred = await signInAnonymously(auth);
+            unsubscribe();
+            await ensureUserProfile(cred.user);
+            resolve(cred.user);
+          } catch (err) {
+            unsubscribe();
+            authReadyPromise = null;
+            reject(err);
+          }
+        }
+      });
+    });
+  }
+  return authReadyPromise;
+}
+
+export async function linkGoogleAccount(): Promise<User> {
+  const provider = new GoogleAuthProvider();
+  const result = await signInWithPopup(auth, provider);
+  await ensureUserProfile(result.user);
+  return result.user;
 }
 
 function generateTagCode(uid: string): string {
-  const clean = uid.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  return `VZR-${clean.slice(0, 4).padEnd(4, '7')}`;
+  const suffix = uid.replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase();
+  return `#STF${suffix.padEnd(4, '9')}`;
 }
 
-function sanitizeDisplayName(raw?: string | null): string {
-  const trimmed = (raw || '').trim().slice(0, 28);
-  if (trimmed.length >= 2) return trimmed;
-  return `Craque_${Math.floor(100 + Math.random() * 899)}`;
-}
-
-export function generateRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = 'VRZ-';
-  for (let i = 0; i < 4; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
-}
-
-/**
- * Validates connection to Firestore server and measures round-trip ping in ms.
- */
-export async function testFirebaseConnection(): Promise<{
-  connected: boolean;
-  pingMs: number;
-  error: string | null;
-}> {
-  const start = performance.now();
+export async function ensureUserProfile(user: User, preferredNickname?: string): Promise<void> {
+  const userRef = doc(db, 'users', user.uid);
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-    const pingMs = Math.max(8, Math.min(95, Math.round(performance.now() - start)));
-    return { connected: true, pingMs, error: null };
-  } catch (error) {
-    const pingMs = Math.max(12, Math.min(95, Math.round(performance.now() - start)));
-    const msg = error instanceof Error ? error.message : String(error);
-    if (msg.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration. Client is offline.');
-      return { connected: false, pingMs, error: msg };
-    }
-    return { connected: true, pingMs, error: null };
-  }
-}
+    const snap = await getDoc(userRef);
+    const defaultName =
+      preferredNickname?.trim() ||
+      user.displayName?.trim() ||
+      `Craque_${user.uid.slice(0, 4).toUpperCase()}`;
 
-/**
- * Ensures the user is authenticated and syncs their `/users/{uid}` document
- * adhering strictly to the `isValidUserProfile` blueprint in `firestore.rules`.
- */
-export async function ensureAuthenticatedUser(
-  customDisplayName?: string,
-  attemptAnonymous = false
-): Promise<{
-  user: User | null;
-  profile: OnlineUserProfile;
-  authError: string | null;
-}> {
-  let currentUser = auth.currentUser;
-  let authError: string | null = null;
-
-  if (!currentUser && attemptAnonymous) {
-    try {
-      const cred = await signInAnonymously(auth);
-      currentUser = cred.user;
-    } catch (err) {
-      authError = err instanceof Error ? err.message : String(err);
-    }
-  }
-
-  const savedName = sanitizeDisplayName(
-    customDisplayName ||
-      currentUser?.displayName ||
-      (typeof localStorage !== 'undefined'
-        ? localStorage.getItem('varzea_player_name')
-        : null)
-  );
-
-  if (typeof localStorage !== 'undefined' && savedName) {
-    localStorage.setItem('varzea_player_name', savedName);
-  }
-
-  let savedLocalUid =
-    typeof localStorage !== 'undefined'
-      ? localStorage.getItem('varzea_local_uid')
-      : null;
-  if (!savedLocalUid) {
-    savedLocalUid = `vzr_${Math.random().toString(36).slice(2, 10)}`;
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem('varzea_local_uid', savedLocalUid);
-    }
-  }
-
-  const uid = currentUser?.uid || savedLocalUid;
-  const tagCode = generateTagCode(uid);
-
-  const profile: OnlineUserProfile = {
-    uid,
-    displayName: savedName,
-    tagCode,
-    status: 'online',
-    currentRoomCode: '',
-    updatedAt: Date.now(),
-    createdAt: Date.now(),
-  };
-
-  if (currentUser) {
-    const userRef = doc(db, 'users', currentUser.uid);
-    try {
-      const existing = await getDoc(userRef);
-      if (existing.exists()) {
-        const data = existing.data();
-        const nextDisplayName = sanitizeDisplayName(
-          customDisplayName || data.displayName || profile.displayName
-        );
-        profile.displayName = nextDisplayName;
-        profile.tagCode = data.tagCode || tagCode;
-
-        // Strict update matching firestore.rules affectedKeys allowlist
-        await updateDoc(userRef, {
-          displayName: nextDisplayName,
-          onlineStatus: 'online',
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        // Strict create matching firestore.rules isValidUserProfile
-        await setDoc(userRef, {
-          uid: currentUser.uid,
-          displayName: profile.displayName,
-          tagCode: profile.tagCode,
-          favoritePlayer: 'Yuri',
-          wins: 0,
-          losses: 0,
-          draws: 0,
-          goalsScored: 0,
-          onlineStatus: 'online',
-          currentRoomCode: '',
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-    } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}`);
-    }
-  }
-
-  return { user: currentUser, profile, authError };
-}
-
-/**
- * Signs in or upgrades an anonymous account with Google Popup OAuth.
- */
-export async function signInOrLinkWithGoogle(): Promise<{
-  user: User | null;
-  error: string | null;
-}> {
-  const provider = new GoogleAuthProvider();
-  try {
-    if (auth.currentUser && auth.currentUser.isAnonymous) {
-      try {
-        const linked = await linkWithPopup(auth.currentUser, provider);
-        await ensureAuthenticatedUser(linked.user.displayName || undefined);
-        return { user: linked.user, error: null };
-      } catch (linkErr: unknown) {
-        const code = (linkErr as { code?: string })?.code;
-        if (code === 'auth/credential-already-in-use') {
-          const signedIn = await signInWithPopup(auth, provider);
-          await ensureAuthenticatedUser(signedIn.user.displayName || undefined);
-          return { user: signedIn.user, error: null };
-        }
-        throw linkErr;
-      }
-    } else {
-      const signedIn = await signInWithPopup(auth, provider);
-      await ensureAuthenticatedUser(signedIn.user.displayName || undefined);
-      return { user: signedIn.user, error: null };
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { user: null, error: msg };
-  }
-}
-
-export async function updateUserProfileName(
-  newName: string
-): Promise<OnlineUserProfile | null> {
-  const clean = sanitizeDisplayName(newName);
-  if (typeof localStorage !== 'undefined') {
-    localStorage.setItem('varzea_player_name', clean);
-  }
-  const { profile } = await ensureAuthenticatedUser(clean);
-  return profile;
-}
-
-/**
- * Creates a new multiplayer room in `/rooms/{roomCode}` adhering strictly to `isValidMultiplayerRoom` in `firestore.rules`.
- */
-export async function createMultiplayerRoom(
-  hostProfile: OnlineUserProfile,
-  homeTeamName: string,
-  awayTeamName: string,
-  preferredCharId = 'home_1'
-): Promise<string> {
-  const roomCode = generateRoomCode();
-  const currentUid = auth.currentUser?.uid || hostProfile.uid;
-  const cleanHostName = sanitizeDisplayName(hostProfile.displayName);
-  const cleanHomeTeam = (homeTeamName || 'Unidos do Barro').slice(0, 32);
-  const cleanAwayTeam = (awayTeamName || 'Rubro-Negro do Beco').slice(0, 32);
-
-  const slots = createDefaultRoomSlots(
-    currentUid,
-    cleanHostName,
-    preferredCharId
-  );
-
-  const initialMatchState: MultiplayerMatchSnapshot = {
-    ball: { x: 0, y: 0.22, z: 0, vx: 0, vy: 0, vz: 0 },
-    players: {},
-    homeGoals: 0,
-    awayGoals: 0,
-    half: 1,
-    remainingSeconds: 300,
-    phase: 'open_play',
-    celebratingPlayerId: null,
-    bannerMessage: null,
-    bannerSubtext: null,
-    timestamp: Date.now(),
-  };
-
-  if (typeof localStorage !== 'undefined') {
-    localStorage.setItem(
-      `varzea_room_${roomCode}`,
-      JSON.stringify({
-        roomCode,
-        hostUid: currentUid,
-        hostName: cleanHostName,
-        status: 'waiting',
-        homeTeamName: cleanHomeTeam,
-        awayTeamName: cleanAwayTeam,
-        homeGoals: 0,
-        awayGoals: 0,
-        half: 1,
-        remainingSeconds: 300,
-        slots,
-        matchState: initialMatchState,
-      })
-    );
-  }
-
-  if (!auth.currentUser) {
-    return roomCode;
-  }
-
-  // Ensure /users/{uid} exists before creating the room (required by relational existence check in firestore.rules)
-  await ensureAuthenticatedUser(cleanHostName);
-
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    await setDoc(roomRef, {
-      roomCode,
-      hostUid: auth.currentUser.uid,
-      hostName: cleanHostName,
-      status: 'waiting',
-      homeTeamName: cleanHomeTeam,
-      awayTeamName: cleanAwayTeam,
-      homeGoals: 0,
-      awayGoals: 0,
-      half: 1,
-      remainingSeconds: 300,
-      assignedSlots: slots,
-      syncState: initialMatchState,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-
-    const userRef = doc(db, 'users', auth.currentUser.uid);
-    await updateDoc(userRef, {
-      onlineStatus: 'in_lobby',
-      currentRoomCode: roomCode,
-      updatedAt: serverTimestamp(),
-    });
-
-    return roomCode;
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `rooms/${roomCode}`);
-    throw err;
-  }
-}
-
-/**
- * Joins an existing room by code and assigns the first free character slot (or requested character slot)
- */
-export async function joinMultiplayerRoom(
-  roomCodeInput: string,
-  profile: OnlineUserProfile,
-  preferredCharacterId?: string
-): Promise<{ roomCode: string; assignedCharacterId: string }> {
-  const roomCode = roomCodeInput.trim().toUpperCase();
-  const currentUid = auth.currentUser?.uid;
-  if (!currentUid) {
-    throw new Error(
-      'Clique em "Vincular / Entrar com Google" acima para entrar em salas online de outros jogadores.'
-    );
-  }
-
-  await ensureAuthenticatedUser(profile.displayName);
-
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
     if (!snap.exists()) {
-      throw new Error(`Sala "${roomCode}" não encontrada.`);
-    }
-    const data = snap.data();
-    const slots: Record<string, MultiplayerSlot> = {
-      ...(data.assignedSlots || {}),
-    };
-
-    let assignedId = Object.keys(slots).find(
-      (k) => slots[k]?.uid === currentUid
-    );
-
-    if (!assignedId) {
-      if (
-        preferredCharacterId &&
-        slots[preferredCharacterId] &&
-        (slots[preferredCharacterId].isBot || !slots[preferredCharacterId].uid)
-      ) {
-        assignedId = preferredCharacterId;
-      } else {
-        assignedId = Object.keys(slots).find(
-          (k) => slots[k].isBot || !slots[k].uid
-        );
-      }
-    }
-
-    if (!assignedId) {
-      throw new Error('A sala já está lotada (8/8 jogadores humanos)!');
-    }
-
-    slots[assignedId] = {
-      ...slots[assignedId],
-      uid: currentUid,
-      displayName: sanitizeDisplayName(profile.displayName),
-      isBot: false,
-      isReady: true,
-      pingMs: 24,
-    };
-
-    await updateDoc(roomRef, {
-      assignedSlots: slots,
-      updatedAt: serverTimestamp(),
-    });
-
-    return { roomCode, assignedCharacterId: assignedId };
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
-    throw err;
-  }
-}
-
-/**
- * Claims a specific character slot (Yuri, Josué, Careca, Bode, Primo, Bicudo, Ismael, Felipe)
- * Ensures no two human players ever control the same character.
- */
-export async function selectCharacterInRoom(
-  roomCode: string,
-  profile: OnlineUserProfile,
-  targetCharacterId: string
-): Promise<boolean> {
-  const currentUid = auth.currentUser?.uid;
-  if (!currentUid) return false;
-
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return false;
-    const data = snap.data();
-    const slots: Record<string, MultiplayerSlot> = {
-      ...(data.assignedSlots || {}),
-    };
-
-    const targetSlot = slots[targetCharacterId];
-    if (!targetSlot) return false;
-
-    if (
-      targetSlot.uid &&
-      targetSlot.uid !== currentUid &&
-      !targetSlot.isBot
-    ) {
-      return false;
-    }
-
-    for (const key of Object.keys(slots)) {
-      if (slots[key].uid === currentUid) {
-        slots[key] = {
-          ...slots[key],
-          uid: null,
-          displayName: `Bot (${slots[key].characterName})`,
-          isBot: true,
-          isReady: true,
-        };
-      }
-    }
-
-    slots[targetCharacterId] = {
-      ...targetSlot,
-      uid: currentUid,
-      displayName: sanitizeDisplayName(profile.displayName),
-      isBot: false,
-      isReady: true,
-      pingMs: 20,
-    };
-
-    await updateDoc(roomRef, {
-      assignedSlots: slots,
-      updatedAt: serverTimestamp(),
-    });
-    return true;
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
-    return false;
-  }
-}
-
-/**
- * Starts the online match (Host transitions room status to 'playing')
- */
-export async function startMultiplayerMatchInRoom(
-  roomCode: string
-): Promise<void> {
-  if (!auth.currentUser) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    await updateDoc(roomRef, {
-      status: 'playing',
-      homeGoals: 0,
-      awayGoals: 0,
-      half: 1,
-      remainingSeconds: 300,
-      updatedAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
-  }
-}
-
-/**
- * Leaves the current room; if the host leaves, automatically migrates host authority to the next connected human player.
- */
-export async function leaveMultiplayerRoom(roomCode: string): Promise<void> {
-  const currentUid = auth.currentUser?.uid;
-  if (!currentUid || !roomCode) return;
-
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const data = snap.data();
-    const slots: Record<string, MultiplayerSlot> = {
-      ...(data.assignedSlots || {}),
-    };
-
-    for (const key of Object.keys(slots)) {
-      if (slots[key].uid === currentUid) {
-        slots[key] = {
-          ...slots[key],
-          uid: null,
-          displayName: `Bot (${slots[key].characterName})`,
-          isBot: true,
-          isReady: true,
-        };
-      }
-    }
-
-    if (data.hostUid === currentUid) {
-      const remainingHuman = Object.values(slots).find(
-        (s) => !s.isBot && s.uid && s.uid !== currentUid
-      );
-      if (remainingHuman && remainingHuman.uid) {
-        await updateDoc(roomRef, {
-          assignedSlots: slots,
-          hostUid: remainingHuman.uid,
-          hostName: sanitizeDisplayName(remainingHuman.displayName),
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        await updateDoc(roomRef, {
-          status: 'finished',
-          assignedSlots: slots,
-          updatedAt: serverTimestamp(),
-        });
-      }
+      await setDoc(userRef, {
+        uid: user.uid,
+        displayName: defaultName.slice(0, 28),
+        tagCode: generateTagCode(user.uid),
+        status: 'online',
+        currentRoomCode: '',
+        friends: [],
+        wins: 0,
+        losses: 0,
+        draws: 0,
+        goalsScored: 0,
+        goalsConceded: 0,
+        matchesPlayed: 0,
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+      });
     } else {
-      await updateDoc(roomRef, {
-        assignedSlots: slots,
+      const existing = snap.data();
+      await updateDoc(userRef, {
+        uid: existing.uid,
+        displayName: (preferredNickname?.trim() || existing.displayName || defaultName).slice(0, 28),
+        tagCode: existing.tagCode,
+        status: existing.status || 'online',
+        currentRoomCode: existing.currentRoomCode || '',
+        friends: Array.isArray(existing.friends) ? existing.friends : [],
+        wins: typeof existing.wins === 'number' ? existing.wins : 0,
+        losses: typeof existing.losses === 'number' ? existing.losses : 0,
+        draws: typeof existing.draws === 'number' ? existing.draws : 0,
+        goalsScored: typeof existing.goalsScored === 'number' ? existing.goalsScored : 0,
+        goalsConceded: typeof existing.goalsConceded === 'number' ? existing.goalsConceded : 0,
+        matchesPlayed: typeof existing.matchesPlayed === 'number' ? existing.matchesPlayed : 0,
+        createdAt: existing.createdAt,
         updatedAt: serverTimestamp(),
       });
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
+    handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
   }
 }
 
-/**
- * Publishes authoritative host snapshot to `/rooms/{roomCode}`
- */
-export async function publishRoomMatchSnapshot(
-  roomCode: string,
-  snapshot: MultiplayerMatchSnapshot
-): Promise<void> {
-  if (!auth.currentUser) return;
-  const roomRef = doc(db, 'rooms', roomCode);
+export async function updateNickname(newName: string): Promise<void> {
+  const user = await ensureAuthenticated();
+  const cleanName = newName.trim().slice(0, 28);
+  if (!cleanName) return;
+
   try {
-    await updateDoc(roomRef, {
-      homeGoals: snapshot.homeGoals,
-      awayGoals: snapshot.awayGoals,
-      half: snapshot.half,
-      remainingSeconds: snapshot.remainingSeconds,
-      syncState: snapshot,
+    await updateProfile(user, { displayName: cleanName });
+  } catch {
+    // Ignore Auth profile update issues on anonymous users
+  }
+  await ensureUserProfile(user, cleanName);
+}
+
+export async function updateUserPresence(
+  status: 'online' | 'in_room' | 'playing' | 'offline',
+  roomCode: string = ''
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) return;
+  const userRef = doc(db, 'users', user.uid);
+  try {
+    const snap = await getDoc(userRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    await updateDoc(userRef, {
+      uid: d.uid,
+      displayName: d.displayName,
+      tagCode: d.tagCode,
+      status,
+      currentRoomCode: roomCode.slice(0, 16),
+      friends: d.friends || [],
+      wins: d.wins || 0,
+      losses: d.losses || 0,
+      draws: d.draws || 0,
+      goalsScored: d.goalsScored || 0,
+      goalsConceded: d.goalsConceded || 0,
+      matchesPlayed: d.matchesPlayed || 0,
+      createdAt: d.createdAt,
       updatedAt: serverTimestamp(),
     });
   } catch {
-    // Non-fatal during high-frequency sync
+    // Non-fatal heartbeat update
   }
 }
 
-/**
- * Publishes a non-host client's controlled character coordinates into the room's syncState
- */
-export async function publishClientCharacterState(
-  roomCode: string,
-  characterId: string,
-  charState: {
-    x: number;
-    z: number;
-    vx: number;
-    vz: number;
-    facingAngle: number;
-    animState: string;
-    voiceBubble?: string | null;
-  }
-): Promise<void> {
-  if (!auth.currentUser) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    await updateDoc(roomRef, {
-      [`syncState.players.${characterId}`]: charState,
-      updatedAt: serverTimestamp(),
-    });
-  } catch {
-    // Ignore transient network contention
-  }
+function mapDocToOnlineUserProfile(id: string, d: Record<string, unknown>): OnlineUserProfile & { friends: string[] } {
+  const updatedTs = d.updatedAt instanceof Timestamp ? d.updatedAt.toMillis() : Date.now();
+  const createdTs = d.createdAt instanceof Timestamp ? d.createdAt.toMillis() : Date.now();
+  return {
+    uid: String(d.uid || id),
+    displayName: String(d.displayName || 'Jogador'),
+    tagCode: String(d.tagCode || '#STF0000'),
+    status: (d.status as 'online' | 'in_room' | 'playing') || 'online',
+    currentRoomCode: String(d.currentRoomCode || ''),
+    friends: Array.isArray(d.friends) ? (d.friends as string[]) : [],
+    wins: typeof d.wins === 'number' ? d.wins : 0,
+    losses: typeof d.losses === 'number' ? d.losses : 0,
+    draws: typeof d.draws === 'number' ? d.draws : 0,
+    goalsScored: typeof d.goalsScored === 'number' ? d.goalsScored : 0,
+    goalsConceded: typeof d.goalsConceded === 'number' ? d.goalsConceded : 0,
+    matchesPlayed: typeof d.matchesPlayed === 'number' ? d.matchesPlayed : 0,
+    updatedAt: updatedTs,
+    createdAt: createdTs,
+  };
 }
 
-/**
- * Lists active waiting or playing rooms (enforcing `where('status', 'in', ['waiting', 'playing'])`)
- */
-export async function listActiveRooms(): Promise<
-  Array<{
-    roomCode: string;
-    hostName: string;
-    status: string;
-    humanCount: number;
-    homeScore: number;
-    awayScore: number;
-  }>
-> {
-  if (!auth.currentUser) return [];
-  try {
-    const q = query(
-      collection(db, 'rooms'),
-      where('status', 'in', ['waiting', 'playing']),
-      limit(15)
+export function subscribeToMyProfile(
+  cb: (profile: (OnlineUserProfile & { friends: string[] }) | null) => void
+): () => void {
+  let unsubDoc: (() => void) | null = null;
+  const unsubAuth = subscribeToAuthReady((user) => {
+    if (unsubDoc) {
+      unsubDoc();
+      unsubDoc = null;
+    }
+    if (!user) {
+      cb(null);
+      return;
+    }
+    const userRef = doc(db, 'users', user.uid);
+    unsubDoc = onSnapshot(
+      userRef,
+      (snap) => {
+        if (snap.exists()) {
+          cb(mapDocToOnlineUserProfile(snap.id, snap.data()));
+        } else {
+          cb(null);
+        }
+      },
+      (err) => {
+        console.error('Error listening to profile:', err);
+      }
     );
-    const snap = await getDocs(q);
-    return snap.docs.map((d) => {
-      const data = d.data();
-      const slots: Record<string, MultiplayerSlot> = data.assignedSlots || {};
-      const humanCount = Object.values(slots).filter(
-        (s) => !s.isBot && s.uid
-      ).length;
-      return {
-        roomCode: data.roomCode,
-        hostName: data.hostName,
-        status: data.status,
-        humanCount,
-        homeScore: data.homeGoals || 0,
-        awayScore: data.awayGoals || 0,
-      };
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, 'rooms');
-    return [];
-  }
+  });
+
+  return () => {
+    unsubAuth();
+    if (unsubDoc) unsubDoc();
+  };
 }
 
-/**
- * Lists online users in `/users` (enforcing `where('onlineStatus', 'in', ['online', 'in_lobby', 'in_match', 'offline'])` required by firestore.rules)
- */
-export async function listOnlineUsers(): Promise<OnlineUserProfile[]> {
-  if (!auth.currentUser) return [];
-  try {
-    const q = query(
-      collection(db, 'users'),
-      where('onlineStatus', 'in', ['online', 'in_lobby', 'in_match', 'offline']),
-      limit(25)
-    );
-    const snap = await getDocs(q);
-    return snap.docs.map((d) => {
-      const data = d.data();
-      const ts = data.updatedAt as Timestamp | undefined;
-      return {
-        uid: data.uid,
-        displayName: data.displayName,
-        tagCode: data.tagCode,
-        status:
-          data.onlineStatus === 'in_lobby'
-            ? 'in_room'
-            : data.onlineStatus === 'in_match'
-            ? 'playing'
-            : 'online',
-        currentRoomCode: data.currentRoomCode || '',
-        updatedAt: ts ? ts.toMillis() : Date.now(),
-        createdAt: Date.now(),
-      };
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, 'users');
-    return [];
-  }
+export function subscribeToOnlinePlayers(cb: (players: OnlineUserProfile[]) => void): () => void {
+  const q = query(collection(db, 'users'), limit(40));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list: OnlineUserProfile[] = [];
+      snap.forEach((docSnap) => {
+        list.push(mapDocToOnlineUserProfile(docSnap.id, docSnap.data()));
+      });
+      list.sort((a, b) => b.updatedAt - a.updatedAt);
+      cb(list);
+    },
+    (err) => {
+      console.warn('Could not list online players:', err);
+    }
+  );
 }
 
-export interface FriendRequestRecord {
+// ============================================================================
+// Friends & Room Invitations
+// ============================================================================
+
+export interface FriendRequestDoc {
   id: string;
   fromUid: string;
   fromName: string;
   fromTag: string;
   toUid: string;
   toName: string;
+  type: 'friend_request' | 'room_invite';
+  roomCode: string;
   status: 'pending' | 'accepted' | 'declined';
-  roomInviteCode: string;
+  createdAt: number;
 }
 
-/**
- * Sends a friend request or room invite to another player matching `isValidFriendRequest` in `firestore.rules`.
- */
-export async function sendFriendRequestOrInvite(
-  fromProfile: OnlineUserProfile,
-  targetUser: { uid: string; displayName: string },
-  roomInviteCode = ''
-): Promise<void> {
-  const currentUid = auth.currentUser?.uid;
-  if (!currentUid || currentUid === targetUser.uid) return;
+export async function sendFriendRequestByTag(targetTagOrName: string): Promise<{ ok: boolean; message: string }> {
+  const user = await ensureAuthenticated();
+  const mySnap = await getDoc(doc(db, 'users', user.uid));
+  if (!mySnap.exists()) {
+    return { ok: false, message: 'Perfil ainda não carregado.' };
+  }
+  const me = mySnap.data();
 
-  await ensureAuthenticatedUser(fromProfile.displayName);
+  const search = targetTagOrName.trim();
+  if (!search) {
+    return { ok: false, message: 'Digite o código #STF ou nome do amigo.' };
+  }
 
-  const reqId = `${currentUid}_${targetUser.uid}`;
-  const reqRef = doc(db, 'friendRequests', reqId);
+  let q = query(collection(db, 'users'), where('tagCode', '==', search.toUpperCase()), limit(5));
+  let snap = await getDocs(q);
+
+  if (snap.empty) {
+    q = query(collection(db, 'users'), where('displayName', '==', search), limit(5));
+    snap = await getDocs(q);
+  }
+
+  if (snap.empty) {
+    return { ok: false, message: 'Nenhum jogador encontrado com essa Tag ou Nome.' };
+  }
+
+  const targetDoc = snap.docs[0];
+  const targetData = targetDoc.data();
+
+  if (targetDoc.id === user.uid) {
+    return { ok: false, message: 'Você não pode adicionar a si mesmo!' };
+  }
+
   try {
-    const existing = await getDoc(reqRef);
-    if (existing.exists() && existing.data().status === 'accepted') {
-      await updateDoc(reqRef, {
-        inviteRoomCode: (roomInviteCode || '').slice(0, 16),
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      await setDoc(reqRef, {
-        fromUid: currentUid,
-        fromName: sanitizeDisplayName(fromProfile.displayName),
-        fromTag: fromProfile.tagCode,
-        toUid: targetUser.uid,
-        toName: sanitizeDisplayName(targetUser.displayName),
-        status: 'pending',
-        inviteRoomCode: (roomInviteCode || '').slice(0, 16),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
+    await addDoc(collection(db, 'friendRequests'), {
+      fromUid: user.uid,
+      fromName: String(me.displayName || 'Jogador').slice(0, 28),
+      fromTag: String(me.tagCode || '#STF0000'),
+      toUid: targetDoc.id,
+      toName: String(targetData.displayName || 'Amigo').slice(0, 28),
+      type: 'friend_request',
+      roomCode: '',
+      status: 'pending',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return { ok: true, message: `Pedido enviado para ${targetData.displayName}!` };
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `friendRequests/${reqId}`);
-    throw err;
+    handleFirestoreError(err, OperationType.CREATE, 'friendRequests');
+  }
+}
+
+export async function sendRoomInviteToFriend(
+  friendUid: string,
+  friendName: string,
+  roomCode: string
+): Promise<void> {
+  const user = await ensureAuthenticated();
+  const mySnap = await getDoc(doc(db, 'users', user.uid));
+  const me = mySnap.exists() ? mySnap.data() : { displayName: 'Craque', tagCode: '#STF0000' };
+
+  try {
+    await addDoc(collection(db, 'friendRequests'), {
+      fromUid: user.uid,
+      fromName: String(me.displayName || 'Craque').slice(0, 28),
+      fromTag: String(me.tagCode || '#STF0000'),
+      toUid: friendUid,
+      toName: friendName.slice(0, 28),
+      type: 'room_invite',
+      roomCode: roomCode.slice(0, 16),
+      status: 'pending',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, 'friendRequests');
   }
 }
 
 export async function respondToFriendRequest(
-  requestId: string,
-  newStatus: 'accepted' | 'declined'
+  request: FriendRequestDoc,
+  accept: boolean
 ): Promise<void> {
-  const reqRef = doc(db, 'friendRequests', requestId);
+  const user = await ensureAuthenticated();
+  const reqRef = doc(db, 'friendRequests', request.id);
+  const snap = await getDoc(reqRef);
+  if (!snap.exists()) return;
+  const d = snap.data();
+
   try {
     await updateDoc(reqRef, {
-      status: newStatus,
+      fromUid: d.fromUid,
+      fromName: d.fromName,
+      fromTag: d.fromTag,
+      toUid: d.toUid,
+      toName: d.toName,
+      type: d.type,
+      roomCode: d.roomCode,
+      status: accept ? 'accepted' : 'declined',
+      createdAt: d.createdAt,
       updatedAt: serverTimestamp(),
     });
+
+    if (accept && request.type === 'friend_request') {
+      const myRef = doc(db, 'users', user.uid);
+      const mySnap = await getDoc(myRef);
+      if (mySnap.exists()) {
+        await updateDoc(myRef, {
+          friends: arrayUnion(request.fromUid),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      const senderRef = doc(db, 'users', request.fromUid);
+      const senderSnap = await getDoc(senderRef);
+      if (senderSnap.exists()) {
+        await updateDoc(senderRef, {
+          friends: arrayUnion(user.uid),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
   } catch (err) {
-    handleFirestoreError(
-      err,
-      OperationType.UPDATE,
-      `friendRequests/${requestId}`
+    handleFirestoreError(err, OperationType.UPDATE, `friendRequests/${request.id}`);
+  }
+}
+
+export function subscribeToIncomingRequests(
+  cb: (requests: FriendRequestDoc[]) => void
+): () => void {
+  let unsubSnap: (() => void) | null = null;
+  const unsubAuth = subscribeToAuthReady((user) => {
+    if (unsubSnap) {
+      unsubSnap();
+      unsubSnap = null;
+    }
+    if (!user) {
+      cb([]);
+      return;
+    }
+    const q = query(
+      collection(db, 'friendRequests'),
+      where('toUid', '==', user.uid),
+      where('status', '==', 'pending'),
+      limit(25)
     );
+    unsubSnap = onSnapshot(
+      q,
+      (snap) => {
+        const list: FriendRequestDoc[] = [];
+        snap.forEach((docSnap) => {
+          const d = docSnap.data();
+          list.push({
+            id: docSnap.id,
+            fromUid: String(d.fromUid),
+            fromName: String(d.fromName),
+            fromTag: String(d.fromTag || '#STF'),
+            toUid: String(d.toUid),
+            toName: String(d.toName),
+            type: (d.type as 'friend_request' | 'room_invite') || 'friend_request',
+            roomCode: String(d.roomCode || ''),
+            status: (d.status as 'pending' | 'accepted' | 'declined') || 'pending',
+            createdAt: d.createdAt instanceof Timestamp ? d.createdAt.toMillis() : Date.now(),
+          });
+        });
+        cb(list);
+      },
+      (err) => {
+        console.warn('Error listening to incoming friend requests:', err);
+      }
+    );
+  });
+
+  return () => {
+    unsubAuth();
+    if (unsubSnap) unsubSnap();
+  };
+}
+
+export function subscribeToFriendsProfiles(
+  friendUids: string[],
+  cb: (friends: OnlineUserProfile[]) => void
+): () => void {
+  if (!friendUids || friendUids.length === 0) {
+    cb([]);
+    return () => {};
+  }
+  const slice = friendUids.slice(0, 20);
+  const q = query(collection(db, 'users'), where('uid', 'in', slice));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list: OnlineUserProfile[] = [];
+      snap.forEach((docSnap) => {
+        list.push(mapDocToOnlineUserProfile(docSnap.id, docSnap.data()));
+      });
+      cb(list);
+    },
+    (err) => {
+      console.warn('Error listening to friends profiles:', err);
+    }
+  );
+}
+
+// ============================================================================
+// Multiplayer Rooms (2v2 & 4v4, Public & Private with Password Hash, Bots)
+// ============================================================================
+
+function generateRoomCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = 'STF-';
+  for (let i = 0; i < 4; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+function mapDocToRoomState(d: Record<string, unknown>): MultiplayerRoomState {
+  const mode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
+  const visibility: RoomVisibility = d.visibility === 'private' ? 'private' : 'public';
+  const slots = (d.slots as Record<string, MultiplayerSlot>) || {};
+  const activeCharacterIds = Array.isArray(d.activeCharacterIds)
+    ? (d.activeCharacterIds as string[])
+    : resolveActiveCharacterIdsForRoom(slots, mode);
+
+  return {
+    roomCode: String(d.roomCode),
+    roomName: String(d.roomName || `SEM TERRA FC — ${String(d.roomCode)}`),
+    mode,
+    visibility,
+    hasPassword: Boolean(d.hasPassword),
+    passwordHash: d.passwordHash ? String(d.passwordHash) : null,
+    maxHumans: typeof d.maxHumans === 'number' ? d.maxHumans : mode === '2v2' ? 4 : 8,
+    autoFillBots: d.autoFillBots !== false,
+    activeCharacterIds,
+    loadingReadyUids: Array.isArray(d.loadingReadyUids) ? (d.loadingReadyUids as string[]) : [],
+    lastActivityMs:
+      typeof d.lastActivityMs === 'number'
+        ? d.lastActivityMs
+        : d.updatedAt instanceof Timestamp
+        ? d.updatedAt.toMillis()
+        : Date.now(),
+    hostUid: String(d.hostUid),
+    hostName: String(d.hostName),
+    status: (d.status as 'waiting' | 'playing' | 'finished') || 'waiting',
+    homeTeamId: String(d.homeTeamId || 'unidos_do_barro'),
+    awayTeamId: String(d.awayTeamId || 'rubro_negro_beco'),
+    homeScore: typeof d.homeGoals === 'number' ? d.homeGoals : 0,
+    awayScore: typeof d.awayGoals === 'number' ? d.awayGoals : 0,
+    half: (d.half as 1 | 2) || 1,
+    remainingSeconds: typeof d.remainingSeconds === 'number' ? d.remainingSeconds : 150,
+    slots,
+    matchState: (d.matchSnapshot as MultiplayerMatchSnapshot) || null,
+  };
+}
+
+export async function createOnlineRoom(
+  homeTeamId: string = 'unidos_do_barro',
+  awayTeamId: string = 'rubro_negro_beco',
+  halfDurationSeconds: number = 150,
+  options?: Partial<CreateRoomParams>
+): Promise<MultiplayerRoomState> {
+  const user = await ensureAuthenticated();
+  const mySnap = await getDoc(doc(db, 'users', user.uid));
+  const hostName = mySnap.exists()
+    ? String(mySnap.data().displayName || 'Anfitrião').slice(0, 28)
+    : (user.displayName || 'Anfitrião').slice(0, 28);
+
+  const roomCode = generateRoomCode();
+  const mode: MatchFormatMode = options?.mode === '2v2' ? '2v2' : '4v4';
+  const visibility: RoomVisibility = options?.visibility === 'private' ? 'private' : 'public';
+  const rawPassword = options?.password?.trim() || '';
+  const hasPassword = visibility === 'private' && rawPassword.length > 0;
+  const passwordHash = hasPassword ? await hashRoomPassword(roomCode, rawPassword) : null;
+  const maxHumans = options?.maxHumans
+    ? Math.max(1, Math.min(mode === '2v2' ? 4 : 8, options.maxHumans))
+    : mode === '2v2'
+    ? 4
+    : 8;
+
+  const roomNum = Math.floor(100 + Math.random() * 900);
+  const roomName = (options?.roomName?.trim() || `SEM TERRA FC — SALA #${roomNum}`).slice(0, 60);
+
+  const slots = buildInitialRoomSlots(user.uid, hostName, options?.preferredCharacterId || 'home_1');
+  const activeCharacterIds = resolveActiveCharacterIdsForRoom(slots, mode);
+  const nowMs = Date.now();
+
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    await setDoc(roomRef, {
+      roomCode,
+      roomName,
+      mode,
+      visibility,
+      hasPassword,
+      passwordHash,
+      maxHumans,
+      autoFillBots: options?.autoFillBots !== false,
+      activeCharacterIds,
+      loadingReadyUids: [user.uid],
+      lastActivityMs: nowMs,
+      hostUid: user.uid,
+      hostName,
+      status: 'waiting',
+      homeTeamId,
+      awayTeamId,
+      homeGoals: 0,
+      awayGoals: 0,
+      half: 1,
+      remainingSeconds: halfDurationSeconds,
+      slots,
+      inputs: {},
+      matchSnapshot: null,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await updateUserPresence('in_room', roomCode);
+
+    return {
+      roomCode,
+      roomName,
+      mode,
+      visibility,
+      hasPassword,
+      passwordHash,
+      maxHumans,
+      autoFillBots: options?.autoFillBots !== false,
+      activeCharacterIds,
+      loadingReadyUids: [user.uid],
+      lastActivityMs: nowMs,
+      hostUid: user.uid,
+      hostName,
+      status: 'waiting',
+      homeTeamId,
+      awayTeamId,
+      homeScore: 0,
+      awayScore: 0,
+      half: 1,
+      remainingSeconds: halfDurationSeconds,
+      slots,
+      matchState: null,
+    };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, `rooms/${roomCode}`);
+  }
+}
+
+export async function joinOnlineRoom(
+  roomCodeInput: string,
+  passwordInput?: string,
+  expectedMode?: MatchFormatMode
+): Promise<MultiplayerRoomState | null> {
+  const user = await ensureAuthenticated();
+  const roomCode = roomCodeInput.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', roomCode);
+
+  const snap = await getDoc(roomRef);
+  if (!snap.exists()) {
+    throw new Error('Sala não encontrada. Verifique o código da sala.');
+  }
+
+  const d = snap.data();
+  if (d.status === 'finished') {
+    throw new Error('Esta partida já foi encerrada.');
+  }
+
+  const roomMode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
+  if (expectedMode && roomMode !== expectedMode) {
+    throw new Error(
+      `Esta sala é da modalidade ${roomMode.toUpperCase()} e não aceita entrada pelo modo ${expectedMode.toUpperCase()}.`
+    );
+  }
+
+  const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+  let existingSlotKey = Object.keys(slots).find((k) => slots[k].uid === user.uid);
+
+  if (d.status === 'playing' && !existingSlotKey) {
+    throw new Error('Não é possível entrar: a partida já está em andamento.');
+  }
+
+  // Validação de senha para salas privadas
+  if (d.hasPassword && d.passwordHash && d.hostUid !== user.uid && !existingSlotKey) {
+    if (!passwordInput || !passwordInput.trim()) {
+      throw new Error('SENHA_OBRIGATORIA: Esta sala privada exige senha para entrar.');
+    }
+    const candidateHash = await hashRoomPassword(roomCode, passwordInput);
+    if (candidateHash !== d.passwordHash) {
+      throw new Error('Senha incorreta para esta sala privada.');
+    }
+  }
+
+  const mySnap = await getDoc(doc(db, 'users', user.uid));
+  const myName = mySnap.exists()
+    ? String(mySnap.data().displayName || 'Jogador').slice(0, 28)
+    : (user.displayName || 'Jogador').slice(0, 28);
+
+  const maxAllowed = typeof d.maxHumans === 'number' ? d.maxHumans : roomMode === '2v2' ? 4 : 8;
+  const currentHumanCount = Object.values(slots).filter((s) => !s.isBot && s.uid).length;
+
+  if (!existingSlotKey) {
+    if (currentHumanCount >= maxAllowed) {
+      throw new Error(`Sala lotada (${currentHumanCount}/${maxAllowed} jogadores humanos).`);
+    }
+
+    // Balanceamento entre Time 1 (home) e Time 2 (away) respeitando limite por equipe (2 em 2v2, 4 em 4v4)
+    const maxPerTeam = roomMode === '2v2' ? 2 : 4;
+    const homeHumans = Object.values(slots).filter((s) => s.team === 'home' && !s.isBot && s.uid).length;
+    const awayHumans = Object.values(slots).filter((s) => s.team === 'away' && !s.isBot && s.uid).length;
+
+    const preferredTeam: 'home' | 'away' =
+      homeHumans <= awayHumans && homeHumans < maxPerTeam
+        ? 'home'
+        : awayHumans < maxPerTeam
+        ? 'away'
+        : 'home';
+
+    let botSlotKey = Object.keys(slots).find(
+      (k) => slots[k].isBot && slots[k].team === preferredTeam
+    );
+    if (!botSlotKey) {
+      botSlotKey = Object.keys(slots).find((k) => slots[k].isBot);
+    }
+
+    if (!botSlotKey) {
+      throw new Error('Todas as vagas de personagens já estão ocupadas.');
+    }
+
+    existingSlotKey = botSlotKey;
+    slots[existingSlotKey] = {
+      ...slots[existingSlotKey],
+      uid: user.uid,
+      displayName: myName,
+      isBot: false,
+      isReady: true,
+      pingMs: 24,
+      micEnabled: false,
+      isSpeaking: false,
+      lastSeenMs: Date.now(),
+    };
+  } else {
+    slots[existingSlotKey] = {
+      ...slots[existingSlotKey],
+      displayName: myName,
+      isBot: false,
+      lastSeenMs: Date.now(),
+    };
+  }
+
+  const activeCharacterIds = resolveActiveCharacterIdsForRoom(
+    slots,
+    roomMode,
+    Array.isArray(d.activeCharacterIds) ? d.activeCharacterIds : undefined
+  );
+
+  try {
+    await updateDoc(roomRef, {
+      ...d,
+      slots,
+      activeCharacterIds,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+    await updateUserPresence('in_room', roomCode);
+    return mapDocToRoomState({
+      ...d,
+      slots,
+      activeCharacterIds,
+      lastActivityMs: Date.now(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
+  }
+}
+
+export async function selectRoomCharacter(
+  roomCode: string,
+  targetCharacterId: string
+): Promise<{ ok: boolean; message?: string }> {
+  const user = await ensureAuthenticated();
+  const roomRef = doc(db, 'rooms', roomCode);
+  const snap = await getDoc(roomRef);
+  if (!snap.exists()) return { ok: false, message: 'Sala não existe mais.' };
+
+  const d = snap.data();
+  const roomMode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
+  const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+  const targetSlot = slots[targetCharacterId];
+
+  if (!targetSlot) return { ok: false, message: 'Personagem inválido.' };
+  if (!targetSlot.isBot && targetSlot.uid !== user.uid) {
+    return {
+      ok: false,
+      message: `${targetSlot.characterName} já foi escolhido por ${targetSlot.displayName}!`,
+    };
+  }
+
+  // Em 2v2, garante no máximo 2 humanos na mesma equipe
+  if (roomMode === '2v2') {
+    const teamHumansExcludingMe = Object.values(slots).filter(
+      (s) => s.team === targetSlot.team && !s.isBot && s.uid && s.uid !== user.uid
+    ).length;
+    if (teamHumansExcludingMe >= 2) {
+      return {
+        ok: false,
+        message: 'Esta equipe já possui 2 jogadores humanos na modalidade 2 contra 2.',
+      };
+    }
+  }
+
+  const mySnap = await getDoc(doc(db, 'users', user.uid));
+  const myName = mySnap.exists()
+    ? String(mySnap.data().displayName || 'Jogador').slice(0, 28)
+    : (user.displayName || 'Jogador').slice(0, 28);
+
+  let myMicEnabled = false;
+  let myReady = true;
+
+  // Libera meu slot anterior de volta para Bot
+  for (const key of Object.keys(slots)) {
+    if (slots[key].uid === user.uid) {
+      myMicEnabled = Boolean(slots[key].micEnabled);
+      myReady = slots[key].isReady !== false;
+      slots[key] = convertSlotToBot(slots[key]);
+    }
+  }
+
+  // Assume o novo personagem
+  slots[targetCharacterId] = {
+    ...targetSlot,
+    uid: user.uid,
+    displayName: myName,
+    isBot: false,
+    isReady: myReady,
+    pingMs: 20,
+    micEnabled: myMicEnabled,
+    isSpeaking: false,
+    lastSeenMs: Date.now(),
+  };
+
+  const activeCharacterIds = resolveActiveCharacterIdsForRoom(slots, roomMode);
+
+  try {
+    await updateDoc(roomRef, {
+      ...d,
+      slots,
+      activeCharacterIds,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+    return { ok: true };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
+  }
+}
+
+export async function togglePlayerReadyInRoom(roomCode: string, ready?: boolean): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !roomCode) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  const snap = await getDoc(roomRef);
+  if (!snap.exists()) return;
+
+  const d = snap.data();
+  const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+  let changed = false;
+
+  for (const key of Object.keys(slots)) {
+    if (slots[key].uid === user.uid) {
+      const nextReady = ready !== undefined ? ready : !slots[key].isReady;
+      slots[key] = {
+        ...slots[key],
+        isReady: nextReady,
+        lastSeenMs: Date.now(),
+      };
+      changed = true;
+    }
+  }
+
+  if (!changed) return;
+
+  try {
+    await updateDoc(roomRef, {
+      ...d,
+      slots,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function updatePlayerVoiceStatusInRoom(
+  roomCode: string,
+  micEnabled: boolean,
+  isSpeaking: boolean
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !roomCode) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+    let changed = false;
+    for (const key of Object.keys(slots)) {
+      if (slots[key].uid === user.uid) {
+        if (slots[key].micEnabled !== micEnabled || slots[key].isSpeaking !== isSpeaking) {
+          slots[key] = {
+            ...slots[key],
+            micEnabled,
+            isSpeaking,
+            lastSeenMs: Date.now(),
+          };
+          changed = true;
+        }
+      }
+    }
+    if (changed) {
+      await updateDoc(roomRef, {
+        ...d,
+        slots,
+        lastActivityMs: Date.now(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch {
+    // Ignore transient conflict
+  }
+}
+
+export async function sendRoomHeartbeat(roomCode: string): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !roomCode) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    if (d.status === 'finished') return;
+
+    const nowMs = Date.now();
+    const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+    for (const key of Object.keys(slots)) {
+      if (slots[key].uid === user.uid) {
+        slots[key] = {
+          ...slots[key],
+          lastSeenMs: nowMs,
+        };
+      }
+    }
+
+    await updateDoc(roomRef, {
+      ...d,
+      slots,
+      lastActivityMs: nowMs,
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    // Ignore heartbeat race
   }
 }
 
 /**
- * Records a completed match in `/matchHistory` matching `isValidMatchRecord` in `firestore.rules`.
+ * Remove o jogador da sala, libera seu personagem para um Bot, transfere a liderança
+ * caso o criador saia e encerra/deleta imediatamente a sala caso não restem jogadores humanos.
  */
-export async function recordMatchHistory(params: {
-  roomCode: string;
-  homeTeamName: string;
-  awayTeamName: string;
-  homeGoals: number;
-  awayGoals: number;
-  mvpName: string;
-}): Promise<void> {
-  const currentUid = auth.currentUser?.uid;
-  if (!currentUid) return;
+export async function leaveOnlineRoom(roomCode: string): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !roomCode) return;
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', normalizedCode);
 
-  await ensureAuthenticatedUser();
-
-  const matchId = `${currentUid}_${Date.now()}`;
-  const ref = doc(db, 'matchHistory', matchId);
   try {
-    await setDoc(ref, {
-      roomCode: (params.roomCode || 'LOCAL').slice(0, 12),
-      recordedByUid: currentUid,
-      homeTeamName: params.homeTeamName.slice(0, 32),
-      awayTeamName: params.awayTeamName.slice(0, 32),
-      homeGoals: Math.max(0, Math.min(99, params.homeGoals)),
-      awayGoals: Math.max(0, Math.min(99, params.awayGoals)),
-      mvpPlayer: (params.mvpName || 'Yuri').slice(0, 32),
-      createdAt: serverTimestamp(),
-    });
-  } catch (err) {
-    handleFirestoreError(err, OperationType.CREATE, `matchHistory/${matchId}`);
+    const snap = await getDoc(roomRef);
+    if (snap.exists()) {
+      const d = snap.data();
+      const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+
+      for (const key of Object.keys(slots)) {
+        if (slots[key].uid === user.uid) {
+          slots[key] = convertSlotToBot(slots[key]);
+        }
+      }
+
+      const remainingHumans = Object.values(slots).filter((s) => !s.isBot && s.uid);
+
+      if (remainingHumans.length === 0) {
+        // Quando o último jogador sair, encerrar e deletar a sala para nunca ficar fantasma
+        await deleteDoc(roomRef);
+      } else {
+        let nextHostUid = String(d.hostUid);
+        let nextHostName = String(d.hostName);
+
+        // Se o criador sair da sala, transfere a liderança para outro jogador conectado
+        if (d.hostUid === user.uid) {
+          nextHostUid = String(remainingHumans[0].uid);
+          nextHostName = String(remainingHumans[0].displayName || 'Anfitrião').slice(0, 28);
+        }
+
+        const roomMode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
+        const activeCharacterIds = resolveActiveCharacterIdsForRoom(
+          slots,
+          roomMode,
+          Array.isArray(d.activeCharacterIds) ? d.activeCharacterIds : undefined
+        );
+
+        await updateDoc(roomRef, {
+          ...d,
+          hostUid: nextHostUid,
+          hostName: nextHostName,
+          slots,
+          activeCharacterIds,
+          lastActivityMs: Date.now(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+    await updateUserPresence('online', '');
+  } catch {
+    // Ignore cleanup errors
   }
 }
 
-export { onAuthStateChanged, onSnapshot, doc, collection, query, where };
-export type { OnlineUserProfile };
-export const FIREBASE_PROJECT_INFO = {
-  projectId: firebaseConfig.projectId,
-  databaseId: firebaseConfig.firestoreDatabaseId,
-};
+/**
+ * Varre salas públicas/privadas para limpar jogadores que fecharam a aba sem aviso
+ * e remover salas abandonadas sem nenhum humano ativo.
+ */
+export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
+  if (!auth.currentUser) return;
+  try {
+    const q = query(collection(db, 'rooms'), limit(25));
+    const snap = await getDocs(q);
+    const nowMs = Date.now();
+    const ROOM_ABANDON_TIMEOUT_MS = 45000;
+    const SLOT_STALE_TIMEOUT_MS = 35000;
+
+    for (const docSnap of snap.docs) {
+      const d = docSnap.data();
+      if (d.status === 'finished') {
+        await deleteDoc(docSnap.ref).catch(() => {});
+        continue;
+      }
+
+      const updatedMs =
+        typeof d.lastActivityMs === 'number'
+          ? d.lastActivityMs
+          : d.updatedAt instanceof Timestamp
+          ? d.updatedAt.toMillis()
+          : nowMs;
+
+      // Sala inteira sem atividade há mais de 45s
+      if (nowMs - updatedMs > ROOM_ABANDON_TIMEOUT_MS) {
+        await deleteDoc(docSnap.ref).catch(() => {});
+        continue;
+      }
+
+      const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+      let slotsChanged = false;
+
+      for (const key of Object.keys(slots)) {
+        const slot = slots[key];
+        if (!slot.isBot && slot.uid && slot.lastSeenMs && nowMs - slot.lastSeenMs > SLOT_STALE_TIMEOUT_MS) {
+          slots[key] = convertSlotToBot(slot);
+          slotsChanged = true;
+        }
+      }
+
+      const remainingHumans = Object.values(slots).filter((s) => !s.isBot && s.uid);
+      if (remainingHumans.length === 0) {
+        await deleteDoc(docSnap.ref).catch(() => {});
+      } else if (slotsChanged) {
+        let nextHostUid = String(d.hostUid);
+        let nextHostName = String(d.hostName);
+        if (!remainingHumans.some((h) => h.uid === nextHostUid)) {
+          nextHostUid = String(remainingHumans[0].uid);
+          nextHostName = String(remainingHumans[0].displayName || 'Anfitrião').slice(0, 28);
+        }
+        await updateDoc(docSnap.ref, {
+          ...d,
+          hostUid: nextHostUid,
+          hostName: nextHostName,
+          slots,
+          lastActivityMs: nowMs,
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      }
+    }
+  } catch {
+    // Non-fatal background sweep
+  }
+}
+
+export async function startOnlineMatch(roomCode: string): Promise<void> {
+  const user = await ensureAuthenticated();
+  const roomRef = doc(db, 'rooms', roomCode);
+  const snap = await getDoc(roomRef);
+  if (!snap.exists()) return;
+  const d = snap.data();
+  if (d.hostUid !== user.uid) return;
+
+  const roomMode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
+  const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+  const activeCharacterIds = resolveActiveCharacterIdsForRoom(
+    slots,
+    roomMode,
+    Array.isArray(d.activeCharacterIds) ? d.activeCharacterIds : undefined
+  );
+
+  try {
+    await updateDoc(roomRef, {
+      ...d,
+      status: 'playing',
+      activeCharacterIds,
+      loadingReadyUids: [user.uid],
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+    await updateUserPresence('playing', roomCode);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
+  }
+}
+
+export async function markPlayerMatchLoadingReady(roomCode: string): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !roomCode) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    const readyList = Array.isArray(d.loadingReadyUids) ? [...d.loadingReadyUids] : [];
+    if (!readyList.includes(user.uid)) {
+      readyList.push(user.uid);
+      await updateDoc(roomRef, {
+        ...d,
+        loadingReadyUids: readyList,
+        lastActivityMs: Date.now(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch {
+    // Ignore transient race
+  }
+}
+
+export async function publishHostMatchSnapshot(
+  roomCode: string,
+  snapshot: MultiplayerMatchSnapshot
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    if (d.hostUid !== user.uid || d.status === 'finished') return;
+
+    await updateDoc(roomRef, {
+      ...d,
+      homeGoals: snapshot.homeGoals,
+      awayGoals: snapshot.awayGoals,
+      half: snapshot.half,
+      remainingSeconds: Math.max(0, Math.floor(snapshot.remainingSeconds)),
+      matchSnapshot: snapshot,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    // Ignore high-frequency sync conflict
+  }
+}
+
+export interface ClientInputState {
+  moveX: number;
+  moveZ: number;
+  sprint: boolean;
+  action: 'none' | 'pass' | 'shoot' | 'tackle';
+  kickPower: number;
+  timestamp: number;
+}
+
+export async function publishClientInput(
+  roomCode: string,
+  input: ClientInputState
+): Promise<void> {
+  const user = auth.currentUser;
+  if (!user) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    if (d.status === 'finished') return;
+    const inputs = { ...(d.inputs || {}), [user.uid]: input };
+    await updateDoc(roomRef, {
+      ...d,
+      inputs,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    // Ignore transient network lag
+  }
+}
+
+export function subscribeToRoom(
+  roomCode: string,
+  cb: (
+    room: (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null
+  ) => void
+): () => void {
+  const roomRef = doc(db, 'rooms', roomCode);
+  return onSnapshot(
+    roomRef,
+    (snap) => {
+      if (!snap.exists()) {
+        cb(null);
+        return;
+      }
+      const d = snap.data();
+      cb({
+        ...mapDocToRoomState(d),
+        inputs: (d.inputs as Record<string, ClientInputState>) || {},
+      });
+    },
+    (err) => {
+      console.warn('Error listening to room:', err);
+      cb(null);
+    }
+  );
+}
+
+export function subscribeToPublicRooms(cb: (rooms: MultiplayerRoomState[]) => void): () => void {
+  const q = query(collection(db, 'rooms'), limit(30));
+  return onSnapshot(
+    q,
+    (snap) => {
+      const list: MultiplayerRoomState[] = [];
+      const nowMs = Date.now();
+      snap.forEach((docSnap) => {
+        const d = docSnap.data();
+        if (d.status === 'finished') return;
+        const room = mapDocToRoomState(d);
+        // Oculta salas sem atividade recente (> 50s)
+        if (room.lastActivityMs && nowMs - room.lastActivityMs > 50000) return;
+        list.push(room);
+      });
+      list.sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
+      cb(list);
+    },
+    (err) => {
+      console.warn('Error listing public rooms:', err);
+    }
+  );
+}
+
+/**
+ * Registra apenas partidas devidamente concluídas (fulltime), atualizando
+ * vitórias, derrotas, empates, gols marcados, gols sofridos e partidas jogadas.
+ */
+export async function recordMatchFinished(
+  roomCode: string,
+  homeTeamName: string,
+  awayTeamName: string,
+  homeGoals: number,
+  awayGoals: number,
+  participantUids: string[],
+  myTeam: 'home' | 'away' = 'home',
+  isLegitimateFulltime: boolean = true
+): Promise<void> {
+  if (!isLegitimateFulltime) return;
+  const user = auth.currentUser;
+  if (!user) return;
+
+  const winner: 'home' | 'away' | 'draw' =
+    homeGoals > awayGoals ? 'home' : awayGoals > homeGoals ? 'away' : 'draw';
+
+  try {
+    if (roomCode) {
+      await addDoc(collection(db, 'matchHistory'), {
+        roomCode: roomCode.slice(0, 16),
+        hostUid: user.uid,
+        homeTeamName: homeTeamName.slice(0, 60),
+        awayTeamName: awayTeamName.slice(0, 60),
+        homeGoals,
+        awayGoals,
+        winner,
+        participantUids: participantUids.length > 0 ? participantUids.slice(0, 16) : [user.uid],
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    // Atualiza estatísticas de carreira do jogador local
+    const userRef = doc(db, 'users', user.uid);
+    const userSnap = await getDoc(userRef);
+    if (userSnap.exists()) {
+      const d = userSnap.data();
+      const didWin = winner === myTeam;
+      const didLose = winner !== 'draw' && winner !== myTeam;
+      const didDraw = winner === 'draw';
+      const myTeamGoals = myTeam === 'home' ? homeGoals : awayGoals;
+      const opponentGoals = myTeam === 'home' ? awayGoals : homeGoals;
+
+      await updateDoc(userRef, {
+        uid: d.uid,
+        displayName: d.displayName,
+        tagCode: d.tagCode,
+        status: 'online',
+        currentRoomCode: '',
+        friends: d.friends || [],
+        wins: (d.wins || 0) + (didWin ? 1 : 0),
+        losses: (d.losses || 0) + (didLose ? 1 : 0),
+        draws: (d.draws || 0) + (didDraw ? 1 : 0),
+        goalsScored: (d.goalsScored || 0) + myTeamGoals,
+        goalsConceded: (d.goalsConceded || 0) + opponentGoals,
+        matchesPlayed: (d.matchesPlayed || 0) + 1,
+        createdAt: d.createdAt,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch {
+    // Non-fatal history log
+  }
+}
+
+export function getCurrentAuthUser(): User | null {
+  return auth.currentUser;
+}
+
+export { ALL_CHARACTERS, arrayRemove };

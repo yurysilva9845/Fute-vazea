@@ -32,8 +32,10 @@ const HAIR_LABELS: Record<HairStyle, string> = {
   short_fade: 'Degradê Curto',
   curly: 'Cacheado',
   bald: 'Careca Raiz',
+  receding_careca: 'Calvo Lateral',
   afro: 'Black / Cavanhaque',
   buzz: 'Raspado Baixo',
+  bucket_hat_josue: 'Chapéu Pescador (Josué)',
   cap_orange: 'Boné Laranja',
   cap_black: 'Boné Preto',
 };
@@ -125,13 +127,13 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
       <div className="flex flex-col lg:flex-row items-start justify-between gap-6 w-full max-w-7xl mx-auto my-auto">
         {/* Left Negative-Space Column: Bespoke SVG Emblem + Roster + Menu CTAs */}
         <div className="pointer-events-auto flex flex-col items-start max-w-lg w-full">
-          {/* Bespoke Inline SVG Title Emblem */}
+          {/* Bespoke Inline SVG Title Emblem — SEM TERRA FC VÁRZEA 4x4 */}
           <div className="mb-3 w-full">
             <svg
               viewBox="0 0 460 128"
-              className="w-full max-w-[410px] h-auto drop-shadow-[0_6px_16px_rgba(0,0,0,0.85)]"
+              className="w-full max-w-[420px] h-auto drop-shadow-[0_6px_16px_rgba(0,0,0,0.85)]"
               role="img"
-              aria-label="Várzea Raiz 4x4"
+              aria-label="SEM TERRA FC Várzea 4x4"
             >
               <path
                 d="M12 20 L438 12 L448 92 L20 104 Z"
@@ -145,7 +147,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                 stroke="#78350f"
                 strokeWidth="1.5"
               />
-              <g transform="translate(54, 58)">
+              <g transform="translate(52, 58)">
                 <circle
                   cx="0"
                   cy="0"
@@ -165,16 +167,16 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                 />
               </g>
               <text
-                x="96"
+                x="92"
                 y="62"
                 fill="#fef3c7"
                 fontFamily="'Barlow Condensed', sans-serif"
                 fontWeight="800"
                 fontStyle="italic"
-                fontSize="50"
-                letterSpacing="1.5"
+                fontSize="44"
+                letterSpacing="1.2"
               >
-                VÁRZEA RAIZ
+                SEM TERRA FC
               </text>
               <rect
                 x="352"
@@ -196,22 +198,23 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                 4x4
               </text>
               <text
-                x="98"
+                x="94"
                 y="84"
                 fill="#fbbf24"
                 fontFamily="'Plus Jakarta Sans', sans-serif"
                 fontWeight="700"
-                fontSize="12"
-                letterSpacing="2.2"
+                fontSize="11.5"
+                letterSpacing="2.0"
               >
-                TERRA BATIDA · PC &amp; MOBILE ONLINE
+                VÁRZEA 4x4 · 2v2 &amp; 4v4 MULTIPLAYER ONLINE
               </text>
             </svg>
           </div>
 
           <p className="text-stone-300 text-xs sm:text-sm leading-relaxed mb-4 max-w-md">
-            O campinho de barro real com poças d&apos;água, muros de tijolo,
-            comemorações personalizadas, vozes da várzea e multiplayer online!
+            O campinho de barro real com poças d&apos;água, travinhas de mini
+            campo, skins fiéis e multiplayer online 2v2 e 4v4 com voz em tempo
+            real!
           </p>
 
           {/* Team 1 & Team 2 Squad Roster Summary */}
@@ -682,7 +685,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                     </div>
                   </div>
 
-                  {/* 4 Independent Volume Sliders: Efeitos Sonoros, Vozes, Ambiente, Música */}
+                  {/* 3 Independent Volume Sliders: Efeitos Sonoros, Ambiente, Música */}
                   <div className="pt-2 border-t border-stone-800 space-y-2.5">
                     <div>
                       <div className="flex justify-between mb-1">
@@ -702,30 +705,6 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
                         onChange={(e) =>
                           onUpdateSettings({
                             sfxVolume: Number(e.target.value),
-                          })
-                        }
-                        className="w-full accent-amber-500"
-                      />
-                    </div>
-
-                    <div>
-                      <div className="flex justify-between mb-1">
-                        <span className="text-stone-300 font-medium">
-                          Volume: Vozes dos Jogadores (Falas na Partida)
-                        </span>
-                        <span className="font-mono text-amber-400">
-                          {Math.round((settings.voiceVolume ?? 0.9) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        value={settings.voiceVolume ?? 0.9}
-                        onChange={(e) =>
-                          onUpdateSettings({
-                            voiceVolume: Number(e.target.value),
                           })
                         }
                         className="w-full accent-amber-500"

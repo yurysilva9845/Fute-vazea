@@ -4,8 +4,10 @@ import {
   GameScreenState,
   GameSettings,
   MatchStats,
+  MultiplayerRoomState,
   TeamConfig,
 } from '../types/game';
+import { VoiceControlsBar } from './VoiceControlsBar';
 
 interface StatusModalsProps {
   screenState: GameScreenState;
@@ -13,6 +15,7 @@ interface StatusModalsProps {
   awayTeam: TeamConfig;
   stats: MatchStats;
   settings: GameSettings;
+  activeRoom?: MultiplayerRoomState | null;
   onResume: () => void;
   onRestart: () => void;
   onBackToTitle: () => void;
@@ -25,6 +28,7 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
   awayTeam,
   stats,
   settings,
+  activeRoom = null,
   onResume,
   onRestart,
   onBackToTitle,
@@ -44,29 +48,41 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
   const isVictory = stats.homeGoals > stats.awayGoals;
   const isDraw = stats.homeGoals === stats.awayGoals;
 
+  const roomParticipants = activeRoom
+    ? Object.values(activeRoom.slots || {}).filter((s) =>
+        activeRoom.activeCharacterIds
+          ? activeRoom.activeCharacterIds.includes(s.characterId)
+          : true
+      )
+    : [];
+
   return (
-    <div className="pointer-events-auto fixed inset-0 z-30 flex items-center justify-center p-4 bg-stone-950/80">
+    <div className="pointer-events-auto fixed inset-0 z-30 flex items-center justify-center p-4 bg-stone-950/85 backdrop-blur-sm overflow-y-auto">
       {screenState === 'paused' && (
         <div
           role="dialog"
           aria-modal="true"
           aria-labelledby="pause-modal-title"
-          className="w-full max-w-md bg-stone-950 border-2 border-stone-800 rounded-2xl p-6 shadow-2xl text-stone-100"
+          className="w-full max-w-md bg-stone-950 border-2 border-stone-800 rounded-2xl p-6 shadow-2xl text-stone-100 space-y-4"
         >
-          <div className="text-center mb-5">
+          <div className="text-center">
             <span className="text-xs font-bold uppercase tracking-widest text-amber-400">
-              Várzea Raiz 4x4
+              SEM TERRA FC · VÁRZEA {activeRoom?.mode === '2v2' ? '2x2' : '4x4'}
             </span>
             <h2
               id="pause-modal-title"
               className="text-2xl font-extrabold text-white mt-1"
             >
-              Partida Pausada
+              Menu da Partida
             </h2>
           </div>
 
+          {activeRoom && (
+            <VoiceControlsBar roomCode={activeRoom.roomCode} />
+          )}
+
           {/* Camera & Distance Quick Controls */}
-          <div className="space-y-3 bg-stone-900/90 border border-stone-800 rounded-xl p-4 mb-6 text-xs">
+          <div className="space-y-3 bg-stone-900/90 border border-stone-800 rounded-xl p-4 text-xs">
             <div className="flex items-center justify-between">
               <span className="text-stone-300 font-semibold">Visão da Câmera</span>
               <div className="flex gap-1">
@@ -81,7 +97,7 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
                     key={m}
                     type="button"
                     onClick={() => onUpdateSettings({ cameraMode: m })}
-                    className={`px-2.5 py-1 rounded font-bold ${
+                    className={`px-2.5 py-1 rounded font-bold cursor-pointer ${
                       settings.cameraMode === m
                         ? 'bg-amber-500 text-stone-950'
                         : 'bg-stone-800 text-stone-300 hover:text-white'
@@ -109,7 +125,7 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
                     cameraDistance: parseFloat(e.target.value),
                   })
                 }
-                className="w-32 accent-amber-500"
+                className="w-32 accent-amber-500 cursor-pointer"
               />
             </div>
           </div>
@@ -120,21 +136,30 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
               onClick={onResume}
               className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-stone-950 font-extrabold text-sm rounded-xl transition-colors cursor-pointer"
             >
-              CONTINUAR PARTIDA
+              CONTINUAR JOGANDO
             </button>
+            {!activeRoom && (
+              <button
+                type="button"
+                onClick={onRestart}
+                className="w-full py-2.5 bg-stone-800 hover:bg-stone-700 text-stone-100 font-bold text-sm rounded-xl transition-colors cursor-pointer"
+              >
+                REINICIAR PARTIDA
+              </button>
+            )}
             <button
               type="button"
-              onClick={onRestart}
-              className="w-full py-2.5 bg-stone-800 hover:bg-stone-700 text-stone-100 font-bold text-sm rounded-xl transition-colors cursor-pointer"
+              onClick={onBackToTitle}
+              className="w-full py-2.5 bg-red-950/80 hover:bg-red-900 text-red-200 border border-red-800/80 font-extrabold text-sm rounded-xl transition-colors cursor-pointer"
             >
-              REINICIAR PARTIDA
+              SAIR DA PARTIDA
             </button>
             <button
               type="button"
               onClick={onBackToTitle}
               className="w-full py-2.5 bg-stone-900 hover:bg-stone-800 text-stone-400 hover:text-stone-200 font-semibold text-sm rounded-xl border border-stone-800 transition-colors cursor-pointer"
             >
-              MENU INICIAL
+              VOLTAR AO MENU PRINCIPAL
             </button>
           </div>
         </div>
@@ -145,11 +170,11 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
           role="dialog"
           aria-modal="true"
           aria-labelledby="gameover-modal-title"
-          className="w-full max-w-lg bg-stone-950 border-2 border-amber-500/60 rounded-2xl p-6 shadow-2xl text-stone-100"
+          className="w-full max-w-lg bg-stone-950 border-2 border-amber-500/60 rounded-2xl p-6 shadow-2xl text-stone-100 space-y-4"
         >
-          <div className="text-center mb-5">
+          <div className="text-center">
             <span className="text-xs font-bold uppercase tracking-widest text-amber-400">
-              Apito Final no Terreirão
+              SEM TERRA FC · APITO FINAL NO TERREIRÃO
             </span>
             <h2
               id="gameover-modal-title"
@@ -171,7 +196,7 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
           </div>
 
           {/* Final Scoreboard Box */}
-          <div className="flex items-center justify-around bg-stone-900 border border-stone-800 rounded-xl p-4 mb-5">
+          <div className="flex items-center justify-around bg-stone-900 border border-stone-800 rounded-xl p-4">
             <div className="text-center">
               <div className="text-xs font-bold text-amber-400 uppercase">
                 {homeTeam.name}
@@ -191,8 +216,49 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
             </div>
           </div>
 
+          {/* Goal Scorers Summary */}
+          {stats.scorers && stats.scorers.length > 0 && (
+            <div className="bg-stone-900/80 border border-stone-800 rounded-xl p-3 text-xs space-y-1">
+              <div className="font-bold text-amber-400 uppercase text-[10px] tracking-wider">
+                Gols Marcados na Partida
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {stats.scorers.map((sc, idx) => (
+                  <span
+                    key={`${sc.playerName}-${idx}`}
+                    className="px-2 py-0.5 rounded bg-stone-950 border border-stone-800 text-stone-200 font-semibold"
+                  >
+                    ⚽ {sc.playerName} ({sc.timeFormatted} · {sc.half}ºT)
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Participating Players in Online Room */}
+          {roomParticipants.length > 0 && (
+            <div className="bg-stone-900/80 border border-stone-800 rounded-xl p-3 text-xs space-y-1.5">
+              <div className="font-bold text-stone-300 uppercase text-[10px] tracking-wider">
+                Jogadores Participantes ({activeRoom?.mode === '2v2' ? '2v2' : '4v4'})
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {roomParticipants.map((slot) => (
+                  <div
+                    key={slot.characterId}
+                    className="px-2 py-1 rounded bg-stone-950 border border-stone-800 flex items-center justify-between text-[11px]"
+                  >
+                    <span className="font-bold text-white">{slot.characterName}</span>
+                    <span className="text-stone-400 truncate max-w-[90px]">
+                      {slot.isBot ? 'Bot IA' : slot.displayName}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Tabular Match Statistics */}
-          <div className="space-y-2.5 bg-stone-900/70 border border-stone-800/80 rounded-xl p-4 mb-6 text-xs">
+          <div className="space-y-2 bg-stone-900/70 border border-stone-800/80 rounded-xl p-3.5 text-xs">
             <div className="flex items-center justify-between font-mono tabular-nums">
               <span className="font-bold text-amber-400">{stats.homeShots}</span>
               <span className="font-sans text-stone-400">Finalizações</span>
@@ -229,7 +295,7 @@ export const StatusModals: React.FC<StatusModalsProps> = ({
               onClick={onBackToTitle}
               className="py-3 px-5 bg-stone-800 hover:bg-stone-700 text-stone-200 font-bold text-sm rounded-xl transition-colors cursor-pointer"
             >
-              MENU INICIAL
+              VOLTAR AO MENU
             </button>
           </div>
         </div>

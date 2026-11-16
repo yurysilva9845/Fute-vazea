@@ -10,6 +10,7 @@ import { formatMatchTime } from '../game/rules';
 import { VarzeaInputManager } from '../game/controls';
 import { LiveHUDUpdate } from '../game/MatchCanvas';
 import { audioEngine } from '../game/audio';
+import { VoiceControlsBar } from './VoiceControlsBar';
 
 interface GameplayHUDProps {
   homeTeam: TeamConfig;
@@ -473,16 +474,23 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             tabIndex={-1}
             onClick={(e) => {
               e.currentTarget.blur();
-              onBackToMenu();
+              onPause();
             }}
-            title="Voltar ao Menu Principal"
-            aria-label="Voltar ao Menu Principal"
+            title="Menu da Partida"
+            aria-label="Menu da Partida"
             className="px-2.5 h-9 sm:h-10 flex items-center justify-center bg-stone-950/90 hover:bg-stone-800 text-stone-300 border border-stone-800 rounded-xl text-[11px] font-bold transition-colors cursor-pointer"
           >
             Menu
           </button>
         </div>
       </div>
+
+      {/* Online WebRTC Voice Chat Quick Bar during Match */}
+      {activeRoom && (
+        <div className="w-full max-w-7xl mx-auto mt-1 flex justify-end">
+          <VoiceControlsBar roomCode={activeRoom.roomCode} compact />
+        </div>
+      )}
 
       {/* Center Callout Banner for Goals / Lateral Throw-ins / Halftime */}
       <div
