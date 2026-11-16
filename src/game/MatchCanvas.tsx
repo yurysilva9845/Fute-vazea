@@ -240,7 +240,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2)
     );
     renderer.shadowMap.enabled = !isSoftwareGl;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.setSize(
       container.clientWidth || window.innerWidth,
       container.clientHeight || window.innerHeight

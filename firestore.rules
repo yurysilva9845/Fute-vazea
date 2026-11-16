@@ -21,6 +21,14 @@ service cloud.firestore {
       return resource.data;
     }
 
+    function isValidTimestampOrInt(val) {
+      return val is timestamp || val is int || val is float;
+    }
+
+    function isValidNumberInRange(val, minVal, maxVal) {
+      return (val is int || val is float) && val >= minVal && val <= maxVal;
+    }
+
     function isValidUserProfile(data, userId) {
       return data.keys().hasAll([
           'uid', 'displayName', 'tagCode', 'status', 'currentRoomCode',
@@ -34,19 +42,19 @@ service cloud.firestore {
           'updatedAt', 'createdAt'
         ])
         && data.uid is string && data.uid == userId
-        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 32
-        && data.tagCode is string && data.tagCode.size() >= 3 && data.tagCode.size() <= 16
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 64
+        && data.tagCode is string && data.tagCode.size() >= 2 && data.tagCode.size() <= 24
         && data.status in ['online', 'in_room', 'playing', 'offline']
-        && data.currentRoomCode is string && data.currentRoomCode.size() <= 16
-        && data.friends is list && data.friends.size() <= 200
-        && data.wins is int && data.wins >= 0 && data.wins <= 100000
-        && data.losses is int && data.losses >= 0 && data.losses <= 100000
-        && data.draws is int && data.draws >= 0 && data.draws <= 100000
-        && data.goalsScored is int && data.goalsScored >= 0 && data.goalsScored <= 500000
-        && (!('goalsConceded' in data) || (data.goalsConceded is int && data.goalsConceded >= 0 && data.goalsConceded <= 500000))
-        && (!('matchesPlayed' in data) || (data.matchesPlayed is int && data.matchesPlayed >= 0 && data.matchesPlayed <= 300000))
-        && data.updatedAt is timestamp
-        && data.createdAt is timestamp;
+        && data.currentRoomCode is string && data.currentRoomCode.size() <= 32
+        && data.friends is list && data.friends.size() <= 500
+        && isValidNumberInRange(data.wins, 0, 100000)
+        && isValidNumberInRange(data.losses, 0, 100000)
+        && isValidNumberInRange(data.draws, 0, 100000)
+        && isValidNumberInRange(data.goalsScored, 0, 500000)
+        && (!('goalsConceded' in data) || isValidNumberInRange(data.goalsConceded, 0, 500000))
+        && (!('matchesPlayed' in data) || isValidNumberInRange(data.matchesPlayed, 0, 300000))
+        && isValidTimestampOrInt(data.updatedAt)
+        && isValidTimestampOrInt(data.createdAt);
     }
 
     function isValidMultiplayerRoom(data, roomId) {
@@ -63,33 +71,33 @@ service cloud.firestore {
           'half', 'remainingSeconds', 'slots', 'inputs', 'matchSnapshot',
           'updatedAt', 'createdAt'
         ])
-        && data.roomCode is string && data.roomCode == roomId && data.roomCode.size() >= 4 && data.roomCode.size() <= 16
+        && data.roomCode is string && data.roomCode == roomId && data.roomCode.size() >= 4 && data.roomCode.size() <= 24
         && (!('matchId' in data) || data.matchId == null || (data.matchId is string && data.matchId.size() <= 32))
-        && (!('roomName' in data) || (data.roomName is string && data.roomName.size() >= 1 && data.roomName.size() <= 64))
+        && (!('roomName' in data) || (data.roomName is string && data.roomName.size() >= 1 && data.roomName.size() <= 80))
         && (!('mode' in data) || (data.mode in ['2v2', '4v4']))
         && (!('visibility' in data) || (data.visibility in ['public', 'private']))
         && (!('hasPassword' in data) || (data.hasPassword is bool))
         && (!('passwordHash' in data) || data.passwordHash == null || (data.passwordHash is string && data.passwordHash.size() <= 128))
-        && (!('maxHumans' in data) || (data.maxHumans is int && data.maxHumans >= 1 && data.maxHumans <= 8))
+        && (!('maxHumans' in data) || isValidNumberInRange(data.maxHumans, 1, 8))
         && (!('autoFillBots' in data) || (data.autoFillBots is bool))
-        && (!('activeCharacterIds' in data) || (data.activeCharacterIds is list && data.activeCharacterIds.size() >= 2 && data.activeCharacterIds.size() <= 8))
+        && (!('activeCharacterIds' in data) || (data.activeCharacterIds is list && data.activeCharacterIds.size() >= 1 && data.activeCharacterIds.size() <= 8))
         && (!('loadingReadyUids' in data) || (data.loadingReadyUids is list && data.loadingReadyUids.size() <= 16))
-        && (!('startAt' in data) || data.startAt == null || (data.startAt is int && data.startAt >= 0))
-        && (!('lastActivityMs' in data) || (data.lastActivityMs is int && data.lastActivityMs >= 0))
+        && (!('startAt' in data) || data.startAt == null || isValidNumberInRange(data.startAt, 0, 99999999999999))
+        && (!('lastActivityMs' in data) || isValidNumberInRange(data.lastActivityMs, 0, 99999999999999))
         && data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128
         && data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 32
         && data.status in ['waiting', 'starting', 'playing', 'finished']
         && data.homeTeamId is string && data.homeTeamId.size() >= 1 && data.homeTeamId.size() <= 64
         && data.awayTeamId is string && data.awayTeamId.size() >= 1 && data.awayTeamId.size() <= 64
-        && data.homeGoals is int && data.homeGoals >= 0 && data.homeGoals <= 99
-        && data.awayGoals is int && data.awayGoals >= 0 && data.awayGoals <= 99
+        && isValidNumberInRange(data.homeGoals, 0, 99)
+        && isValidNumberInRange(data.awayGoals, 0, 99)
         && data.half in [1, 2]
-        && data.remainingSeconds is int && data.remainingSeconds >= 0 && data.remainingSeconds <= 3600
+        && isValidNumberInRange(data.remainingSeconds, 0, 3600)
         && data.slots is map && data.slots.size() <= 16
         && (!('inputs' in data) || (data.inputs is map && data.inputs.size() <= 16))
         && (!('matchSnapshot' in data) || data.matchSnapshot == null || data.matchSnapshot is map)
-        && data.updatedAt is timestamp
-        && data.createdAt is timestamp;
+        && isValidTimestampOrInt(data.updatedAt)
+        && isValidTimestampOrInt(data.createdAt);
     }
 
     function isValidMultiplayerMatch(data, matchId) {
@@ -102,7 +110,7 @@ service cloud.firestore {
           'players', 'bots', 'score', 'ball', 'startAt', 'createdAt', 'updatedAt'
         ])
         && data.matchId is string && data.matchId == matchId && data.matchId.size() >= 4 && data.matchId.size() <= 32
-        && data.roomId is string && data.roomId.size() >= 4 && data.roomId.size() <= 16
+        && data.roomId is string && data.roomId.size() >= 4 && data.roomId.size() <= 24
         && data.hostId is string && data.hostId.size() >= 1 && data.hostId.size() <= 128
         && data.mode in ['2v2', '4v4']
         && data.status in ['waiting', 'starting', 'playing', 'finished']
@@ -110,9 +118,9 @@ service cloud.firestore {
         && data.bots is list && data.bots.size() <= 16
         && data.score is map
         && (!('ball' in data) || data.ball == null || data.ball is map)
-        && data.startAt is int && data.startAt >= 0
-        && data.createdAt is timestamp
-        && data.updatedAt is timestamp;
+        && isValidNumberInRange(data.startAt, 0, 99999999999999)
+        && isValidTimestampOrInt(data.createdAt)
+        && isValidTimestampOrInt(data.updatedAt);
     }
 
     function isValidVoiceSignal(data) {
@@ -122,7 +130,7 @@ service cloud.firestore {
         && data.toUid is string && data.toUid.size() >= 1 && data.toUid.size() <= 128
         && data.type in ['offer', 'answer', 'ice']
         && data.payload is string && data.payload.size() >= 2 && data.payload.size() <= 16384
-        && data.createdAt is timestamp;
+        && isValidTimestampOrInt(data.createdAt);
     }
 
     function isValidFriendRequest(data) {
@@ -135,16 +143,16 @@ service cloud.firestore {
           'type', 'roomCode', 'status', 'createdAt', 'updatedAt'
         ])
         && data.fromUid is string && data.fromUid.size() >= 1 && data.fromUid.size() <= 128
-        && data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 32
-        && data.fromTag is string && data.fromTag.size() >= 3 && data.fromTag.size() <= 16
+        && data.fromName is string && data.fromName.size() >= 1 && data.fromName.size() <= 64
+        && data.fromTag is string && data.fromTag.size() >= 1 && data.fromTag.size() <= 24
         && data.toUid is string && data.toUid.size() >= 1 && data.toUid.size() <= 128
-        && data.toName is string && data.toName.size() >= 1 && data.toName.size() <= 32
+        && data.toName is string && data.toName.size() >= 1 && data.toName.size() <= 64
         && data.fromUid != data.toUid
         && data.type in ['friend_request', 'room_invite']
-        && data.roomCode is string && data.roomCode.size() <= 16
+        && data.roomCode is string && data.roomCode.size() <= 24
         && data.status in ['pending', 'accepted', 'declined']
-        && data.createdAt is timestamp
-        && data.updatedAt is timestamp;
+        && isValidTimestampOrInt(data.createdAt)
+        && isValidTimestampOrInt(data.updatedAt);
     }
 
     function isValidMatchHistory(data) {
@@ -156,15 +164,15 @@ service cloud.firestore {
           'roomCode', 'hostUid', 'homeTeamName', 'awayTeamName',
           'homeGoals', 'awayGoals', 'winner', 'participantUids', 'createdAt'
         ])
-        && data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 16
+        && data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 24
         && data.hostUid is string && data.hostUid == request.auth.uid
         && data.homeTeamName is string && data.homeTeamName.size() >= 1 && data.homeTeamName.size() <= 64
         && data.awayTeamName is string && data.awayTeamName.size() >= 1 && data.awayTeamName.size() <= 64
-        && data.homeGoals is int && data.homeGoals >= 0 && data.homeGoals <= 99
-        && data.awayGoals is int && data.awayGoals >= 0 && data.awayGoals <= 99
+        && isValidNumberInRange(data.homeGoals, 0, 99)
+        && isValidNumberInRange(data.awayGoals, 0, 99)
         && data.winner in ['home', 'away', 'draw']
         && data.participantUids is list && data.participantUids.size() >= 1 && data.participantUids.size() <= 16
-        && data.createdAt is timestamp;
+        && isValidTimestampOrInt(data.createdAt);
     }
 
     // ===============================================================
@@ -181,18 +189,17 @@ service cloud.firestore {
         && incoming().updatedAt == request.time;
 
       allow update: if (
-          // Self update: immutable uid, tagCode, createdAt
+          // Self update: owner can normalize legacy profiles while keeping uid immutable
           isOwner(userId)
           && isValidUserProfile(incoming(), userId)
-          && incoming().uid == existing().uid
-          && incoming().tagCode == existing().tagCode
-          && incoming().createdAt == existing().createdAt
+          && (!('uid' in existing()) || incoming().uid == existing().uid)
+          && (!('tagCode' in existing()) || incoming().tagCode == existing().tagCode || isOwner(userId))
           && incoming().updatedAt == request.time
         ) || (
           // Mutual friend acceptance update: another user can only append/remove their own UID in `friends`
           isAuthenticated()
-          && isValidUserProfile(incoming(), userId)
           && incoming().diff(existing()).affectedKeys().hasOnly(['friends', 'updatedAt'])
+          && incoming().friends is list && incoming().friends.size() <= 500
           && incoming().updatedAt == request.time
         );
 
@@ -216,7 +223,6 @@ service cloud.firestore {
         && isValidMultiplayerRoom(incoming(), roomId)
         && existing().status != 'finished'
         && incoming().roomCode == existing().roomCode
-        && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
           // Host can update match state, scores, phase, or transfer host on leave
@@ -261,7 +267,6 @@ service cloud.firestore {
         && isValidMultiplayerMatch(incoming(), matchId)
         && incoming().matchId == existing().matchId
         && incoming().roomId == existing().roomId
-        && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time;
 
       allow delete: if isAuthenticated();
@@ -270,7 +275,7 @@ service cloud.firestore {
     // 3. Friend Requests & Room Invites
     match /friendRequests/{requestId} {
       allow get, list: if isAuthenticated()
-        && (existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
+        && (resource == null || existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
 
       allow create: if isAuthenticated()
         && isValidFriendRequest(incoming())
@@ -282,11 +287,9 @@ service cloud.firestore {
 
       allow update: if isAuthenticated()
         && isValidFriendRequest(incoming())
-        && existing().status == 'pending'
+        && existing().status in ['pending', 'accepted']
         && incoming().fromUid == existing().fromUid
         && incoming().toUid == existing().toUid
-        && incoming().type == existing().type
-        && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
           // Recipient accepts or declines

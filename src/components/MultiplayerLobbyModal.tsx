@@ -509,12 +509,32 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     showToast(`Convite da sala ${currentRoom.roomCode} enviado para ${friend.displayName}!`);
   };
 
+  // Timeout de segurança para garantir que o overlay "ENTRANDO NA SALA..." nunca trave indefinidamente
+  useEffect(() => {
+    if (!loadingOverlayType) return;
+    const safetyTimer = window.setTimeout(() => {
+      setLoadingOverlayType(null);
+      showToast('A conexão demorou mais que o esperado. Tente novamente.', true);
+    }, 9500);
+    return () => window.clearTimeout(safetyTimer);
+  }, [loadingOverlayType]);
+
   const handleRespondRequest = async (req: FriendRequestDoc, accept: boolean) => {
-    await respondToFriendRequest(req, accept);
+    // Remove otimisticamente o convite/solicitação da lista para resposta imediata na UI
+    setIncomingRequests((prev) => prev.filter((item) => item.id !== req.id));
+
     if (accept && req.type === 'room_invite' && req.roomCode) {
+      // Dispara atualização do status do convite em background e entra imediatamente na sala
+      respondToFriendRequest(req, true).catch(() => {});
       await handleJoinRoom(req.roomCode);
-    } else {
+      return;
+    }
+
+    try {
+      await respondToFriendRequest(req, accept);
       showToast(accept ? 'Solicitação aceita!' : 'Solicitação recusada.');
+    } catch {
+      showToast('Não foi possível atualizar a solicitação agora.', true);
     }
   };
 

@@ -174,8 +174,116 @@ function notifyAuthListeners(user: User | null): void {
   authStatusListeners.forEach((cb) => cb(info));
 }
 
+function withFirestoreTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+    promise
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+function buildSanitizedRoomPayload(
+  roomCode: string,
+  d: Record<string, unknown>,
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const merged = { ...d, ...overrides };
+  const mode: MatchFormatMode = merged.mode === '2v2' ? '2v2' : '4v4';
+  const visibility: RoomVisibility = merged.visibility === 'private' ? 'private' : 'public';
+  const slots =
+    merged.slots && typeof merged.slots === 'object'
+      ? (merged.slots as Record<string, MultiplayerSlot>)
+      : {};
+  const activeCharacterIds = Array.isArray(merged.activeCharacterIds)
+    ? (merged.activeCharacterIds as string[]).slice(0, 8)
+    : resolveActiveCharacterIdsForRoom(slots, mode);
+
+  return {
+    roomCode: String(merged.roomCode || roomCode).slice(0, 16),
+    matchId:
+      typeof merged.matchId === 'string' && merged.matchId.trim().length > 0
+        ? merged.matchId.slice(0, 32)
+        : null,
+    roomName: String(merged.roomName || `SEM TERRA FC — ${roomCode}`).slice(0, 60),
+    mode,
+    visibility,
+    hasPassword: Boolean(merged.hasPassword),
+    passwordHash:
+      typeof merged.passwordHash === 'string' && merged.passwordHash.length > 0
+        ? merged.passwordHash.slice(0, 128)
+        : null,
+    maxHumans:
+      typeof merged.maxHumans === 'number'
+        ? Math.max(1, Math.min(8, Math.floor(merged.maxHumans)))
+        : mode === '2v2'
+        ? 4
+        : 8,
+    autoFillBots: merged.autoFillBots !== false,
+    activeCharacterIds,
+    loadingReadyUids: Array.isArray(merged.loadingReadyUids)
+      ? (merged.loadingReadyUids as string[]).slice(0, 16)
+      : [],
+    startAt:
+      typeof merged.startAt === 'number' && merged.startAt >= 0
+        ? Math.floor(merged.startAt)
+        : null,
+    lastActivityMs:
+      typeof merged.lastActivityMs === 'number' && merged.lastActivityMs >= 0
+        ? Math.floor(merged.lastActivityMs)
+        : Date.now(),
+    hostUid: String(merged.hostUid || '').slice(0, 128),
+    hostName: String(merged.hostName || 'Anfitrião').slice(0, 28),
+    status:
+      merged.status === 'starting' ||
+      merged.status === 'playing' ||
+      merged.status === 'finished'
+        ? merged.status
+        : 'waiting',
+    homeTeamId: String(merged.homeTeamId || 'unidos_do_barro').slice(0, 64),
+    awayTeamId: String(merged.awayTeamId || 'rubro_negro_beco').slice(0, 64),
+    homeGoals:
+      typeof merged.homeGoals === 'number' && merged.homeGoals >= 0
+        ? Math.min(99, Math.floor(merged.homeGoals))
+        : 0,
+    awayGoals:
+      typeof merged.awayGoals === 'number' && merged.awayGoals >= 0
+        ? Math.min(99, Math.floor(merged.awayGoals))
+        : 0,
+    half: merged.half === 2 ? 2 : 1,
+    remainingSeconds:
+      typeof merged.remainingSeconds === 'number' && merged.remainingSeconds >= 0
+        ? Math.min(3600, Math.floor(merged.remainingSeconds))
+        : 150,
+    slots,
+    inputs:
+      merged.inputs && typeof merged.inputs === 'object'
+        ? (merged.inputs as Record<string, unknown>)
+        : {},
+    matchSnapshot:
+      merged.matchSnapshot && typeof merged.matchSnapshot === 'object'
+        ? merged.matchSnapshot
+        : null,
+    createdAt: d.createdAt instanceof Timestamp ? d.createdAt : serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+}
+
 onAuthStateChanged(auth, async (user) => {
   if (user) {
+    notifyAuthListeners(user);
     try {
       await ensureUserProfile(user);
     } catch (e) {
@@ -223,18 +331,14 @@ export function ensureAuthenticated(): Promise<User> {
       const unsubscribe = onAuthStateChanged(auth, async (user) => {
         if (user) {
           unsubscribe();
-          try {
-            await ensureUserProfile(user);
-          } catch {
-            // Ignore transient error
-          }
           resolve(user);
+          ensureUserProfile(user).catch(() => {});
         } else {
           try {
             const cred = await signInAnonymously(auth);
             unsubscribe();
-            await ensureUserProfile(cred.user);
             resolve(cred.user);
+            ensureUserProfile(cred.user).catch(() => {});
           } catch (err) {
             unsubscribe();
             authReadyPromise = null;
@@ -395,24 +499,30 @@ async function mergeAnonymousDataIntoGoogleUser(
       (id) => id !== googleUser.uid
     );
 
-    await updateDoc(googleUserRef, {
-      uid: existing.uid,
-      displayName: (existing.displayName || preferredName).slice(0, 28),
-      tagCode: existing.tagCode,
+    await setDoc(googleUserRef, {
+      uid: googleUser.uid,
+      displayName: String(existing.displayName || preferredName).slice(0, 28),
+      tagCode:
+        typeof existing.tagCode === 'string' && existing.tagCode.length >= 2
+          ? existing.tagCode.slice(0, 20)
+          : generateTagCode(googleUser.uid),
       status: anonRoomCode ? 'in_room' : existing.status || 'online',
-      currentRoomCode: anonRoomCode || existing.currentRoomCode || '',
+      currentRoomCode: String(anonRoomCode || existing.currentRoomCode || '').slice(0, 16),
       friends: mergedFriends.slice(0, 200),
-      wins: (typeof existing.wins === 'number' ? existing.wins : 0) + anonWins,
-      losses: (typeof existing.losses === 'number' ? existing.losses : 0) + anonLosses,
-      draws: (typeof existing.draws === 'number' ? existing.draws : 0) + anonDraws,
-      goalsScored:
-        (typeof existing.goalsScored === 'number' ? existing.goalsScored : 0) + anonGoalsScored,
-      goalsConceded:
+      wins: Math.floor((typeof existing.wins === 'number' ? existing.wins : 0) + anonWins),
+      losses: Math.floor((typeof existing.losses === 'number' ? existing.losses : 0) + anonLosses),
+      draws: Math.floor((typeof existing.draws === 'number' ? existing.draws : 0) + anonDraws),
+      goalsScored: Math.floor(
+        (typeof existing.goalsScored === 'number' ? existing.goalsScored : 0) + anonGoalsScored
+      ),
+      goalsConceded: Math.floor(
         (typeof existing.goalsConceded === 'number' ? existing.goalsConceded : 0) +
-        anonGoalsConceded,
-      matchesPlayed:
-        (typeof existing.matchesPlayed === 'number' ? existing.matchesPlayed : 0) + anonMatches,
-      createdAt: existing.createdAt,
+          anonGoalsConceded
+      ),
+      matchesPlayed: Math.floor(
+        (typeof existing.matchesPlayed === 'number' ? existing.matchesPlayed : 0) + anonMatches
+      ),
+      createdAt: existing.createdAt instanceof Timestamp ? existing.createdAt : serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
   }
@@ -440,14 +550,15 @@ async function mergeAnonymousDataIntoGoogleUser(
         const nextHostUid = rd.hostUid === anonUid ? googleUser.uid : rd.hostUid;
         const nextHostName = rd.hostUid === anonUid ? preferredName : rd.hostName;
         if (changed || rd.hostUid === anonUid) {
-          await updateDoc(roomRef, {
-            ...rd,
-            hostUid: nextHostUid,
-            hostName: nextHostName,
-            slots,
-            lastActivityMs: Date.now(),
-            updatedAt: serverTimestamp(),
-          });
+          await setDoc(
+            roomRef,
+            buildSanitizedRoomPayload(anonRoomCode, rd, {
+              hostUid: nextHostUid,
+              hostName: nextHostName,
+              slots,
+              lastActivityMs: Date.now(),
+            })
+          );
         }
       }
     } catch {
@@ -475,7 +586,7 @@ export async function ensureUserProfile(user: User, preferredNickname?: string):
     if (!snap.exists()) {
       await setDoc(userRef, {
         uid: user.uid,
-        displayName: defaultName.slice(0, 28),
+        displayName: (defaultName || 'Jogador').slice(0, 28),
         tagCode: generateTagCode(user.uid),
         status: 'online',
         currentRoomCode: '',
@@ -496,25 +607,49 @@ export async function ensureUserProfile(user: User, preferredNickname?: string):
         preferredNickname?.trim() ||
         (existingName && !existingName.startsWith('Craque_') ? existingName : defaultName);
 
-      await updateDoc(userRef, {
-        uid: existing.uid,
-        displayName: resolvedName.slice(0, 28),
-        tagCode: existing.tagCode,
-        status: existing.status || 'online',
-        currentRoomCode: existing.currentRoomCode || '',
-        friends: Array.isArray(existing.friends) ? existing.friends : [],
-        wins: typeof existing.wins === 'number' ? existing.wins : 0,
-        losses: typeof existing.losses === 'number' ? existing.losses : 0,
-        draws: typeof existing.draws === 'number' ? existing.draws : 0,
-        goalsScored: typeof existing.goalsScored === 'number' ? existing.goalsScored : 0,
-        goalsConceded: typeof existing.goalsConceded === 'number' ? existing.goalsConceded : 0,
-        matchesPlayed: typeof existing.matchesPlayed === 'number' ? existing.matchesPlayed : 0,
-        createdAt: existing.createdAt,
+      await setDoc(userRef, {
+        uid: user.uid,
+        displayName: (resolvedName || 'Jogador').slice(0, 28),
+        tagCode:
+          typeof existing.tagCode === 'string' && existing.tagCode.length >= 2
+            ? existing.tagCode.slice(0, 20)
+            : generateTagCode(user.uid),
+        status:
+          existing.status === 'in_room' ||
+          existing.status === 'playing' ||
+          existing.status === 'offline'
+            ? existing.status
+            : 'online',
+        currentRoomCode:
+          typeof existing.currentRoomCode === 'string' ? existing.currentRoomCode.slice(0, 16) : '',
+        friends: Array.isArray(existing.friends)
+          ? existing.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
+          : [],
+        wins: typeof existing.wins === 'number' && existing.wins >= 0 ? Math.floor(existing.wins) : 0,
+        losses:
+          typeof existing.losses === 'number' && existing.losses >= 0
+            ? Math.floor(existing.losses)
+            : 0,
+        draws:
+          typeof existing.draws === 'number' && existing.draws >= 0 ? Math.floor(existing.draws) : 0,
+        goalsScored:
+          typeof existing.goalsScored === 'number' && existing.goalsScored >= 0
+            ? Math.floor(existing.goalsScored)
+            : 0,
+        goalsConceded:
+          typeof existing.goalsConceded === 'number' && existing.goalsConceded >= 0
+            ? Math.floor(existing.goalsConceded)
+            : 0,
+        matchesPlayed:
+          typeof existing.matchesPlayed === 'number' && existing.matchesPlayed >= 0
+            ? Math.floor(existing.matchesPlayed)
+            : 0,
+        createdAt: existing.createdAt instanceof Timestamp ? existing.createdAt : serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
+    console.warn(`Aviso ao sincronizar perfil users/${user.uid}:`, err);
   }
 }
 
@@ -543,20 +678,32 @@ export async function updateUserPresence(
     const snap = await getDoc(userRef);
     if (!snap.exists()) return;
     const d = snap.data();
-    await updateDoc(userRef, {
-      uid: d.uid,
-      displayName: d.displayName,
-      tagCode: d.tagCode,
+    await setDoc(userRef, {
+      uid: user.uid,
+      displayName: String(d.displayName || user.displayName || 'Jogador').slice(0, 28),
+      tagCode:
+        typeof d.tagCode === 'string' && d.tagCode.length >= 2
+          ? d.tagCode.slice(0, 20)
+          : generateTagCode(user.uid),
       status,
       currentRoomCode: roomCode.slice(0, 16),
-      friends: d.friends || [],
-      wins: d.wins || 0,
-      losses: d.losses || 0,
-      draws: d.draws || 0,
-      goalsScored: d.goalsScored || 0,
-      goalsConceded: d.goalsConceded || 0,
-      matchesPlayed: d.matchesPlayed || 0,
-      createdAt: d.createdAt,
+      friends: Array.isArray(d.friends)
+        ? d.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
+        : [],
+      wins: typeof d.wins === 'number' && d.wins >= 0 ? Math.floor(d.wins) : 0,
+      losses: typeof d.losses === 'number' && d.losses >= 0 ? Math.floor(d.losses) : 0,
+      draws: typeof d.draws === 'number' && d.draws >= 0 ? Math.floor(d.draws) : 0,
+      goalsScored:
+        typeof d.goalsScored === 'number' && d.goalsScored >= 0 ? Math.floor(d.goalsScored) : 0,
+      goalsConceded:
+        typeof d.goalsConceded === 'number' && d.goalsConceded >= 0
+          ? Math.floor(d.goalsConceded)
+          : 0,
+      matchesPlayed:
+        typeof d.matchesPlayed === 'number' && d.matchesPlayed >= 0
+          ? Math.floor(d.matchesPlayed)
+          : 0,
+      createdAt: d.createdAt instanceof Timestamp ? d.createdAt : serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
   } catch {
@@ -739,45 +886,55 @@ export async function respondToFriendRequest(
 ): Promise<void> {
   const user = await ensureAuthenticated();
   const reqRef = doc(db, 'friendRequests', request.id);
-  const snap = await getDoc(reqRef);
-  if (!snap.exists()) return;
-  const d = snap.data();
 
   try {
-    await updateDoc(reqRef, {
-      fromUid: d.fromUid,
-      fromName: d.fromName,
-      fromTag: d.fromTag,
-      toUid: d.toUid,
-      toName: d.toName,
-      type: d.type,
-      roomCode: d.roomCode,
-      status: accept ? 'accepted' : 'declined',
-      createdAt: d.createdAt,
-      updatedAt: serverTimestamp(),
-    });
-
-    if (accept && request.type === 'friend_request') {
-      const myRef = doc(db, 'users', user.uid);
-      const mySnap = await getDoc(myRef);
-      if (mySnap.exists()) {
-        await updateDoc(myRef, {
-          friends: arrayUnion(request.fromUid),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      const senderRef = doc(db, 'users', request.fromUid);
-      const senderSnap = await getDoc(senderRef);
-      if (senderSnap.exists()) {
-        await updateDoc(senderRef, {
-          friends: arrayUnion(user.uid),
-          updatedAt: serverTimestamp(),
-        });
-      }
+    const snap = await getDoc(reqRef);
+    if (snap.exists()) {
+      const d = snap.data();
+      await setDoc(reqRef, {
+        fromUid: String(d.fromUid || request.fromUid),
+        fromName: String(d.fromName || request.fromName || 'Jogador').slice(0, 28),
+        fromTag: String(d.fromTag || request.fromTag || '#STF0000').slice(0, 16),
+        toUid: String(d.toUid || request.toUid || user.uid),
+        toName: String(d.toName || request.toName || 'Jogador').slice(0, 28),
+        type:
+          d.type === 'room_invite' || request.type === 'room_invite'
+            ? 'room_invite'
+            : 'friend_request',
+        roomCode: String(d.roomCode ?? request.roomCode ?? '').slice(0, 16),
+        status: accept ? 'accepted' : 'declined',
+        createdAt: d.createdAt instanceof Timestamp ? d.createdAt : serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
     }
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `friendRequests/${request.id}`);
+    console.warn(`Aviso ao atualizar friendRequests/${request.id}:`, err);
+    if (request.type !== 'room_invite') {
+      // Tenta remover caso o documento antigo estivesse com schema incompatível
+      await deleteDoc(reqRef).catch(() => {});
+    }
+  }
+
+  if (accept && request.type === 'friend_request') {
+    try {
+      const myRef = doc(db, 'users', user.uid);
+      await updateDoc(myRef, {
+        friends: arrayUnion(request.fromUid),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      console.warn('Aviso ao adicionar amigo no perfil local:', err);
+    }
+
+    try {
+      const senderRef = doc(db, 'users', request.fromUid);
+      await updateDoc(senderRef, {
+        friends: arrayUnion(user.uid),
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      console.warn('Aviso ao adicionar amigo no perfil remetente:', err);
+    }
   }
 }
 
@@ -928,10 +1085,11 @@ export async function createOnlineRoom(
   options?: Partial<CreateRoomParams>
 ): Promise<MultiplayerRoomState> {
   const user = await ensureAuthenticated();
-  const mySnap = await getDoc(doc(db, 'users', user.uid));
-  const hostName = mySnap.exists()
-    ? String(mySnap.data().displayName || 'Anfitrião').slice(0, 28)
-    : (user.displayName || 'Anfitrião').slice(0, 28);
+  const mySnap = await getDoc(doc(db, 'users', user.uid)).catch(() => null);
+  const hostName =
+    mySnap && mySnap.exists()
+      ? String(mySnap.data().displayName || user.displayName || 'Anfitrião').slice(0, 28)
+      : (user.displayName || 'Anfitrião').slice(0, 28);
 
   const roomCode = generateRoomCode();
   const mode: MatchFormatMode = options?.mode === '2v2' ? '2v2' : '4v4';
@@ -954,37 +1112,41 @@ export async function createOnlineRoom(
 
   const roomRef = doc(db, 'rooms', roomCode);
   try {
-    await setDoc(roomRef, {
-      roomCode,
-      matchId: null,
-      roomName,
-      mode,
-      visibility,
-      hasPassword,
-      passwordHash,
-      maxHumans,
-      autoFillBots: options?.autoFillBots !== false,
-      activeCharacterIds,
-      loadingReadyUids: [user.uid],
-      startAt: null,
-      lastActivityMs: nowMs,
-      hostUid: user.uid,
-      hostName,
-      status: 'waiting',
-      homeTeamId,
-      awayTeamId,
-      homeGoals: 0,
-      awayGoals: 0,
-      half: 1,
-      remainingSeconds: halfDurationSeconds,
-      slots,
-      inputs: {},
-      matchSnapshot: null,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    await withFirestoreTimeout(
+      setDoc(roomRef, {
+        roomCode,
+        matchId: null,
+        roomName,
+        mode,
+        visibility,
+        hasPassword,
+        passwordHash,
+        maxHumans,
+        autoFillBots: options?.autoFillBots !== false,
+        activeCharacterIds,
+        loadingReadyUids: [user.uid],
+        startAt: null,
+        lastActivityMs: nowMs,
+        hostUid: user.uid,
+        hostName,
+        status: 'waiting',
+        homeTeamId,
+        awayTeamId,
+        homeGoals: 0,
+        awayGoals: 0,
+        half: 1,
+        remainingSeconds: Math.floor(halfDurationSeconds),
+        slots,
+        inputs: {},
+        matchSnapshot: null,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+      8000,
+      'Tempo limite excedido ao criar a sala. Verifique sua conexão e tente novamente.'
+    );
 
-    await updateUserPresence('in_room', roomCode);
+    void updateUserPresence('in_room', roomCode);
 
     return {
       roomCode,
@@ -1024,7 +1186,15 @@ export async function joinOnlineRoom(
   const roomCode = roomCodeInput.trim().toUpperCase();
   const roomRef = doc(db, 'rooms', roomCode);
 
-  const snap = await getDoc(roomRef);
+  const [snap, mySnap] = await withFirestoreTimeout(
+    Promise.all([
+      getDoc(roomRef),
+      getDoc(doc(db, 'users', user.uid)).catch(() => null),
+    ]),
+    8000,
+    `Tempo limite ao buscar a sala ${roomCode}. Tente novamente.`
+  );
+
   if (!snap.exists()) {
     throw new Error('Sala não encontrada. Verifique o código da sala.');
   }
@@ -1059,10 +1229,10 @@ export async function joinOnlineRoom(
     }
   }
 
-  const mySnap = await getDoc(doc(db, 'users', user.uid));
-  const myName = mySnap.exists()
-    ? String(mySnap.data().displayName || 'Jogador').slice(0, 28)
-    : (user.displayName || 'Jogador').slice(0, 28);
+  const myName =
+    mySnap && mySnap.exists()
+      ? String(mySnap.data().displayName || user.displayName || 'Jogador').slice(0, 28)
+      : (user.displayName || 'Jogador').slice(0, 28);
 
   const maxAllowed = typeof d.maxHumans === 'number' ? d.maxHumans : roomMode === '2v2' ? 4 : 8;
   const currentHumanCount = Object.values(slots).filter((s) => !s.isBot && s.uid).length;
@@ -1121,21 +1291,26 @@ export async function joinOnlineRoom(
     roomMode,
     Array.isArray(d.activeCharacterIds) ? d.activeCharacterIds : undefined
   );
+  const nowMs = Date.now();
 
   try {
-    await updateDoc(roomRef, {
-      ...d,
+    const sanitizedPayload = buildSanitizedRoomPayload(roomCode, d, {
       slots,
       activeCharacterIds,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
+      lastActivityMs: nowMs,
     });
-    await updateUserPresence('in_room', roomCode);
+
+    await withFirestoreTimeout(
+      setDoc(roomRef, sanitizedPayload),
+      8000,
+      `Tempo limite ao entrar na sala ${roomCode}. Tente novamente.`
+    );
+
+    void updateUserPresence('in_room', roomCode);
+
     return mapDocToRoomState({
-      ...d,
-      slots,
-      activeCharacterIds,
-      lastActivityMs: Date.now(),
+      ...sanitizedPayload,
+      lastActivityMs: nowMs,
     });
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
@@ -1177,10 +1352,11 @@ export async function selectRoomCharacter(
     }
   }
 
-  const mySnap = await getDoc(doc(db, 'users', user.uid));
-  const myName = mySnap.exists()
-    ? String(mySnap.data().displayName || 'Jogador').slice(0, 28)
-    : (user.displayName || 'Jogador').slice(0, 28);
+  const mySnap = await getDoc(doc(db, 'users', user.uid)).catch(() => null);
+  const myName =
+    mySnap && mySnap.exists()
+      ? String(mySnap.data().displayName || user.displayName || 'Jogador').slice(0, 28)
+      : (user.displayName || 'Jogador').slice(0, 28);
 
   let myMicEnabled = false;
   let myReady = true;
@@ -1210,13 +1386,14 @@ export async function selectRoomCharacter(
   const activeCharacterIds = resolveActiveCharacterIdsForRoom(slots, roomMode);
 
   try {
-    await updateDoc(roomRef, {
-      ...d,
-      slots,
-      activeCharacterIds,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        slots,
+        activeCharacterIds,
+        lastActivityMs: Date.now(),
+      })
+    );
     return { ok: true };
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
@@ -1249,12 +1426,13 @@ export async function togglePlayerReadyInRoom(roomCode: string, ready?: boolean)
   if (!changed) return;
 
   try {
-    await updateDoc(roomRef, {
-      ...d,
-      slots,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        slots,
+        lastActivityMs: Date.now(),
+      })
+    );
   } catch {
     // Non-fatal
   }
@@ -1288,12 +1466,13 @@ export async function updatePlayerVoiceStatusInRoom(
       }
     }
     if (changed) {
-      await updateDoc(roomRef, {
-        ...d,
-        slots,
-        lastActivityMs: Date.now(),
-        updatedAt: serverTimestamp(),
-      });
+      await setDoc(
+        roomRef,
+        buildSanitizedRoomPayload(roomCode, d, {
+          slots,
+          lastActivityMs: Date.now(),
+        })
+      );
     }
   } catch {
     // Ignore transient conflict
@@ -1321,12 +1500,13 @@ export async function sendRoomHeartbeat(roomCode: string): Promise<void> {
       }
     }
 
-    await updateDoc(roomRef, {
-      ...d,
-      slots,
-      lastActivityMs: nowMs,
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        slots,
+        lastActivityMs: nowMs,
+      })
+    );
   } catch {
     // Ignore heartbeat race
   }
@@ -1379,18 +1559,19 @@ export async function leaveOnlineRoom(roomCode: string): Promise<void> {
           Array.isArray(d.activeCharacterIds) ? d.activeCharacterIds : undefined
         );
 
-        await updateDoc(roomRef, {
-          ...d,
-          hostUid: nextHostUid,
-          hostName: nextHostName,
-          slots,
-          activeCharacterIds,
-          lastActivityMs: Date.now(),
-          updatedAt: serverTimestamp(),
-        });
+        await setDoc(
+          roomRef,
+          buildSanitizedRoomPayload(normalizedCode, d, {
+            hostUid: nextHostUid,
+            hostName: nextHostName,
+            slots,
+            activeCharacterIds,
+            lastActivityMs: Date.now(),
+          })
+        );
       }
     }
-    await updateUserPresence('online', '');
+    void updateUserPresence('online', '');
   } catch {
     // Ignore cleanup errors
   }
@@ -1459,14 +1640,15 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
           nextHostUid = String(remainingHumans[0].uid);
           nextHostName = String(remainingHumans[0].displayName || 'Anfitrião').slice(0, 28);
         }
-        await updateDoc(docSnap.ref, {
-          ...d,
-          hostUid: nextHostUid,
-          hostName: nextHostName,
-          slots,
-          lastActivityMs: nowMs,
-          updatedAt: serverTimestamp(),
-        }).catch(() => {});
+        await setDoc(
+          docSnap.ref,
+          buildSanitizedRoomPayload(docSnap.id, d, {
+            hostUid: nextHostUid,
+            hostName: nextHostName,
+            slots,
+            lastActivityMs: nowMs,
+          })
+        ).catch(() => {});
       }
     }
   } catch {
@@ -1483,7 +1665,11 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
 export async function startOnlineMatch(roomCode: string): Promise<string> {
   const user = await ensureAuthenticated();
   const roomRef = doc(db, 'rooms', roomCode);
-  const snap = await getDoc(roomRef);
+  const snap = await withFirestoreTimeout(
+    getDoc(roomRef),
+    8000,
+    'Tempo limite ao validar a sala para início da partida.'
+  );
   if (!snap.exists()) {
     throw new Error('Sala não encontrada.');
   }
@@ -1516,41 +1702,50 @@ export async function startOnlineMatch(roomCode: string): Promise<string> {
   try {
     // Cria documento compartilhado /matches/{matchId}
     const matchRef = doc(db, 'matches', matchId);
-    await setDoc(matchRef, {
-      matchId,
-      roomId: roomCode,
-      hostId: user.uid,
-      mode: roomMode,
-      status: 'starting',
-      players: humanPlayers.length > 0 ? humanPlayers : [user.uid],
-      bots: botCharacters,
-      score: {
-        teamA: 0,
-        teamB: 0,
-      },
-      ball: {
-        x: 0,
-        y: 0.22,
-        z: 0,
-      },
-      startAt,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    await withFirestoreTimeout(
+      setDoc(matchRef, {
+        matchId,
+        roomId: roomCode,
+        hostId: user.uid,
+        mode: roomMode,
+        status: 'starting',
+        players: humanPlayers.length > 0 ? humanPlayers : [user.uid],
+        bots: botCharacters,
+        score: {
+          teamA: 0,
+          teamB: 0,
+        },
+        ball: {
+          x: 0,
+          y: 0.22,
+          z: 0,
+        },
+        startAt,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+      8000,
+      'Tempo limite ao criar sessão de partida.'
+    );
 
     // Atualiza sala para status: "starting" para disparar transição imediata em todos os convidados
-    await updateDoc(roomRef, {
-      ...d,
-      matchId,
-      status: 'starting',
-      startAt,
-      activeCharacterIds,
-      loadingReadyUids: [user.uid],
-      lastActivityMs: startAt,
-      updatedAt: serverTimestamp(),
-    });
+    await withFirestoreTimeout(
+      setDoc(
+        roomRef,
+        buildSanitizedRoomPayload(roomCode, d, {
+          matchId,
+          status: 'starting',
+          startAt,
+          activeCharacterIds,
+          loadingReadyUids: [user.uid],
+          lastActivityMs: startAt,
+        })
+      ),
+      8000,
+      'Tempo limite ao sincronizar início da partida.'
+    );
 
-    await updateUserPresence('playing', roomCode);
+    void updateUserPresence('playing', roomCode);
     return matchId;
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
@@ -1584,22 +1779,32 @@ export async function markPlayerMatchLoadingReady(roomCode: string): Promise<voi
     const nextStatus =
       d.status === 'starting' && allHumansReady ? 'playing' : d.status;
 
-    await updateDoc(roomRef, {
-      ...d,
-      status: nextStatus,
-      loadingReadyUids: readyList,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        status: nextStatus,
+        loadingReadyUids: readyList,
+        lastActivityMs: Date.now(),
+      })
+    );
 
     if (nextStatus === 'playing' && d.matchId) {
       const matchRef = doc(db, 'matches', String(d.matchId));
       const matchSnap = await getDoc(matchRef);
       if (matchSnap.exists()) {
         const md = matchSnap.data();
-        await updateDoc(matchRef, {
-          ...md,
+        await setDoc(matchRef, {
+          matchId: String(md.matchId || d.matchId),
+          roomId: String(md.roomId || roomCode),
+          hostId: String(md.hostId || d.hostUid || user.uid),
+          mode: md.mode === '2v2' ? '2v2' : '4v4',
           status: 'playing',
+          players: Array.isArray(md.players) ? md.players.slice(0, 16) : [user.uid],
+          bots: Array.isArray(md.bots) ? md.bots.slice(0, 16) : [],
+          score: md.score && typeof md.score === 'object' ? md.score : { teamA: 0, teamB: 0 },
+          ball: md.ball && typeof md.ball === 'object' ? md.ball : { x: 0, y: 0.22, z: 0 },
+          startAt: typeof md.startAt === 'number' ? Math.floor(md.startAt) : Date.now(),
+          createdAt: md.createdAt instanceof Timestamp ? md.createdAt : serverTimestamp(),
           updatedAt: serverTimestamp(),
         }).catch(() => {});
       }
@@ -1627,22 +1832,32 @@ export async function promoteRoomToPlaying(roomCode: string): Promise<void> {
       ? Array.from(new Set([...(d.loadingReadyUids as string[]), user.uid]))
       : [user.uid];
 
-    await updateDoc(roomRef, {
-      ...d,
-      status: 'playing',
-      loadingReadyUids: readyList,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        status: 'playing',
+        loadingReadyUids: readyList,
+        lastActivityMs: Date.now(),
+      })
+    );
 
     if (d.matchId) {
       const matchRef = doc(db, 'matches', String(d.matchId));
       const matchSnap = await getDoc(matchRef);
       if (matchSnap.exists()) {
         const md = matchSnap.data();
-        await updateDoc(matchRef, {
-          ...md,
+        await setDoc(matchRef, {
+          matchId: String(md.matchId || d.matchId),
+          roomId: String(md.roomId || roomCode),
+          hostId: String(md.hostId || d.hostUid || user.uid),
+          mode: md.mode === '2v2' ? '2v2' : '4v4',
           status: 'playing',
+          players: Array.isArray(md.players) ? md.players.slice(0, 16) : [user.uid],
+          bots: Array.isArray(md.bots) ? md.bots.slice(0, 16) : [],
+          score: md.score && typeof md.score === 'object' ? md.score : { teamA: 0, teamB: 0 },
+          ball: md.ball && typeof md.ball === 'object' ? md.ball : { x: 0, y: 0.22, z: 0 },
+          startAt: typeof md.startAt === 'number' ? Math.floor(md.startAt) : Date.now(),
+          createdAt: md.createdAt instanceof Timestamp ? md.createdAt : serverTimestamp(),
           updatedAt: serverTimestamp(),
         }).catch(() => {});
       }
@@ -1665,16 +1880,17 @@ export async function publishHostMatchSnapshot(
     const d = snap.data();
     if (d.hostUid !== user.uid || d.status === 'finished') return;
 
-    await updateDoc(roomRef, {
-      ...d,
-      homeGoals: snapshot.homeGoals,
-      awayGoals: snapshot.awayGoals,
-      half: snapshot.half,
-      remainingSeconds: Math.max(0, Math.floor(snapshot.remainingSeconds)),
-      matchSnapshot: snapshot,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        homeGoals: snapshot.homeGoals,
+        awayGoals: snapshot.awayGoals,
+        half: snapshot.half,
+        remainingSeconds: Math.max(0, Math.floor(snapshot.remainingSeconds)),
+        matchSnapshot: snapshot,
+        lastActivityMs: Date.now(),
+      })
+    );
   } catch {
     // Ignore high-frequency sync conflict
   }
@@ -1702,12 +1918,13 @@ export async function publishClientInput(
     const d = snap.data();
     if (d.status === 'finished') return;
     const inputs = { ...(d.inputs || {}), [user.uid]: input };
-    await updateDoc(roomRef, {
-      ...d,
-      inputs,
-      lastActivityMs: Date.now(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(
+      roomRef,
+      buildSanitizedRoomPayload(roomCode, d, {
+        inputs,
+        lastActivityMs: Date.now(),
+      })
+    );
   } catch {
     // Ignore transient network lag
   }
@@ -1792,8 +2009,8 @@ export async function recordMatchFinished(
         hostUid: user.uid,
         homeTeamName: homeTeamName.slice(0, 60),
         awayTeamName: awayTeamName.slice(0, 60),
-        homeGoals,
-        awayGoals,
+        homeGoals: Math.max(0, Math.min(99, Math.floor(homeGoals))),
+        awayGoals: Math.max(0, Math.min(99, Math.floor(awayGoals))),
         winner,
         participantUids: participantUids.length > 0 ? participantUids.slice(0, 16) : [user.uid],
         createdAt: serverTimestamp(),
@@ -1811,20 +2028,27 @@ export async function recordMatchFinished(
       const myTeamGoals = myTeam === 'home' ? homeGoals : awayGoals;
       const opponentGoals = myTeam === 'home' ? awayGoals : homeGoals;
 
-      await updateDoc(userRef, {
-        uid: d.uid,
-        displayName: d.displayName,
-        tagCode: d.tagCode,
+      await setDoc(userRef, {
+        uid: user.uid,
+        displayName: String(d.displayName || user.displayName || 'Jogador').slice(0, 28),
+        tagCode:
+          typeof d.tagCode === 'string' && d.tagCode.length >= 2
+            ? d.tagCode.slice(0, 20)
+            : generateTagCode(user.uid),
         status: 'online',
         currentRoomCode: '',
-        friends: d.friends || [],
-        wins: (d.wins || 0) + (didWin ? 1 : 0),
-        losses: (d.losses || 0) + (didLose ? 1 : 0),
-        draws: (d.draws || 0) + (didDraw ? 1 : 0),
-        goalsScored: (d.goalsScored || 0) + myTeamGoals,
-        goalsConceded: (d.goalsConceded || 0) + opponentGoals,
-        matchesPlayed: (d.matchesPlayed || 0) + 1,
-        createdAt: d.createdAt,
+        friends: Array.isArray(d.friends)
+          ? d.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
+          : [],
+        wins: Math.floor((typeof d.wins === 'number' ? d.wins : 0) + (didWin ? 1 : 0)),
+        losses: Math.floor((typeof d.losses === 'number' ? d.losses : 0) + (didLose ? 1 : 0)),
+        draws: Math.floor((typeof d.draws === 'number' ? d.draws : 0) + (didDraw ? 1 : 0)),
+        goalsScored: Math.floor((typeof d.goalsScored === 'number' ? d.goalsScored : 0) + myTeamGoals),
+        goalsConceded: Math.floor(
+          (typeof d.goalsConceded === 'number' ? d.goalsConceded : 0) + opponentGoals
+        ),
+        matchesPlayed: Math.floor((typeof d.matchesPlayed === 'number' ? d.matchesPlayed : 0) + 1),
+        createdAt: d.createdAt instanceof Timestamp ? d.createdAt : serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     }

@@ -145,15 +145,30 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
         bannerSubRef.current
       ) {
         if (data.bannerMessage) {
-          bannerWrapRef.current.style.opacity = '1';
+          if (lastBannerText !== data.bannerMessage) {
+            lastBannerText = data.bannerMessage;
+            bannerShownAt = performance.now();
+          }
+          const ageMs = performance.now() - bannerShownAt;
+          if (ageMs < 2400) {
+            bannerWrapRef.current.style.opacity = '1';
+            bannerWrapRef.current.style.transform = 'translate(-50%, 0px)';
+          } else {
+            bannerWrapRef.current.style.opacity = '0';
+            bannerWrapRef.current.style.transform = 'translate(-50%, -8px)';
+          }
           bannerTitleRef.current.textContent = data.bannerMessage;
           bannerSubRef.current.textContent = data.bannerSubtext || '';
         } else {
+          lastBannerText = null;
           bannerWrapRef.current.style.opacity = '0';
+          bannerWrapRef.current.style.transform = 'translate(-50%, -8px)';
         }
       }
       rafId = requestAnimationFrame(syncDOM);
     };
+    let lastBannerText: string | null = null;
+    let bannerShownAt = 0;
     rafId = requestAnimationFrame(syncDOM);
     return () => cancelAnimationFrame(rafId);
   }, [hudUpdateRef]);
@@ -492,22 +507,24 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
         </div>
       )}
 
-      {/* Compact Top Broadcast Banner for Goals / Lateral Throw-ins / Halftime (Never blocks center gameplay) */}
+      {/* Floating Top-Center Notification for Goals / Lateral Throw-ins / Halftime (Fades out automatically, never obstructs field) */}
       <div
         ref={bannerWrapRef}
         data-testid="match-event-banner"
-        style={{ opacity: 0 }}
-        className="pointer-events-none self-center mt-1.5 mb-auto max-w-md w-auto bg-stone-950/90 border border-amber-500/85 rounded-xl px-4 py-1.5 text-center shadow-lg transition-opacity duration-200 backdrop-blur-xs"
+        style={{ opacity: 0, transform: 'translate(-50%, -8px)' }}
+        className="gameplay-hud-goal-display pointer-events-none fixed top-14 sm:top-16 left-1/2 z-30 max-w-xs sm:max-w-sm w-max bg-stone-950/85 border border-amber-500/75 rounded-full px-3.5 py-1 text-center shadow-lg transition-all duration-500 ease-out backdrop-blur-xs"
       >
         <div
           ref={bannerTitleRef}
-          className="font-extrabold text-xs sm:text-sm text-amber-400 tracking-wider uppercase leading-tight"
+          className="font-extrabold text-[11px] sm:text-xs text-amber-400 tracking-wider uppercase leading-tight"
         />
         <div
           ref={bannerSubRef}
-          className="text-[10px] sm:text-xs font-semibold text-stone-200 mt-0.5 leading-tight"
+          className="text-[9px] sm:text-[10px] font-medium text-stone-200 leading-tight truncate max-w-[260px] sm:max-w-[320px]"
         />
       </div>
+
+      <div className="my-auto pointer-events-none" />
 
       {/* Bottom Area: Mobile Virtual Controls ONLY on Mobile/Touchscreen Devices; Desktop Hint on PC */}
       {isMobileDevice ? (

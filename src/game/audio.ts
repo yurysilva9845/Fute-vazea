@@ -10,8 +10,20 @@ class VarzeaAudioEngine {
   private ambientVolume: number = 0.65;
   private musicVolume: number = 0.5;
   private vibrationEnabled: boolean = true;
+  private hasUserGesture: boolean = false;
   private ambienceInterval: number | null = null;
   private musicInterval: number | null = null;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      const markGesture = () => {
+        this.hasUserGesture = true;
+      };
+      window.addEventListener('pointerdown', markGesture, { once: true, passive: true });
+      window.addEventListener('touchstart', markGesture, { once: true, passive: true });
+      window.addEventListener('keydown', markGesture, { once: true, passive: true });
+    }
+  }
 
   private ensureContext(): AudioContext | null {
     if (!this.enabled) return null;
@@ -56,6 +68,16 @@ class VarzeaAudioEngine {
 
   public vibrate(pattern: number | number[]) {
     if (!this.vibrationEnabled) return;
+    if (typeof document !== 'undefined' && document.body?.dataset?.state !== 'playing') {
+      return;
+    }
+    const navActivation =
+      typeof navigator !== 'undefined'
+        ? (navigator as unknown as { userActivation?: { hasBeenActive?: boolean } }).userActivation
+        : undefined;
+    if (!this.hasUserGesture && !navActivation?.hasBeenActive) {
+      return;
+    }
     if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
       try {
         navigator.vibrate(pattern);
