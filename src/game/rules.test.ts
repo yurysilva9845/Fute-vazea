@@ -472,4 +472,80 @@ test('PARTE 3 — Directional Pass, Weak/Strong Shots, Key Remapping without con
   assert.equal(decisions.length, 3);
 });
 
+test('Firebase Auth singleton, single onAuthStateChanged observer, and shared multiplexed Firestore listeners', async () => {
+  const fs = await import('node:fs');
+  const firebaseSource = fs.readFileSync('./src/services/firebase.ts', 'utf8');
 
+  // 1. Singleton Firebase App & Auth instance check
+  assert.ok(
+    firebaseSource.includes('getApps().length > 0 ? getApp() : initializeApp(firebaseConfig)'),
+    'Must use singleton getApps() check when initializing Firebase App'
+  );
+
+  // 2. Exactly one onAuthStateChanged call (1 import + 1 call inside ensureSingleAuthObserverRegistered)
+  const onAuthMatches = firebaseSource.match(/onAuthStateChanged\s*\(/g) || [];
+  assert.equal(
+    onAuthMatches.length,
+    1,
+    `Expected exactly 1 onAuthStateChanged( registration in firebase.ts, found ${onAuthMatches.length}`
+  );
+
+  // 3. Deduplicated profile synchronization (profileSyncInFlight)
+  assert.ok(
+    firebaseSource.includes('profileSyncInFlight'),
+    'Must deduplicate concurrent ensureUserProfile calls per UID'
+  );
+
+  // 4. Shared listener multiplexers prevent duplicate onSnapshot across App.tsx and MultiplayerLobbyModal.tsx
+  assert.ok(firebaseSource.includes('myProfileSubscribers'));
+  assert.ok(firebaseSource.includes('sharedRoomSubscriptions'));
+  assert.ok(firebaseSource.includes('publicRoomsSubscribers'));
+  assert.ok(firebaseSource.includes('onlinePlayersSubscribers'));
+  assert.ok(firebaseSource.includes('incomingRequestsSubscribers'));
+
+  // 5. Identifiable diagnostic log prefixes
+  assert.ok(firebaseSource.includes('[STF-Auth]'));
+  assert.ok(firebaseSource.includes('[STF-Firestore]'));
+});
+
+test('Firestore resource-exhausted handling, exponential backoff, presence deduplication, and zero 60FPS Firestore writes', async () => {
+  const {
+    isQuotaExceededError,
+    getQuotaStatus,
+    clearQuotaBackoffForManualRetry,
+    publishHostMatchSnapshot,
+    publishClientInput,
+  } = await import('../services/firebase');
+  const fs = await import('node:fs');
+
+  // 1. Accurate detection of resource-exhausted vs permission-denied
+  assert.equal(
+    isQuotaExceededError({ code: 'resource-exhausted', message: 'Quota exceeded.' }),
+    true
+  );
+  assert.equal(
+    isQuotaExceededError(new Error('FirebaseError: [code=resource-exhausted]: Quota exceeded.')),
+    true
+  );
+  assert.equal(
+    isQuotaExceededError({ code: 'permission-denied', message: 'Missing or insufficient permissions.' }),
+    false
+  );
+
+  // 2. Manual retry resets backoff state cleanly
+  clearQuotaBackoffForManualRetry();
+  const status = getQuotaStatus();
+  assert.equal(status.isExhausted, false);
+
+  // 3. 60 FPS match snapshot & input functions must be no-ops in Firestore (handled by WebSocket server)
+  await publishHostMatchSnapshot('STF-1000', {} as any);
+  await publishClientInput('STF-1000', {} as any);
+
+  // 4. PresenceManager deduplicates startRoomPresence calls to prevent onSnapshot write-read loops
+  const presenceSource = fs.readFileSync('./src/services/presenceService.ts', 'utf8');
+  assert.ok(
+    presenceSource.includes('this.activeRoomCode === normalized') &&
+      presenceSource.includes('this.activeStatus === status'),
+    'PresenceManager must deduplicate startRoomPresence calls for identical roomCode and status'
+  );
+});

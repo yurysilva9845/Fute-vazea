@@ -41,11 +41,14 @@ import {
 } from '../services/botService';
 import {
   ALL_CHARACTERS,
+  clearQuotaBackoffForManualRetry,
   createOnlineRoom,
   extractAuthUserInfo,
+  FirestoreQuotaStatus,
   FriendRequestDoc,
   generateMatchId,
   getCurrentAuthUser,
+  getQuotaStatus,
   joinOnlineRoom,
   leaveOnlineRoom,
   linkGoogleAccount,
@@ -60,6 +63,7 @@ import {
   subscribeToMyProfile,
   subscribeToOnlinePlayers,
   subscribeToPublicRooms,
+  subscribeToQuotaStatus,
   subscribeToRoom,
   togglePlayerReadyInRoom,
   updateNickname,
@@ -185,8 +189,14 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     };
   }, []);
 
+  const [quotaStatus, setQuotaStatus] = useState<FirestoreQuotaStatus>(() => getQuotaStatus());
+
   useEffect(() => {
     sessionCleanupService.startPeriodicCleanup();
+
+    const unsubQuota = subscribeToQuotaStatus((status) => {
+      setQuotaStatus(status);
+    });
 
     const unsubAuth = subscribeToAuthStatus((info) => {
       setAuthInfo(info);
@@ -198,26 +208,47 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
         setNicknameInput(prof.displayName);
       }
     });
-    const unsubRooms = subscribeToPublicRooms((rooms) => {
-      setPublicRooms(rooms);
-    });
-    const unsubOnline = subscribeToOnlinePlayers((players) => {
-      setOnlinePlayers(players);
-    });
+
     const unsubReqs = subscribeToIncomingRequests((reqs) => {
       setIncomingRequests(reqs);
     });
 
     return () => {
+      unsubQuota();
       unsubAuth();
       unsubProfile();
-      unsubRooms();
-      unsubOnline();
       unsubReqs();
+      sessionCleanupService.stopPeriodicCleanup();
     };
   }, []);
 
+  // Inscreve nas salas públicas apenas quando o jogador está nas abas que exibem salas públicas
   useEffect(() => {
+    if (tab !== 'modes' && tab !== 'public_rooms' && tab !== 'diagnostics') {
+      return;
+    }
+    const unsubRooms = subscribeToPublicRooms((rooms) => {
+      setPublicRooms(rooms);
+    });
+    return () => unsubRooms();
+  }, [tab]);
+
+  // Inscreve na lista de jogadores online apenas quando na aba de Amigos ou Sala de Equipes
+  useEffect(() => {
+    if (tab !== 'friends' && tab !== 'room') {
+      return;
+    }
+    const unsubOnline = subscribeToOnlinePlayers((players) => {
+      setOnlinePlayers(players);
+    });
+    return () => unsubOnline();
+  }, [tab]);
+
+  // Inscreve nos perfis de amigos apenas quando na aba de Amigos ou Sala de Equipes
+  useEffect(() => {
+    if (tab !== 'friends' && tab !== 'room') {
+      return;
+    }
     if (!myProfile || !myProfile.friends || myProfile.friends.length === 0) {
       setFriendsList([]);
       return;
@@ -226,7 +257,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
       setFriendsList(friends);
     });
     return () => unsubFriends();
-  }, [myProfile?.friends?.join(',')]);
+  }, [tab, myProfile?.friends?.join(',')]);
 
   useEffect(() => {
     if (!activeRoomCode) {
@@ -862,6 +893,27 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
             </button>
           </div>
         </header>
+
+        {/* Aviso amigável quando a cota de nuvem do Firestore estiver temporariamente em backoff (resource-exhausted) */}
+        {quotaStatus.isExhausted && (
+          <div className="bg-amber-500/20 border-b border-amber-500/50 px-3 py-2 flex flex-wrap items-center justify-between gap-2 shrink-0">
+            <div className="text-[11px] sm:text-xs text-amber-100 leading-snug">
+              <strong className="text-amber-300 uppercase">Modo de Economia de Nuvem Ativo:</strong>{' '}
+              {quotaStatus.friendlyMessage ||
+                'O limite gratuito do banco em nuvem (plano Spark — renovado diariamente) foi atingido temporariamente. Seus dados em cache continuam ativos e a física da partida roda em 60 FPS via WebSocket local.'}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                clearQuotaBackoffForManualRetry();
+                showToast('Tentando reconectar sincronização com a nuvem...');
+              }}
+              className="bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-[10px] uppercase px-2.5 py-1 rounded shrink-0 cursor-pointer"
+            >
+              Tentar Reconectar
+            </button>
+          </div>
+        )}
 
         {/* Aviso amigável se o celular estiver na vertical (Retrato) */}
         {isMobilePortrait && (

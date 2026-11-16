@@ -1,7 +1,4 @@
-import { initializeApp } from 'firebase/app';
-import {
-  FirebaseError,
-} from 'firebase/app';
+import { FirebaseError, getApp, getApps, initializeApp } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
@@ -21,6 +18,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   getFirestore,
   limit,
@@ -50,7 +48,8 @@ import {
 } from './botService';
 import { CreateRoomParams, hashRoomPassword } from './roomService';
 
-const app = initializeApp(firebaseConfig);
+// Singleton initialization: prevents multiple Firebase App / Auth instances across hot reloads or re-imports
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 
@@ -82,11 +81,138 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export interface FirestoreQuotaStatus {
+  isExhausted: boolean;
+  backoffUntilMs: number;
+  attempt: number;
+  friendlyMessage: string | null;
+}
+
+let quotaState: FirestoreQuotaStatus = {
+  isExhausted: false,
+  backoffUntilMs: 0,
+  attempt: 0,
+  friendlyMessage: null,
+};
+let quotaRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
+const quotaStatusListeners = new Set<(status: FirestoreQuotaStatus) => void>();
+
+export function isQuotaExceededError(error: unknown): boolean {
+  if (!error) return false;
+  const fbErr = error as FirebaseError | undefined;
+  const code = String(fbErr?.code || '').toLowerCase();
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    code.includes('resource-exhausted') ||
+    msg.includes('resource-exhausted') ||
+    msg.includes('Quota exceeded')
+  );
+}
+
+function notifyQuotaStatusListeners(): void {
+  const snapshot = { ...quotaState };
+  quotaStatusListeners.forEach((cb) => {
+    try {
+      cb(snapshot);
+    } catch {
+      // Ignore listener error
+    }
+  });
+}
+
+function registerQuotaExhausted(context: string, error: unknown): void {
+  const nextAttempt = Math.min(6, quotaState.attempt + 1);
+  // Backoff exponencial com jitter aleatório (15s, 30s, 60s, 120s, até 300s + 0..5s jitter)
+  const baseDelayMs = Math.min(300_000, 15_000 * Math.pow(2, nextAttempt - 1));
+  const jitterMs = Math.floor(Math.random() * 5000);
+  const backoffMs = baseDelayMs + jitterMs;
+  const untilMs = Date.now() + backoffMs;
+
+  quotaState = {
+    isExhausted: true,
+    backoffUntilMs: untilMs,
+    attempt: nextAttempt,
+    friendlyMessage:
+      'O serviço de salas em nuvem atingiu temporariamente o limite gratuito de requisições (Quota Exceeded). O jogo segue funcionando com cache local e servidor WebSocket de baixa latência.',
+  };
+
+  console.warn(
+    `[STF-Firestore] Cota excedida (resource-exhausted) em "${context}". Backoff exponencial ativado por ${Math.round(
+      backoffMs / 1000
+    )}s (tentativa ${nextAttempt}).`,
+    error
+  );
+  notifyQuotaStatusListeners();
+
+  if (quotaRecoveryTimer) {
+    clearTimeout(quotaRecoveryTimer);
+  }
+  quotaRecoveryTimer = setTimeout(() => {
+    quotaState = {
+      ...quotaState,
+      isExhausted: false,
+      friendlyMessage: null,
+    };
+    notifyQuotaStatusListeners();
+  }, backoffMs);
+}
+
+export function isInQuotaBackoff(): boolean {
+  if (!quotaState.isExhausted) return false;
+  if (Date.now() >= quotaState.backoffUntilMs) {
+    quotaState = {
+      ...quotaState,
+      isExhausted: false,
+      friendlyMessage: null,
+    };
+    notifyQuotaStatusListeners();
+    return false;
+  }
+  return true;
+}
+
+export function getQuotaStatus(): FirestoreQuotaStatus {
+  isInQuotaBackoff();
+  return { ...quotaState };
+}
+
+export function clearQuotaBackoffForManualRetry(): void {
+  if (quotaRecoveryTimer) {
+    clearTimeout(quotaRecoveryTimer);
+    quotaRecoveryTimer = null;
+  }
+  quotaState = {
+    isExhausted: false,
+    backoffUntilMs: 0,
+    attempt: 0,
+    friendlyMessage: null,
+  };
+  notifyQuotaStatusListeners();
+}
+
+export function subscribeToQuotaStatus(
+  cb: (status: FirestoreQuotaStatus) => void
+): () => void {
+  quotaStatusListeners.add(cb);
+  cb(getQuotaStatus());
+  return () => {
+    quotaStatusListeners.delete(cb);
+  };
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
   path: string | null
 ): never {
+  // Não confunde erro de cota (resource-exhausted) com falta de permissão
+  if (isQuotaExceededError(error)) {
+    registerQuotaExhausted(path || operationType, error);
+    throw new Error(
+      'Serviço de nuvem temporariamente ocupado (limite de requisições atingido). Aguarde alguns segundos e tente novamente.'
+    );
+  }
+
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -115,8 +241,72 @@ export function handleFirestoreError(
 // ============================================================================
 
 let authReadyPromise: Promise<User> | null = null;
+let authObserverRegistered = false;
+let isInteractiveAuthInProgress = false;
+let lastNotifiedReadyUid: string | null = null;
+let connectionValidatedOnce = false;
+const profileSyncInFlight = new Map<string, Promise<void>>();
+const syncedProfileUids = new Set<string>();
 const authReadyListeners = new Set<(user: User | null) => void>();
 const authStatusListeners = new Set<(info: AuthUserInfo) => void>();
+
+// ============================================================================
+// Local In-Memory Cache & Throttling State (Prevents Redundant Reads/Writes)
+// ============================================================================
+let cachedMyProfile: (OnlineUserProfile & { friends: string[] }) | null = null;
+const cachedRoomDocsByCode = new Map<string, Record<string, unknown>>();
+let cachedPublicRooms: MultiplayerRoomState[] = [];
+let cachedOnlinePlayers: OnlineUserProfile[] = [];
+let cachedIncomingRequests: FriendRequestDoc[] = [];
+const cachedFriendsByKey = new Map<string, OnlineUserProfile[]>();
+
+let lastPresenceWrite: {
+  uid: string;
+  status: string;
+  roomCode: string;
+  timestampMs: number;
+} | null = null;
+const lastRoomHeartbeatMsByCode = new Map<string, number>();
+const lastVoiceMicWriteByCode = new Map<string, { micEnabled: boolean; timestampMs: number }>();
+let lastAbandonedSweepMs = 0;
+
+function logAuthInfo(message: string, details?: unknown): void {
+  if (details !== undefined) {
+    console.info(`[STF-Auth] ${message}`, details);
+  } else {
+    console.info(`[STF-Auth] ${message}`);
+  }
+}
+
+function logAuthWarn(message: string, error: unknown): void {
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  console.warn(`[STF-Auth] ${message} -> ${detail}`, error);
+}
+
+function logFirestoreWarn(context: string, error: unknown): void {
+  if (isQuotaExceededError(error)) {
+    registerQuotaExhausted(context, error);
+    return;
+  }
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  console.warn(`[STF-Firestore] ${context} -> ${detail}`, error);
+}
+
+async function validateFirestoreConnectionOnce(): Promise<void> {
+  if (connectionValidatedOnce || isInQuotaBackoff()) return;
+  connectionValidatedOnce = true;
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (isQuotaExceededError(error)) {
+      registerQuotaExhausted('test/connection', error);
+      return;
+    }
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error('[STF-Firestore] Please check your Firebase configuration (client is offline).');
+    }
+  }
+}
 
 /**
  * Verifica se o usuário possui o provedor Google ('google.com') vinculado em user.providerData.
@@ -168,10 +358,37 @@ export function extractAuthUserInfo(user: User | null = auth.currentUser): AuthU
   };
 }
 
-function notifyAuthListeners(user: User | null): void {
+function notifyAuthStatusListeners(user: User | null): void {
   const info = extractAuthUserInfo(user);
-  authReadyListeners.forEach((cb) => cb(user));
-  authStatusListeners.forEach((cb) => cb(info));
+  authStatusListeners.forEach((cb) => {
+    try {
+      cb(info);
+    } catch (err) {
+      logAuthWarn('Erro em listener de status de autenticação', err);
+    }
+  });
+}
+
+function notifyAuthReadyListeners(user: User | null, force: boolean = false): void {
+  const nextUid = user?.uid ?? null;
+  if (!force && nextUid !== null && nextUid === lastNotifiedReadyUid) {
+    // Mesmo UID já notificado como pronto: apenas atualiza os listeners de UI (status/nome/provedor)
+    notifyAuthStatusListeners(user);
+    return;
+  }
+  lastNotifiedReadyUid = nextUid;
+  notifyAuthStatusListeners(user);
+  authReadyListeners.forEach((cb) => {
+    try {
+      cb(user);
+    } catch (err) {
+      logAuthWarn('Erro em listener authReady', err);
+    }
+  });
+}
+
+function notifyAuthListeners(user: User | null): void {
+  notifyAuthReadyListeners(user, false);
 }
 
 function withFirestoreTimeout<T>(
@@ -281,41 +498,95 @@ function buildSanitizedRoomPayload(
   };
 }
 
-onAuthStateChanged(auth, async (user) => {
-  if (user) {
-    notifyAuthListeners(user);
-    try {
-      await ensureUserProfile(user);
-    } catch (e) {
-      console.warn('Could not initialize user profile yet:', e);
+function ensureSingleAuthObserverRegistered(): void {
+  if (authObserverRegistered) return;
+  authObserverRegistered = true;
+
+  onAuthStateChanged(
+    auth,
+    async (user) => {
+      if (user) {
+        // Atualiza imediatamente a UI de status (Google vs Anônimo), mas aguarda token + perfil antes de liberar queries Firestore
+        notifyAuthStatusListeners(user);
+        try {
+          await user.getIdToken();
+        } catch (tokenErr) {
+          logAuthWarn(`Falha ao validar token de sessão para UID ${user.uid}`, tokenErr);
+        }
+        try {
+          await ensureUserProfile(user);
+        } catch (profileErr) {
+          logAuthWarn(`Falha ao inicializar perfil Firestore para UID ${user.uid}`, profileErr);
+        }
+        void validateFirestoreConnectionOnce();
+        notifyAuthReadyListeners(user);
+      } else {
+        lastNotifiedReadyUid = null;
+        notifyAuthStatusListeners(null);
+        if (!isInteractiveAuthInProgress) {
+          authReadyListeners.forEach((cb) => {
+            try {
+              cb(null);
+            } catch (err) {
+              logAuthWarn('Erro ao notificar desconexão em authReady', err);
+            }
+          });
+        }
+      }
+    },
+    (authObserverErr) => {
+      logAuthWarn('Erro reportado pelo observador global onAuthStateChanged', authObserverErr);
     }
-    notifyAuthListeners(user);
-  } else {
-    notifyAuthListeners(null);
-  }
-});
+  );
+}
+
+ensureSingleAuthObserverRegistered();
 
 export function subscribeToAuthReady(cb: (user: User | null) => void): () => void {
+  ensureSingleAuthObserverRegistered();
   authReadyListeners.add(cb);
-  if (auth.currentUser) {
+
+  if (auth.currentUser && lastNotifiedReadyUid === auth.currentUser.uid) {
     cb(auth.currentUser);
   } else {
-    ensureAuthenticated().catch(() => cb(null));
+    ensureAuthenticated()
+      .then((u) => {
+        if (authReadyListeners.has(cb)) {
+          cb(u);
+        }
+      })
+      .catch((err) => {
+        logAuthWarn('Não foi possível confirmar sessão em subscribeToAuthReady', err);
+        if (authReadyListeners.has(cb)) {
+          cb(null);
+        }
+      });
   }
+
   return () => {
     authReadyListeners.delete(cb);
   };
 }
 
 export function subscribeToAuthStatus(cb: (info: AuthUserInfo) => void): () => void {
+  ensureSingleAuthObserverRegistered();
   authStatusListeners.add(cb);
   if (auth.currentUser) {
     cb(extractAuthUserInfo(auth.currentUser));
   } else {
     cb(extractAuthUserInfo(null));
     ensureAuthenticated()
-      .then((u) => cb(extractAuthUserInfo(u)))
-      .catch(() => cb(extractAuthUserInfo(null)));
+      .then((u) => {
+        if (authStatusListeners.has(cb)) {
+          cb(extractAuthUserInfo(u));
+        }
+      })
+      .catch((err) => {
+        logAuthWarn('Não foi possível obter status inicial em subscribeToAuthStatus', err);
+        if (authStatusListeners.has(cb)) {
+          cb(extractAuthUserInfo(null));
+        }
+      });
   }
   return () => {
     authStatusListeners.delete(cb);
@@ -323,31 +594,46 @@ export function subscribeToAuthStatus(cb: (info: AuthUserInfo) => void): () => v
 }
 
 export function ensureAuthenticated(): Promise<User> {
-  if (auth.currentUser) {
+  ensureSingleAuthObserverRegistered();
+
+  if (auth.currentUser && lastNotifiedReadyUid === auth.currentUser.uid) {
     return Promise.resolve(auth.currentUser);
   }
+
   if (!authReadyPromise) {
-    authReadyPromise = new Promise<User>((resolve, reject) => {
-      const unsubscribe = onAuthStateChanged(auth, async (user) => {
-        if (user) {
-          unsubscribe();
-          resolve(user);
-          ensureUserProfile(user).catch(() => {});
-        } else {
-          try {
-            const cred = await signInAnonymously(auth);
-            unsubscribe();
-            resolve(cred.user);
-            ensureUserProfile(cred.user).catch(() => {});
-          } catch (err) {
-            unsubscribe();
-            authReadyPromise = null;
-            reject(err);
-          }
+    authReadyPromise = (async () => {
+      try {
+        // 1. Aguarda a restauração nativa da sessão persistida no IndexedDB/LocalStorage sem registrar novo onAuthStateChanged
+        if (typeof auth.authStateReady === 'function') {
+          await auth.authStateReady();
         }
-      });
-    });
+
+        let activeUser = auth.currentUser;
+
+        // 2. Se não houver sessão persistida e nenhum login Google interativo estiver em andamento, cria sessão anônima
+        if (!activeUser && !isInteractiveAuthInProgress) {
+          logAuthInfo('Nenhuma sessão prévia restaurada; iniciando autenticação anônima.');
+          const cred = await signInAnonymously(auth);
+          activeUser = cred.user;
+        }
+
+        if (!activeUser) {
+          throw new Error('Sessão de autenticação indisponível no momento.');
+        }
+
+        await activeUser.getIdToken();
+        await ensureUserProfile(activeUser);
+        notifyAuthReadyListeners(activeUser);
+        return activeUser;
+      } catch (err) {
+        logAuthWarn('Erro durante ensureAuthenticated()', err);
+        throw err;
+      } finally {
+        authReadyPromise = null;
+      }
+    })();
   }
+
   return authReadyPromise;
 }
 
@@ -372,7 +658,7 @@ export async function linkGoogleAccount(): Promise<GoogleLinkResult> {
   // 1. Se o usuário já possui provedor Google vinculado, não abre novo fluxo duplicado
   if (currentUser && isUserGoogleLinked(currentUser)) {
     await ensureUserProfile(currentUser);
-    notifyAuthListeners(currentUser);
+    notifyAuthStatusListeners(currentUser);
     return {
       user: currentUser,
       mergedFromAnonymous: false,
@@ -380,69 +666,81 @@ export async function linkGoogleAccount(): Promise<GoogleLinkResult> {
     };
   }
 
-  // 2. Se o usuário está autenticado anonimamente, usa linkWithPopup para preservar o UID
-  if (currentUser && currentUser.isAnonymous) {
-    const anonUid = currentUser.uid;
-    let anonProfileData: Record<string, unknown> | null = null;
-    try {
-      const anonSnap = await getDoc(doc(db, 'users', anonUid));
-      if (anonSnap.exists()) {
-        anonProfileData = anonSnap.data();
+  isInteractiveAuthInProgress = true;
+  try {
+    // 2. Se o usuário está autenticado anonimamente, usa linkWithPopup para preservar o UID
+    if (currentUser && currentUser.isAnonymous) {
+      const anonUid = currentUser.uid;
+      let anonProfileData: Record<string, unknown> | null = null;
+      try {
+        const anonSnap = await getDoc(doc(db, 'users', anonUid));
+        if (anonSnap.exists()) {
+          anonProfileData = anonSnap.data();
+        }
+      } catch (readErr) {
+        logFirestoreWarn(`Leitura pré-vinculação de users/${anonUid} ignorada`, readErr);
       }
-    } catch {
-      // Ignore pre-read error
-    }
 
-    try {
-      const linkedResult = await linkWithPopup(currentUser, provider);
-      const googleName =
-        linkedResult.user.displayName ||
-        linkedResult.user.providerData.find((p) => p.providerId === 'google.com')?.displayName ||
-        undefined;
-      await ensureUserProfile(linkedResult.user, googleName);
-      notifyAuthListeners(linkedResult.user);
-      return {
-        user: linkedResult.user,
-        mergedFromAnonymous: false,
-        alreadyLinked: false,
-      };
-    } catch (err: unknown) {
-      const fbErr = err as FirebaseError | undefined;
-      const code = fbErr?.code || '';
-
-      if (
-        code === 'auth/credential-already-in-use' ||
-        code === 'auth/account-exists-with-different-credential' ||
-        code === 'auth/email-already-in-use'
-      ) {
-        const credential = GoogleAuthProvider.credentialFromError(err as FirebaseError);
-        const signInResult = credential
-          ? await signInWithCredential(auth, credential)
-          : await signInWithPopup(auth, provider);
-        const googleUser = signInResult.user;
-
-        await mergeAnonymousDataIntoGoogleUser(anonUid, anonProfileData, googleUser);
-        notifyAuthListeners(googleUser);
+      try {
+        const linkedResult = await linkWithPopup(currentUser, provider);
+        const googleName =
+          linkedResult.user.displayName ||
+          linkedResult.user.providerData.find((p) => p.providerId === 'google.com')?.displayName ||
+          undefined;
+        await ensureUserProfile(linkedResult.user, googleName);
+        notifyAuthStatusListeners(linkedResult.user);
+        logAuthInfo(`Conta anônima ${anonUid} vinculada ao Google preservando o mesmo UID.`);
         return {
-          user: googleUser,
-          mergedFromAnonymous: true,
+          user: linkedResult.user,
+          mergedFromAnonymous: false,
           alreadyLinked: false,
         };
+      } catch (err: unknown) {
+        const fbErr = err as FirebaseError | undefined;
+        const code = fbErr?.code || '';
+
+        if (
+          code === 'auth/credential-already-in-use' ||
+          code === 'auth/account-exists-with-different-credential' ||
+          code === 'auth/email-already-in-use'
+        ) {
+          logAuthInfo(
+            `Conta Google já existente detectada (${code}). Mesclando progresso anônimo (${anonUid}) para a conta Google existente.`
+          );
+          const credential = GoogleAuthProvider.credentialFromError(err as FirebaseError);
+          const signInResult = credential
+            ? await signInWithCredential(auth, credential)
+            : await signInWithPopup(auth, provider);
+          const googleUser = signInResult.user;
+
+          await googleUser.getIdToken();
+          await mergeAnonymousDataIntoGoogleUser(anonUid, anonProfileData, googleUser);
+          notifyAuthReadyListeners(googleUser);
+          return {
+            user: googleUser,
+            mergedFromAnonymous: true,
+            alreadyLinked: false,
+          };
+        }
+
+        logAuthWarn('Erro ao vincular conta Google via linkWithPopup', err);
+        throw err;
       }
-
-      throw err;
     }
-  }
 
-  // 3. Caso não haja usuário logado, autentica com Google diretamente
-  const result = await signInWithPopup(auth, provider);
-  await ensureUserProfile(result.user);
-  notifyAuthListeners(result.user);
-  return {
-    user: result.user,
-    mergedFromAnonymous: false,
-    alreadyLinked: false,
-  };
+    // 3. Caso não haja usuário logado, autentica com Google diretamente
+    const result = await signInWithPopup(auth, provider);
+    await result.user.getIdToken();
+    await ensureUserProfile(result.user);
+    notifyAuthReadyListeners(result.user);
+    return {
+      user: result.user,
+      mergedFromAnonymous: false,
+      alreadyLinked: false,
+    };
+  } finally {
+    isInteractiveAuthInProgress = false;
+  }
 }
 
 async function mergeAnonymousDataIntoGoogleUser(
@@ -573,98 +871,159 @@ function generateTagCode(uid: string): string {
 }
 
 export async function ensureUserProfile(user: User, preferredNickname?: string): Promise<void> {
-  const userRef = doc(db, 'users', user.uid);
-  try {
-    const snap = await getDoc(userRef);
-    const googleName = user.providerData?.find((p) => p.providerId === 'google.com')?.displayName;
-    const defaultName =
-      preferredNickname?.trim() ||
-      user.displayName?.trim() ||
-      googleName?.trim() ||
-      `Craque_${user.uid.slice(0, 4).toUpperCase()}`;
+  if (isInQuotaBackoff()) return;
 
-    if (!snap.exists()) {
-      await setDoc(userRef, {
-        uid: user.uid,
-        displayName: (defaultName || 'Jogador').slice(0, 28),
-        tagCode: generateTagCode(user.uid),
-        status: 'online',
-        currentRoomCode: '',
-        friends: [],
-        wins: 0,
-        losses: 0,
-        draws: 0,
-        goalsScored: 0,
-        goalsConceded: 0,
-        matchesPlayed: 0,
-        updatedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      });
-    } else {
-      const existing = snap.data();
-      const existingName = typeof existing.displayName === 'string' ? existing.displayName : '';
-      const resolvedName =
-        preferredNickname?.trim() ||
-        (existingName && !existingName.startsWith('Craque_') ? existingName : defaultName);
-
-      await setDoc(userRef, {
-        uid: user.uid,
-        displayName: (resolvedName || 'Jogador').slice(0, 28),
-        tagCode:
-          typeof existing.tagCode === 'string' && existing.tagCode.length >= 2
-            ? existing.tagCode.slice(0, 20)
-            : generateTagCode(user.uid),
-        status:
-          existing.status === 'in_room' ||
-          existing.status === 'playing' ||
-          existing.status === 'offline'
-            ? existing.status
-            : 'online',
-        currentRoomCode:
-          typeof existing.currentRoomCode === 'string' ? existing.currentRoomCode.slice(0, 16) : '',
-        friends: Array.isArray(existing.friends)
-          ? existing.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
-          : [],
-        wins: typeof existing.wins === 'number' && existing.wins >= 0 ? Math.floor(existing.wins) : 0,
-        losses:
-          typeof existing.losses === 'number' && existing.losses >= 0
-            ? Math.floor(existing.losses)
-            : 0,
-        draws:
-          typeof existing.draws === 'number' && existing.draws >= 0 ? Math.floor(existing.draws) : 0,
-        goalsScored:
-          typeof existing.goalsScored === 'number' && existing.goalsScored >= 0
-            ? Math.floor(existing.goalsScored)
-            : 0,
-        goalsConceded:
-          typeof existing.goalsConceded === 'number' && existing.goalsConceded >= 0
-            ? Math.floor(existing.goalsConceded)
-            : 0,
-        matchesPlayed:
-          typeof existing.matchesPlayed === 'number' && existing.matchesPlayed >= 0
-            ? Math.floor(existing.matchesPlayed)
-            : 0,
-        createdAt: existing.createdAt instanceof Timestamp ? existing.createdAt : serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-  } catch (err) {
-    console.warn(`Aviso ao sincronizar perfil users/${user.uid}:`, err);
+  // Se o perfil deste UID já foi sincronizado nesta sessão e não há troca de apelido, usa o cache local sem consultar o Firestore
+  if (
+    !preferredNickname?.trim() &&
+    syncedProfileUids.has(user.uid) &&
+    cachedMyProfile &&
+    cachedMyProfile.uid === user.uid
+  ) {
+    return;
   }
+
+  const syncKey = `${user.uid}:${preferredNickname?.trim() || ''}`;
+  const existingSync = profileSyncInFlight.get(syncKey);
+  if (existingSync) {
+    return existingSync;
+  }
+
+  const syncTask = (async () => {
+    const userRef = doc(db, 'users', user.uid);
+    try {
+      const snap = await getDoc(userRef);
+      const googleName = user.providerData?.find((p) => p.providerId === 'google.com')?.displayName;
+      const defaultName =
+        preferredNickname?.trim() ||
+        user.displayName?.trim() ||
+        googleName?.trim() ||
+        `Craque_${user.uid.slice(0, 4).toUpperCase()}`;
+
+      if (!snap.exists()) {
+        const newProfileDoc = {
+          uid: user.uid,
+          displayName: (defaultName || 'Jogador').slice(0, 28),
+          tagCode: generateTagCode(user.uid),
+          status: 'online',
+          currentRoomCode: '',
+          friends: [],
+          wins: 0,
+          losses: 0,
+          draws: 0,
+          goalsScored: 0,
+          goalsConceded: 0,
+          matchesPlayed: 0,
+          updatedAt: serverTimestamp(),
+          createdAt: serverTimestamp(),
+        };
+        await setDoc(userRef, newProfileDoc);
+        cachedMyProfile = mapDocToOnlineUserProfile(user.uid, newProfileDoc);
+        syncedProfileUids.add(user.uid);
+      } else {
+        const existing = snap.data();
+        const existingName = typeof existing.displayName === 'string' ? existing.displayName : '';
+        const resolvedName =
+          preferredNickname?.trim() ||
+          (existingName && !existingName.startsWith('Craque_') ? existingName : defaultName);
+
+        // Só regrava o documento no boot se o nickname mudou ou se algum campo obrigatório do schema precisar de normalização
+        const needsNormalization =
+          Boolean(preferredNickname?.trim() && preferredNickname.trim() !== existingName) ||
+          existing.uid !== user.uid ||
+          typeof existing.tagCode !== 'string' ||
+          existing.tagCode.length < 2 ||
+          typeof existing.currentRoomCode !== 'string' ||
+          !Array.isArray(existing.friends) ||
+          typeof existing.wins !== 'number' ||
+          typeof existing.losses !== 'number' ||
+          typeof existing.draws !== 'number' ||
+          typeof existing.goalsScored !== 'number' ||
+          !(existing.createdAt instanceof Timestamp) ||
+          !(existing.updatedAt instanceof Timestamp);
+
+        if (needsNormalization) {
+          const normalizedDoc = {
+            uid: user.uid,
+            displayName: (resolvedName || 'Jogador').slice(0, 28),
+            tagCode:
+              typeof existing.tagCode === 'string' && existing.tagCode.length >= 2
+                ? existing.tagCode.slice(0, 20)
+                : generateTagCode(user.uid),
+            status:
+              existing.status === 'in_room' ||
+              existing.status === 'playing' ||
+              existing.status === 'offline'
+                ? existing.status
+                : 'online',
+            currentRoomCode:
+              typeof existing.currentRoomCode === 'string'
+                ? existing.currentRoomCode.slice(0, 16)
+                : '',
+            friends: Array.isArray(existing.friends)
+              ? existing.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
+              : [],
+            wins:
+              typeof existing.wins === 'number' && existing.wins >= 0
+                ? Math.floor(existing.wins)
+                : 0,
+            losses:
+              typeof existing.losses === 'number' && existing.losses >= 0
+                ? Math.floor(existing.losses)
+                : 0,
+            draws:
+              typeof existing.draws === 'number' && existing.draws >= 0
+                ? Math.floor(existing.draws)
+                : 0,
+            goalsScored:
+              typeof existing.goalsScored === 'number' && existing.goalsScored >= 0
+                ? Math.floor(existing.goalsScored)
+                : 0,
+            goalsConceded:
+              typeof existing.goalsConceded === 'number' && existing.goalsConceded >= 0
+                ? Math.floor(existing.goalsConceded)
+                : 0,
+            matchesPlayed:
+              typeof existing.matchesPlayed === 'number' && existing.matchesPlayed >= 0
+                ? Math.floor(existing.matchesPlayed)
+                : 0,
+            createdAt:
+              existing.createdAt instanceof Timestamp ? existing.createdAt : serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          };
+          await setDoc(userRef, normalizedDoc);
+          cachedMyProfile = mapDocToOnlineUserProfile(user.uid, normalizedDoc);
+        } else {
+          cachedMyProfile = mapDocToOnlineUserProfile(user.uid, existing);
+        }
+        syncedProfileUids.add(user.uid);
+      }
+    } catch (err) {
+      logFirestoreWarn(`Falha ao sincronizar perfil users/${user.uid}`, err);
+    } finally {
+      profileSyncInFlight.delete(syncKey);
+    }
+  })();
+
+  profileSyncInFlight.set(syncKey, syncTask);
+  return syncTask;
 }
 
 export async function updateNickname(newName: string): Promise<void> {
   const user = await ensureAuthenticated();
   const cleanName = newName.trim().slice(0, 28);
   if (!cleanName) return;
+  if (cachedMyProfile && cachedMyProfile.uid === user.uid && cachedMyProfile.displayName === cleanName) {
+    return;
+  }
 
   try {
     await updateProfile(user, { displayName: cleanName });
-  } catch {
-    // Ignore Auth profile update issues on anonymous users
+  } catch (err) {
+    logAuthWarn('Aviso ao atualizar displayName no Firebase Auth', err);
   }
   await ensureUserProfile(user, cleanName);
-  notifyAuthListeners(auth.currentUser);
+  notifyAuthStatusListeners(auth.currentUser);
 }
 
 export async function updateUserPresence(
@@ -672,12 +1031,82 @@ export async function updateUserPresence(
   roomCode: string = ''
 ): Promise<void> {
   const user = auth.currentUser;
-  if (!user) return;
+  if (!user || isInQuotaBackoff()) return;
+
+  const cleanRoom = roomCode.trim().toUpperCase().slice(0, 16);
+  const nowMs = Date.now();
+
+  // Evita gravar no Firestore quando o status e o roomCode não mudaram!
+  if (
+    lastPresenceWrite &&
+    lastPresenceWrite.uid === user.uid &&
+    lastPresenceWrite.status === status &&
+    lastPresenceWrite.roomCode === cleanRoom
+  ) {
+    return;
+  }
+
+  if (
+    cachedMyProfile &&
+    cachedMyProfile.uid === user.uid &&
+    cachedMyProfile.status === status &&
+    cachedMyProfile.currentRoomCode === cleanRoom &&
+    lastPresenceWrite &&
+    nowMs - lastPresenceWrite.timestampMs < 30_000
+  ) {
+    return;
+  }
+
+  lastPresenceWrite = {
+    uid: user.uid,
+    status,
+    roomCode: cleanRoom,
+    timestampMs: nowMs,
+  };
+
+  if (cachedMyProfile && cachedMyProfile.uid === user.uid) {
+    cachedMyProfile = {
+      ...cachedMyProfile,
+      status: status === 'offline' ? 'online' : status,
+      currentRoomCode: cleanRoom,
+      updatedAt: nowMs,
+    };
+  }
+
   const userRef = doc(db, 'users', user.uid);
   try {
+    // Usa o perfil em cache local para evitar getDoc antes do setDoc
+    if (cachedMyProfile && cachedMyProfile.uid === user.uid) {
+      await setDoc(userRef, {
+        uid: user.uid,
+        displayName: String(cachedMyProfile.displayName || user.displayName || 'Jogador').slice(0, 28),
+        tagCode:
+          typeof cachedMyProfile.tagCode === 'string' && cachedMyProfile.tagCode.length >= 2
+            ? cachedMyProfile.tagCode.slice(0, 20)
+            : generateTagCode(user.uid),
+        status,
+        currentRoomCode: cleanRoom,
+        friends: Array.isArray(cachedMyProfile.friends)
+          ? cachedMyProfile.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
+          : [],
+        wins: Math.max(0, Math.floor(cachedMyProfile.wins || 0)),
+        losses: Math.max(0, Math.floor(cachedMyProfile.losses || 0)),
+        draws: Math.max(0, Math.floor(cachedMyProfile.draws || 0)),
+        goalsScored: Math.max(0, Math.floor(cachedMyProfile.goalsScored || 0)),
+        goalsConceded: Math.max(0, Math.floor(cachedMyProfile.goalsConceded || 0)),
+        matchesPlayed: Math.max(0, Math.floor(cachedMyProfile.matchesPlayed || 0)),
+        createdAt: Timestamp.fromMillis(cachedMyProfile.createdAt || nowMs),
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    }
+
     const snap = await getDoc(userRef);
     if (!snap.exists()) return;
     const d = snap.data();
+    if (d.status === status && String(d.currentRoomCode || '') === cleanRoom) {
+      return;
+    }
     await setDoc(userRef, {
       uid: user.uid,
       displayName: String(d.displayName || user.displayName || 'Jogador').slice(0, 28),
@@ -686,7 +1115,7 @@ export async function updateUserPresence(
           ? d.tagCode.slice(0, 20)
           : generateTagCode(user.uid),
       status,
-      currentRoomCode: roomCode.slice(0, 16),
+      currentRoomCode: cleanRoom,
       friends: Array.isArray(d.friends)
         ? d.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
         : [],
@@ -706,12 +1135,15 @@ export async function updateUserPresence(
       createdAt: d.createdAt instanceof Timestamp ? d.createdAt : serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
-  } catch {
-    // Non-fatal heartbeat update
+  } catch (err) {
+    logFirestoreWarn('Aviso em updateUserPresence', err);
   }
 }
 
-function mapDocToOnlineUserProfile(id: string, d: Record<string, unknown>): OnlineUserProfile & { friends: string[] } {
+function mapDocToOnlineUserProfile(
+  id: string,
+  d: Record<string, unknown>
+): OnlineUserProfile & { friends: string[] } {
   const updatedTs = d.updatedAt instanceof Timestamp ? d.updatedAt.toMillis() : Date.now();
   const createdTs = d.createdAt instanceof Timestamp ? d.createdAt.toMillis() : Date.now();
   return {
@@ -732,57 +1164,145 @@ function mapDocToOnlineUserProfile(id: string, d: Record<string, unknown>): Onli
   };
 }
 
+// Multiplexador de subscribeToMyProfile (garante apenas 1 onSnapshot em users/{uid} em todo o app)
+const myProfileSubscribers = new Set<
+  (profile: (OnlineUserProfile & { friends: string[] }) | null) => void
+>();
+let sharedMyProfileUnsubDoc: (() => void) | null = null;
+let sharedMyProfileUnsubAuth: (() => void) | null = null;
+let sharedMyProfileActiveUid: string | null = null;
+
+function teardownSharedMyProfileListener(): void {
+  if (sharedMyProfileUnsubDoc) {
+    sharedMyProfileUnsubDoc();
+    sharedMyProfileUnsubDoc = null;
+  }
+  if (sharedMyProfileUnsubAuth) {
+    sharedMyProfileUnsubAuth();
+    sharedMyProfileUnsubAuth = null;
+  }
+  sharedMyProfileActiveUid = null;
+}
+
 export function subscribeToMyProfile(
   cb: (profile: (OnlineUserProfile & { friends: string[] }) | null) => void
 ): () => void {
-  let unsubDoc: (() => void) | null = null;
-  const unsubAuth = subscribeToAuthReady((user) => {
-    if (unsubDoc) {
-      unsubDoc();
-      unsubDoc = null;
-    }
-    if (!user) {
-      cb(null);
-      return;
-    }
-    const userRef = doc(db, 'users', user.uid);
-    unsubDoc = onSnapshot(
-      userRef,
-      (snap) => {
-        if (snap.exists()) {
-          cb(mapDocToOnlineUserProfile(snap.id, snap.data()));
-        } else {
-          cb(null);
-        }
-      },
-      (err) => {
-        console.error('Error listening to profile:', err);
+  myProfileSubscribers.add(cb);
+  if (cachedMyProfile) {
+    cb(cachedMyProfile);
+  }
+
+  if (!sharedMyProfileUnsubAuth) {
+    sharedMyProfileUnsubAuth = subscribeToAuthReady((user) => {
+      const nextUid = user?.uid ?? null;
+      if (nextUid === sharedMyProfileActiveUid && sharedMyProfileUnsubDoc) {
+        return;
       }
-    );
-  });
+
+      if (sharedMyProfileUnsubDoc) {
+        sharedMyProfileUnsubDoc();
+        sharedMyProfileUnsubDoc = null;
+      }
+      sharedMyProfileActiveUid = nextUid;
+
+      if (!user || isInQuotaBackoff()) {
+        if (!user) {
+          cachedMyProfile = null;
+        }
+        myProfileSubscribers.forEach((sub) => sub(cachedMyProfile));
+        return;
+      }
+
+      const userRef = doc(db, 'users', user.uid);
+      sharedMyProfileUnsubDoc = onSnapshot(
+        userRef,
+        (snap) => {
+          if (snap.exists()) {
+            cachedMyProfile = mapDocToOnlineUserProfile(snap.id, snap.data());
+            syncedProfileUids.add(user.uid);
+          } else {
+            cachedMyProfile = null;
+          }
+          myProfileSubscribers.forEach((sub) => sub(cachedMyProfile));
+        },
+        (err) => {
+          logFirestoreWarn(`Erro no listener subscribeToMyProfile (users/${user.uid})`, err);
+        }
+      );
+    });
+  }
 
   return () => {
-    unsubAuth();
-    if (unsubDoc) unsubDoc();
+    myProfileSubscribers.delete(cb);
+    if (myProfileSubscribers.size === 0) {
+      teardownSharedMyProfileListener();
+    }
   };
 }
 
+// Multiplexador de subscribeToOnlinePlayers (máximo 1 listener compartilhado na aba Amigos)
+const onlinePlayersSubscribers = new Set<(players: OnlineUserProfile[]) => void>();
+let sharedOnlinePlayersUnsubSnap: (() => void) | null = null;
+let sharedOnlinePlayersUnsubAuth: (() => void) | null = null;
+let sharedOnlinePlayersActiveUid: string | null = null;
+
 export function subscribeToOnlinePlayers(cb: (players: OnlineUserProfile[]) => void): () => void {
-  const q = query(collection(db, 'users'), limit(40));
-  return onSnapshot(
-    q,
-    (snap) => {
-      const list: OnlineUserProfile[] = [];
-      snap.forEach((docSnap) => {
-        list.push(mapDocToOnlineUserProfile(docSnap.id, docSnap.data()));
-      });
-      list.sort((a, b) => b.updatedAt - a.updatedAt);
-      cb(list);
-    },
-    (err) => {
-      console.warn('Could not list online players:', err);
+  onlinePlayersSubscribers.add(cb);
+  if (cachedOnlinePlayers.length > 0) {
+    cb(cachedOnlinePlayers);
+  }
+
+  if (!sharedOnlinePlayersUnsubAuth) {
+    sharedOnlinePlayersUnsubAuth = subscribeToAuthReady((user) => {
+      const nextUid = user?.uid ?? null;
+      if (nextUid === sharedOnlinePlayersActiveUid && sharedOnlinePlayersUnsubSnap) {
+        return;
+      }
+
+      if (sharedOnlinePlayersUnsubSnap) {
+        sharedOnlinePlayersUnsubSnap();
+        sharedOnlinePlayersUnsubSnap = null;
+      }
+      sharedOnlinePlayersActiveUid = nextUid;
+
+      if (!user || isInQuotaBackoff()) {
+        onlinePlayersSubscribers.forEach((sub) => sub(cachedOnlinePlayers));
+        return;
+      }
+
+      const q = query(collection(db, 'users'), limit(20));
+      sharedOnlinePlayersUnsubSnap = onSnapshot(
+        q,
+        (snap) => {
+          const list: OnlineUserProfile[] = [];
+          snap.forEach((docSnap) => {
+            list.push(mapDocToOnlineUserProfile(docSnap.id, docSnap.data()));
+          });
+          list.sort((a, b) => b.updatedAt - a.updatedAt);
+          cachedOnlinePlayers = list;
+          onlinePlayersSubscribers.forEach((sub) => sub(list));
+        },
+        (err) => {
+          logFirestoreWarn('Erro no listener subscribeToOnlinePlayers (users)', err);
+        }
+      );
+    });
+  }
+
+  return () => {
+    onlinePlayersSubscribers.delete(cb);
+    if (onlinePlayersSubscribers.size === 0) {
+      if (sharedOnlinePlayersUnsubSnap) {
+        sharedOnlinePlayersUnsubSnap();
+        sharedOnlinePlayersUnsubSnap = null;
+      }
+      if (sharedOnlinePlayersUnsubAuth) {
+        sharedOnlinePlayersUnsubAuth();
+        sharedOnlinePlayersUnsubAuth = null;
+      }
+      sharedOnlinePlayersActiveUid = null;
     }
-  );
+  };
 }
 
 // ============================================================================
@@ -802,52 +1322,80 @@ export interface FriendRequestDoc {
   createdAt: number;
 }
 
-export async function sendFriendRequestByTag(targetTagOrName: string): Promise<{ ok: boolean; message: string }> {
-  const user = await ensureAuthenticated();
-  const mySnap = await getDoc(doc(db, 'users', user.uid));
-  if (!mySnap.exists()) {
-    return { ok: false, message: 'Perfil ainda não carregado.' };
+export async function sendFriendRequestByTag(
+  targetTagOrName: string
+): Promise<{ ok: boolean; message: string }> {
+  if (isInQuotaBackoff()) {
+    return {
+      ok: false,
+      message: 'Serviço temporariamente ocupado. Aguarde alguns segundos e tente novamente.',
+    };
   }
-  const me = mySnap.data();
-
+  const user = await ensureAuthenticated();
   const search = targetTagOrName.trim();
   if (!search) {
     return { ok: false, message: 'Digite o código #STF ou nome do amigo.' };
   }
 
-  let q = query(collection(db, 'users'), where('tagCode', '==', search.toUpperCase()), limit(5));
-  let snap = await getDocs(q);
+  let meName = cachedMyProfile?.displayName || user.displayName || 'Jogador';
+  let meTag = cachedMyProfile?.tagCode || generateTagCode(user.uid);
 
-  if (snap.empty) {
-    q = query(collection(db, 'users'), where('displayName', '==', search), limit(5));
-    snap = await getDocs(q);
+  if (!cachedMyProfile || cachedMyProfile.uid !== user.uid) {
+    const mySnap = await getDoc(doc(db, 'users', user.uid));
+    if (!mySnap.exists()) {
+      return { ok: false, message: 'Perfil ainda não carregado.' };
+    }
+    const me = mySnap.data();
+    meName = String(me.displayName || meName);
+    meTag = String(me.tagCode || meTag);
   }
 
-  if (snap.empty) {
-    return { ok: false, message: 'Nenhum jogador encontrado com essa Tag ou Nome.' };
+  // Primeiro verifica no cache local de jogadores online para economizar leituras getDocs
+  let targetUid: string | null = null;
+  let targetDisplayName: string | null = null;
+  const cachedMatch = cachedOnlinePlayers.find(
+    (p) =>
+      p.tagCode.toUpperCase() === search.toUpperCase() ||
+      p.displayName.toLowerCase() === search.toLowerCase()
+  );
+
+  if (cachedMatch) {
+    targetUid = cachedMatch.uid;
+    targetDisplayName = cachedMatch.displayName;
+  } else {
+    let q = query(collection(db, 'users'), where('tagCode', '==', search.toUpperCase()), limit(3));
+    let snap = await getDocs(q);
+
+    if (snap.empty) {
+      q = query(collection(db, 'users'), where('displayName', '==', search), limit(3));
+      snap = await getDocs(q);
+    }
+
+    if (snap.empty) {
+      return { ok: false, message: 'Nenhum jogador encontrado com essa Tag ou Nome.' };
+    }
+    targetUid = snap.docs[0].id;
+    targetDisplayName = String(snap.docs[0].data().displayName || 'Amigo');
   }
 
-  const targetDoc = snap.docs[0];
-  const targetData = targetDoc.data();
-
-  if (targetDoc.id === user.uid) {
+  if (targetUid === user.uid) {
     return { ok: false, message: 'Você não pode adicionar a si mesmo!' };
   }
 
   try {
     await addDoc(collection(db, 'friendRequests'), {
       fromUid: user.uid,
-      fromName: String(me.displayName || 'Jogador').slice(0, 28),
-      fromTag: String(me.tagCode || '#STF0000'),
-      toUid: targetDoc.id,
-      toName: String(targetData.displayName || 'Amigo').slice(0, 28),
+      fromName: meName.slice(0, 28),
+      fromTag: meTag.slice(0, 16),
+      toUid: targetUid,
+      toName: (targetDisplayName || 'Amigo').slice(0, 28),
       type: 'friend_request',
       roomCode: '',
       status: 'pending',
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
-    return { ok: true, message: `Pedido enviado para ${targetData.displayName}!` };
+    return { ok: true, message: `Pedido enviado para ${targetDisplayName}!` };
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, 'friendRequests');
   }
@@ -858,15 +1406,16 @@ export async function sendRoomInviteToFriend(
   friendName: string,
   roomCode: string
 ): Promise<void> {
+  if (isInQuotaBackoff()) return;
   const user = await ensureAuthenticated();
-  const mySnap = await getDoc(doc(db, 'users', user.uid));
-  const me = mySnap.exists() ? mySnap.data() : { displayName: 'Craque', tagCode: '#STF0000' };
+  const meName = cachedMyProfile?.displayName || user.displayName || 'Craque';
+  const meTag = cachedMyProfile?.tagCode || generateTagCode(user.uid);
 
   try {
     await addDoc(collection(db, 'friendRequests'), {
       fromUid: user.uid,
-      fromName: String(me.displayName || 'Craque').slice(0, 28),
-      fromTag: String(me.tagCode || '#STF0000'),
+      fromName: String(meName).slice(0, 28),
+      fromTag: String(meTag).slice(0, 16),
       toUid: friendUid,
       toName: friendName.slice(0, 28),
       type: 'room_invite',
@@ -884,6 +1433,7 @@ export async function respondToFriendRequest(
   request: FriendRequestDoc,
   accept: boolean
 ): Promise<void> {
+  if (isInQuotaBackoff()) return;
   const user = await ensureAuthenticated();
   const reqRef = doc(db, 'friendRequests', request.id);
 
@@ -908,9 +1458,8 @@ export async function respondToFriendRequest(
       });
     }
   } catch (err) {
-    console.warn(`Aviso ao atualizar friendRequests/${request.id}:`, err);
+    logFirestoreWarn(`Aviso ao atualizar friendRequests/${request.id}`, err);
     if (request.type !== 'room_invite') {
-      // Tenta remover caso o documento antigo estivesse com schema incompatível
       await deleteDoc(reqRef).catch(() => {});
     }
   }
@@ -923,7 +1472,7 @@ export async function respondToFriendRequest(
         updatedAt: serverTimestamp(),
       });
     } catch (err) {
-      console.warn('Aviso ao adicionar amigo no perfil local:', err);
+      logFirestoreWarn('Aviso ao adicionar amigo no perfil local', err);
     }
 
     try {
@@ -933,60 +1482,94 @@ export async function respondToFriendRequest(
         updatedAt: serverTimestamp(),
       });
     } catch (err) {
-      console.warn('Aviso ao adicionar amigo no perfil remetente:', err);
+      logFirestoreWarn('Aviso ao adicionar amigo no perfil remetente', err);
     }
   }
 }
 
+// Multiplexador de subscribeToIncomingRequests
+const incomingRequestsSubscribers = new Set<(requests: FriendRequestDoc[]) => void>();
+let sharedIncomingUnsubSnap: (() => void) | null = null;
+let sharedIncomingUnsubAuth: (() => void) | null = null;
+let sharedIncomingActiveUid: string | null = null;
+
 export function subscribeToIncomingRequests(
   cb: (requests: FriendRequestDoc[]) => void
 ): () => void {
-  let unsubSnap: (() => void) | null = null;
-  const unsubAuth = subscribeToAuthReady((user) => {
-    if (unsubSnap) {
-      unsubSnap();
-      unsubSnap = null;
-    }
-    if (!user) {
-      cb([]);
-      return;
-    }
-    const q = query(
-      collection(db, 'friendRequests'),
-      where('toUid', '==', user.uid),
-      where('status', '==', 'pending'),
-      limit(25)
-    );
-    unsubSnap = onSnapshot(
-      q,
-      (snap) => {
-        const list: FriendRequestDoc[] = [];
-        snap.forEach((docSnap) => {
-          const d = docSnap.data();
-          list.push({
-            id: docSnap.id,
-            fromUid: String(d.fromUid),
-            fromName: String(d.fromName),
-            fromTag: String(d.fromTag || '#STF'),
-            toUid: String(d.toUid),
-            toName: String(d.toName),
-            type: (d.type as 'friend_request' | 'room_invite') || 'friend_request',
-            roomCode: String(d.roomCode || ''),
-            status: (d.status as 'pending' | 'accepted' | 'declined') || 'pending',
-            createdAt: d.createdAt instanceof Timestamp ? d.createdAt.toMillis() : Date.now(),
-          });
-        });
-        cb(list);
-      },
-      (err) => {
-        console.warn('Error listening to incoming friend requests:', err);
+  incomingRequestsSubscribers.add(cb);
+  if (cachedIncomingRequests.length > 0) {
+    cb(cachedIncomingRequests);
+  }
+
+  if (!sharedIncomingUnsubAuth) {
+    sharedIncomingUnsubAuth = subscribeToAuthReady((user) => {
+      const nextUid = user?.uid ?? null;
+      if (nextUid === sharedIncomingActiveUid && sharedIncomingUnsubSnap) {
+        return;
       }
-    );
-  });
+
+      if (sharedIncomingUnsubSnap) {
+        sharedIncomingUnsubSnap();
+        sharedIncomingUnsubSnap = null;
+      }
+      sharedIncomingActiveUid = nextUid;
+
+      if (!user || isInQuotaBackoff()) {
+        if (!user) cachedIncomingRequests = [];
+        incomingRequestsSubscribers.forEach((sub) => sub(cachedIncomingRequests));
+        return;
+      }
+
+      const q = query(
+        collection(db, 'friendRequests'),
+        where('toUid', '==', user.uid),
+        limit(20)
+      );
+      sharedIncomingUnsubSnap = onSnapshot(
+        q,
+        (snap) => {
+          const list: FriendRequestDoc[] = [];
+          snap.forEach((docSnap) => {
+            const d = docSnap.data();
+            const status = (d.status as 'pending' | 'accepted' | 'declined') || 'pending';
+            if (status !== 'pending') return;
+            list.push({
+              id: docSnap.id,
+              fromUid: String(d.fromUid),
+              fromName: String(d.fromName),
+              fromTag: String(d.fromTag || '#STF'),
+              toUid: String(d.toUid),
+              toName: String(d.toName),
+              type: (d.type as 'friend_request' | 'room_invite') || 'friend_request',
+              roomCode: String(d.roomCode || ''),
+              status,
+              createdAt: d.createdAt instanceof Timestamp ? d.createdAt.toMillis() : Date.now(),
+            });
+          });
+          list.sort((a, b) => b.createdAt - a.createdAt);
+          cachedIncomingRequests = list;
+          incomingRequestsSubscribers.forEach((sub) => sub(list));
+        },
+        (err) => {
+          logFirestoreWarn(`Erro no listener subscribeToIncomingRequests (toUid=${user.uid})`, err);
+        }
+      );
+    });
+  }
 
   return () => {
-    unsubAuth();
-    if (unsubSnap) unsubSnap();
+    incomingRequestsSubscribers.delete(cb);
+    if (incomingRequestsSubscribers.size === 0) {
+      if (sharedIncomingUnsubSnap) {
+        sharedIncomingUnsubSnap();
+        sharedIncomingUnsubSnap = null;
+      }
+      if (sharedIncomingUnsubAuth) {
+        sharedIncomingUnsubAuth();
+        sharedIncomingUnsubAuth = null;
+      }
+      sharedIncomingActiveUid = null;
+    }
   };
 }
 
@@ -998,21 +1581,60 @@ export function subscribeToFriendsProfiles(
     cb([]);
     return () => {};
   }
-  const slice = friendUids.slice(0, 20);
-  const q = query(collection(db, 'users'), where('uid', 'in', slice));
-  return onSnapshot(
-    q,
-    (snap) => {
-      const list: OnlineUserProfile[] = [];
-      snap.forEach((docSnap) => {
-        list.push(mapDocToOnlineUserProfile(docSnap.id, docSnap.data()));
-      });
-      cb(list);
-    },
-    (err) => {
-      console.warn('Error listening to friends profiles:', err);
+  const slice = Array.from(new Set(friendUids.filter(Boolean))).sort().slice(0, 20);
+  if (slice.length === 0) {
+    cb([]);
+    return () => {};
+  }
+
+  const cacheKey = slice.join(',');
+  const cached = cachedFriendsByKey.get(cacheKey);
+  if (cached) {
+    cb(cached);
+  }
+
+  let unsubSnap: (() => void) | null = null;
+  let activeUid: string | null = null;
+
+  const unsubAuth = subscribeToAuthReady((user) => {
+    const nextUid = user?.uid ?? null;
+    if (nextUid === activeUid && unsubSnap) {
+      return;
     }
-  );
+    if (unsubSnap) {
+      unsubSnap();
+      unsubSnap = null;
+    }
+    activeUid = nextUid;
+    if (!user || isInQuotaBackoff()) {
+      cb(cachedFriendsByKey.get(cacheKey) || []);
+      return;
+    }
+    const q = query(collection(db, 'users'), where('uid', 'in', slice));
+    unsubSnap = onSnapshot(
+      q,
+      (snap) => {
+        const list: OnlineUserProfile[] = [];
+        snap.forEach((docSnap) => {
+          list.push(mapDocToOnlineUserProfile(docSnap.id, docSnap.data()));
+        });
+        cachedFriendsByKey.set(cacheKey, list);
+        cb(list);
+      },
+      (err) => {
+        logFirestoreWarn('Erro no listener subscribeToFriendsProfiles', err);
+      }
+    );
+  });
+
+  return () => {
+    unsubAuth();
+    activeUid = null;
+    if (unsubSnap) {
+      unsubSnap();
+      unsubSnap = null;
+    }
+  };
 }
 
 // ============================================================================
@@ -1085,11 +1707,11 @@ export async function createOnlineRoom(
   options?: Partial<CreateRoomParams>
 ): Promise<MultiplayerRoomState> {
   const user = await ensureAuthenticated();
-  const mySnap = await getDoc(doc(db, 'users', user.uid)).catch(() => null);
-  const hostName =
-    mySnap && mySnap.exists()
-      ? String(mySnap.data().displayName || user.displayName || 'Anfitrião').slice(0, 28)
-      : (user.displayName || 'Anfitrião').slice(0, 28);
+  const hostName = (
+    cachedMyProfile?.displayName ||
+    user.displayName ||
+    'Anfitrião'
+  ).slice(0, 28);
 
   const roomCode = generateRoomCode();
   const mode: MatchFormatMode = options?.mode === '2v2' ? '2v2' : '4v4';
@@ -1110,42 +1732,50 @@ export async function createOnlineRoom(
   const activeCharacterIds = resolveActiveCharacterIdsForRoom(slots, mode);
   const nowMs = Date.now();
 
+  const roomDocPayload = {
+    roomCode,
+    matchId: null,
+    roomName,
+    mode,
+    visibility,
+    hasPassword,
+    passwordHash,
+    maxHumans,
+    autoFillBots: options?.autoFillBots !== false,
+    activeCharacterIds,
+    loadingReadyUids: [user.uid],
+    startAt: null,
+    lastActivityMs: nowMs,
+    hostUid: user.uid,
+    hostName,
+    status: 'waiting',
+    homeTeamId,
+    awayTeamId,
+    homeGoals: 0,
+    awayGoals: 0,
+    half: 1,
+    remainingSeconds: Math.floor(halfDurationSeconds),
+    slots,
+    inputs: {},
+    matchSnapshot: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
   const roomRef = doc(db, 'rooms', roomCode);
   try {
     await withFirestoreTimeout(
-      setDoc(roomRef, {
-        roomCode,
-        matchId: null,
-        roomName,
-        mode,
-        visibility,
-        hasPassword,
-        passwordHash,
-        maxHumans,
-        autoFillBots: options?.autoFillBots !== false,
-        activeCharacterIds,
-        loadingReadyUids: [user.uid],
-        startAt: null,
-        lastActivityMs: nowMs,
-        hostUid: user.uid,
-        hostName,
-        status: 'waiting',
-        homeTeamId,
-        awayTeamId,
-        homeGoals: 0,
-        awayGoals: 0,
-        half: 1,
-        remainingSeconds: Math.floor(halfDurationSeconds),
-        slots,
-        inputs: {},
-        matchSnapshot: null,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      }),
+      setDoc(roomRef, roomDocPayload),
       8000,
       'Tempo limite excedido ao criar a sala. Verifique sua conexão e tente novamente.'
     );
 
+    cachedRoomDocsByCode.set(roomCode, {
+      ...roomDocPayload,
+      createdAt: Timestamp.fromMillis(nowMs),
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+    lastRoomHeartbeatMsByCode.set(roomCode, nowMs);
     void updateUserPresence('in_room', roomCode);
 
     return {
@@ -1186,11 +1816,8 @@ export async function joinOnlineRoom(
   const roomCode = roomCodeInput.trim().toUpperCase();
   const roomRef = doc(db, 'rooms', roomCode);
 
-  const [snap, mySnap] = await withFirestoreTimeout(
-    Promise.all([
-      getDoc(roomRef),
-      getDoc(doc(db, 'users', user.uid)).catch(() => null),
-    ]),
+  const snap = await withFirestoreTimeout(
+    getDoc(roomRef),
     8000,
     `Tempo limite ao buscar a sala ${roomCode}. Tente novamente.`
   );
@@ -1200,6 +1827,8 @@ export async function joinOnlineRoom(
   }
 
   const d = snap.data();
+  cachedRoomDocsByCode.set(roomCode, d);
+
   if (d.status === 'finished') {
     throw new Error('Esta partida já foi encerrada.');
   }
@@ -1229,13 +1858,24 @@ export async function joinOnlineRoom(
     }
   }
 
-  const myName =
-    mySnap && mySnap.exists()
-      ? String(mySnap.data().displayName || user.displayName || 'Jogador').slice(0, 28)
-      : (user.displayName || 'Jogador').slice(0, 28);
+  const myName = (
+    cachedMyProfile?.displayName ||
+    user.displayName ||
+    'Jogador'
+  ).slice(0, 28);
 
   const maxAllowed = typeof d.maxHumans === 'number' ? d.maxHumans : roomMode === '2v2' ? 4 : 8;
   const currentHumanCount = Object.values(slots).filter((s) => !s.isBot && s.uid).length;
+
+  // Se o jogador já está ocupando seu slot na sala com o mesmo nome, retorna o estado em cache sem regravar!
+  if (
+    existingSlotKey &&
+    !slots[existingSlotKey].isBot &&
+    slots[existingSlotKey].displayName === myName
+  ) {
+    void updateUserPresence('in_room', roomCode);
+    return mapDocToRoomState(d);
+  }
 
   if (!existingSlotKey) {
     if (currentHumanCount >= maxAllowed) {
@@ -1306,6 +1946,12 @@ export async function joinOnlineRoom(
       `Tempo limite ao entrar na sala ${roomCode}. Tente novamente.`
     );
 
+    cachedRoomDocsByCode.set(roomCode, {
+      ...d,
+      ...sanitizedPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+    lastRoomHeartbeatMsByCode.set(roomCode, nowMs);
     void updateUserPresence('in_room', roomCode);
 
     return mapDocToRoomState({
@@ -1321,17 +1967,32 @@ export async function selectRoomCharacter(
   roomCode: string,
   targetCharacterId: string
 ): Promise<{ ok: boolean; message?: string }> {
+  if (isInQuotaBackoff()) {
+    return {
+      ok: false,
+      message: 'Serviço temporariamente ocupado. Aguarde alguns segundos.',
+    };
+  }
   const user = await ensureAuthenticated();
-  const roomRef = doc(db, 'rooms', roomCode);
-  const snap = await getDoc(roomRef);
-  if (!snap.exists()) return { ok: false, message: 'Sala não existe mais.' };
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', normalizedCode);
 
-  const d = snap.data();
+  let d = cachedRoomDocsByCode.get(normalizedCode);
+  if (!d) {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return { ok: false, message: 'Sala não existe mais.' };
+    d = snap.data();
+  }
+
   const roomMode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
   const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
   const targetSlot = slots[targetCharacterId];
 
   if (!targetSlot) return { ok: false, message: 'Personagem inválido.' };
+  if (!targetSlot.isBot && targetSlot.uid === user.uid) {
+    // Já está neste personagem — evita gravação desnecessária
+    return { ok: true };
+  }
   if (!targetSlot.isBot && targetSlot.uid !== user.uid) {
     return {
       ok: false,
@@ -1352,11 +2013,11 @@ export async function selectRoomCharacter(
     }
   }
 
-  const mySnap = await getDoc(doc(db, 'users', user.uid)).catch(() => null);
-  const myName =
-    mySnap && mySnap.exists()
-      ? String(mySnap.data().displayName || user.displayName || 'Jogador').slice(0, 28)
-      : (user.displayName || 'Jogador').slice(0, 28);
+  const myName = (
+    cachedMyProfile?.displayName ||
+    user.displayName ||
+    'Jogador'
+  ).slice(0, 28);
 
   let myMicEnabled = false;
   let myReady = true;
@@ -1384,131 +2045,197 @@ export async function selectRoomCharacter(
   };
 
   const activeCharacterIds = resolveActiveCharacterIdsForRoom(slots, roomMode);
+  const nowMs = Date.now();
 
   try {
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        slots,
-        activeCharacterIds,
-        lastActivityMs: Date.now(),
-      })
-    );
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      slots,
+      activeCharacterIds,
+      lastActivityMs: nowMs,
+    });
+    await setDoc(roomRef, nextPayload);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
     return { ok: true };
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
+    handleFirestoreError(err, OperationType.UPDATE, `rooms/${normalizedCode}`);
   }
 }
 
 export async function togglePlayerReadyInRoom(roomCode: string, ready?: boolean): Promise<void> {
   const user = auth.currentUser;
-  if (!user || !roomCode) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  const snap = await getDoc(roomRef);
-  if (!snap.exists()) return;
+  if (!user || !roomCode || isInQuotaBackoff()) return;
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', normalizedCode);
 
-  const d = snap.data();
+  let d = cachedRoomDocsByCode.get(normalizedCode);
+  if (!d) {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    d = snap.data();
+  }
+
   const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
   let changed = false;
 
   for (const key of Object.keys(slots)) {
     if (slots[key].uid === user.uid) {
       const nextReady = ready !== undefined ? ready : !slots[key].isReady;
-      slots[key] = {
-        ...slots[key],
-        isReady: nextReady,
-        lastSeenMs: Date.now(),
-      };
-      changed = true;
+      if (Boolean(slots[key].isReady) !== Boolean(nextReady)) {
+        slots[key] = {
+          ...slots[key],
+          isReady: nextReady,
+          lastSeenMs: Date.now(),
+        };
+        changed = true;
+      }
     }
   }
 
   if (!changed) return;
 
   try {
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        slots,
-        lastActivityMs: Date.now(),
-      })
-    );
-  } catch {
-    // Non-fatal
+    const nowMs = Date.now();
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      slots,
+      lastActivityMs: nowMs,
+    });
+    await setDoc(roomRef, nextPayload);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+  } catch (err) {
+    logFirestoreWarn(`Aviso em togglePlayerReadyInRoom (${normalizedCode})`, err);
   }
 }
 
 export async function updatePlayerVoiceStatusInRoom(
   roomCode: string,
   micEnabled: boolean,
-  isSpeaking: boolean
+  _isSpeaking: boolean
 ): Promise<void> {
   const user = auth.currentUser;
-  if (!user || !roomCode) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const d = snap.data();
-    const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
-    let changed = false;
-    for (const key of Object.keys(slots)) {
-      if (slots[key].uid === user.uid) {
-        if (slots[key].micEnabled !== micEnabled || slots[key].isSpeaking !== isSpeaking) {
-          slots[key] = {
-            ...slots[key],
-            micEnabled,
-            isSpeaking,
-            lastSeenMs: Date.now(),
-          };
-          changed = true;
-        }
+  if (!user || !roomCode || isInQuotaBackoff()) return;
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const nowMs = Date.now();
+
+  // Nunca grava flutuações de voz (isSpeaking a cada 220ms) no Firestore!
+  // Apenas sincroniza mudança real do estado de mute/unmute (micEnabled) com throttle mínimo de 3s.
+  const prevWrite = lastVoiceMicWriteByCode.get(normalizedCode);
+  if (
+    prevWrite &&
+    prevWrite.micEnabled === micEnabled &&
+    nowMs - prevWrite.timestampMs < 30_000
+  ) {
+    return;
+  }
+  if (prevWrite && nowMs - prevWrite.timestampMs < 3000) {
+    return;
+  }
+
+  const d = cachedRoomDocsByCode.get(normalizedCode);
+  if (!d) return;
+
+  const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+  let changed = false;
+  for (const key of Object.keys(slots)) {
+    if (slots[key].uid === user.uid) {
+      if (Boolean(slots[key].micEnabled) !== Boolean(micEnabled)) {
+        slots[key] = {
+          ...slots[key],
+          micEnabled,
+          isSpeaking: false,
+          lastSeenMs: nowMs,
+        };
+        changed = true;
       }
     }
-    if (changed) {
-      await setDoc(
-        roomRef,
-        buildSanitizedRoomPayload(roomCode, d, {
-          slots,
-          lastActivityMs: Date.now(),
-        })
-      );
-    }
-  } catch {
-    // Ignore transient conflict
+  }
+
+  if (!changed) {
+    lastVoiceMicWriteByCode.set(normalizedCode, { micEnabled, timestampMs: nowMs });
+    return;
+  }
+
+  lastVoiceMicWriteByCode.set(normalizedCode, { micEnabled, timestampMs: nowMs });
+  const roomRef = doc(db, 'rooms', normalizedCode);
+  try {
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      slots,
+      lastActivityMs: nowMs,
+    });
+    await setDoc(roomRef, nextPayload);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+  } catch (err) {
+    logFirestoreWarn(`Aviso em updatePlayerVoiceStatusInRoom (${normalizedCode})`, err);
   }
 }
 
 export async function sendRoomHeartbeat(roomCode: string): Promise<void> {
   const user = auth.currentUser;
-  if (!user || !roomCode) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const d = snap.data();
-    if (d.status === 'finished') return;
+  if (!user || !roomCode || isInQuotaBackoff()) return;
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const nowMs = Date.now();
 
-    const nowMs = Date.now();
+  // Rate-limit estrito: máximo 1 heartbeat a cada 40 segundos por sala
+  const lastHb = lastRoomHeartbeatMsByCode.get(normalizedCode) || 0;
+  if (nowMs - lastHb < 40_000) {
+    return;
+  }
+
+  const cachedDoc = cachedRoomDocsByCode.get(normalizedCode);
+  // Durante 'playing' ou 'starting', o servidor WebSocket 30Hz mantém a sessão viva — não grava heartbeat no Firestore!
+  if (cachedDoc && (cachedDoc.status === 'playing' || cachedDoc.status === 'starting' || cachedDoc.status === 'finished')) {
+    lastRoomHeartbeatMsByCode.set(normalizedCode, nowMs);
+    return;
+  }
+
+  lastRoomHeartbeatMsByCode.set(normalizedCode, nowMs);
+  const roomRef = doc(db, 'rooms', normalizedCode);
+
+  try {
+    let d = cachedDoc;
+    if (!d) {
+      const snap = await getDoc(roomRef);
+      if (!snap.exists()) return;
+      d = snap.data();
+    }
+    if (d.status === 'finished' || d.status === 'playing') return;
+
     const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+    let foundMySlot = false;
     for (const key of Object.keys(slots)) {
       if (slots[key].uid === user.uid) {
         slots[key] = {
           ...slots[key],
           lastSeenMs: nowMs,
         };
+        foundMySlot = true;
       }
     }
+    if (!foundMySlot) return;
 
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        slots,
-        lastActivityMs: nowMs,
-      })
-    );
-  } catch {
-    // Ignore heartbeat race
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      slots,
+      lastActivityMs: nowMs,
+    });
+    await setDoc(roomRef, nextPayload);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+  } catch (err) {
+    logFirestoreWarn(`Aviso em sendRoomHeartbeat (${normalizedCode})`, err);
   }
 }
 
@@ -1522,22 +2249,43 @@ export async function leaveOnlineRoom(roomCode: string): Promise<void> {
   const normalizedCode = roomCode.trim().toUpperCase();
   const roomRef = doc(db, 'rooms', normalizedCode);
 
+  lastRoomHeartbeatMsByCode.delete(normalizedCode);
+  lastVoiceMicWriteByCode.delete(normalizedCode);
+
+  if (isInQuotaBackoff()) {
+    cachedRoomDocsByCode.delete(normalizedCode);
+    return;
+  }
+
   try {
-    const snap = await getDoc(roomRef);
-    if (snap.exists()) {
-      const d = snap.data();
+    let d = cachedRoomDocsByCode.get(normalizedCode);
+    if (!d) {
+      const snap = await getDoc(roomRef);
+      if (snap.exists()) {
+        d = snap.data();
+      }
+    }
+    cachedRoomDocsByCode.delete(normalizedCode);
+
+    if (d) {
       const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+      let wasInRoom = false;
 
       for (const key of Object.keys(slots)) {
         if (slots[key].uid === user.uid) {
           slots[key] = convertSlotToBot(slots[key]);
+          wasInRoom = true;
         }
+      }
+
+      if (!wasInRoom && d.hostUid !== user.uid) {
+        void updateUserPresence('online', '');
+        return;
       }
 
       const remainingHumans = Object.values(slots).filter((s) => !s.isBot && s.uid);
 
       if (remainingHumans.length === 0) {
-        // Quando o último jogador sair, encerrar e deletar a sala e o documento da partida
         if (d.matchId) {
           await deleteDoc(doc(db, 'matches', String(d.matchId))).catch(() => {});
         }
@@ -1546,7 +2294,6 @@ export async function leaveOnlineRoom(roomCode: string): Promise<void> {
         let nextHostUid = String(d.hostUid);
         let nextHostName = String(d.hostName);
 
-        // Se o criador sair da sala, transfere a liderança para outro jogador conectado
         if (d.hostUid === user.uid) {
           nextHostUid = String(remainingHumans[0].uid);
           nextHostName = String(remainingHumans[0].displayName || 'Anfitrião').slice(0, 28);
@@ -1572,23 +2319,29 @@ export async function leaveOnlineRoom(roomCode: string): Promise<void> {
       }
     }
     void updateUserPresence('online', '');
-  } catch {
-    // Ignore cleanup errors
+  } catch (err) {
+    logFirestoreWarn(`Aviso ao sair da sala ${normalizedCode}`, err);
   }
 }
 
 /**
  * Varre salas públicas/privadas para limpar jogadores que fecharam a aba sem aviso
  * e remover salas abandonadas sem nenhum humano ativo.
+ * Executado sob controle de frequência (máximo 1 vez a cada 5 minutos) para evitar leituras desnecessárias.
  */
-export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
-  if (!auth.currentUser) return;
+export async function cleanupAbandonedRoomsAndSlots(force: boolean = false): Promise<void> {
+  if (!auth.currentUser || isInQuotaBackoff()) return;
+  const nowMs = Date.now();
+  if (!force && nowMs - lastAbandonedSweepMs < 300_000) {
+    return;
+  }
+  lastAbandonedSweepMs = nowMs;
+
   try {
-    const q = query(collection(db, 'rooms'), limit(25));
+    const q = query(collection(db, 'rooms'), limit(10));
     const snap = await getDocs(q);
-    const nowMs = Date.now();
-    const ROOM_ABANDON_TIMEOUT_MS = 45000;
-    const SLOT_STALE_TIMEOUT_MS = 35000;
+    const ROOM_ABANDON_TIMEOUT_MS = 120_000;
+    const SLOT_STALE_TIMEOUT_MS = 95_000;
 
     for (const docSnap of snap.docs) {
       const d = docSnap.data();
@@ -1607,7 +2360,6 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
           ? d.updatedAt.toMillis()
           : nowMs;
 
-      // Sala inteira sem atividade há mais de 45s
       if (nowMs - updatedMs > ROOM_ABANDON_TIMEOUT_MS) {
         if (d.matchId) {
           await deleteDoc(doc(db, 'matches', String(d.matchId))).catch(() => {});
@@ -1621,7 +2373,12 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
 
       for (const key of Object.keys(slots)) {
         const slot = slots[key];
-        if (!slot.isBot && slot.uid && slot.lastSeenMs && nowMs - slot.lastSeenMs > SLOT_STALE_TIMEOUT_MS) {
+        if (
+          !slot.isBot &&
+          slot.uid &&
+          slot.lastSeenMs &&
+          nowMs - slot.lastSeenMs > SLOT_STALE_TIMEOUT_MS
+        ) {
           slots[key] = convertSlotToBot(slot);
           slotsChanged = true;
         }
@@ -1651,8 +2408,8 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
         ).catch(() => {});
       }
     }
-  } catch {
-    // Non-fatal background sweep
+  } catch (err) {
+    logFirestoreWarn('Aviso na limpeza periódica de salas abandonadas', err);
   }
 }
 
@@ -1664,16 +2421,22 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
  */
 export async function startOnlineMatch(roomCode: string): Promise<string> {
   const user = await ensureAuthenticated();
-  const roomRef = doc(db, 'rooms', roomCode);
-  const snap = await withFirestoreTimeout(
-    getDoc(roomRef),
-    8000,
-    'Tempo limite ao validar a sala para início da partida.'
-  );
-  if (!snap.exists()) {
-    throw new Error('Sala não encontrada.');
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', normalizedCode);
+
+  let d = cachedRoomDocsByCode.get(normalizedCode);
+  if (!d) {
+    const snap = await withFirestoreTimeout(
+      getDoc(roomRef),
+      8000,
+      'Tempo limite ao validar a sala para início da partida.'
+    );
+    if (!snap.exists()) {
+      throw new Error('Sala não encontrada.');
+    }
+    d = snap.data();
   }
-  const d = snap.data();
+
   if (d.hostUid !== user.uid) {
     throw new Error('Apenas o anfitrião da sala pode iniciar a partida.');
   }
@@ -1700,12 +2463,11 @@ export async function startOnlineMatch(roomCode: string): Promise<string> {
     .map((s) => s.characterId);
 
   try {
-    // Cria documento compartilhado /matches/{matchId}
     const matchRef = doc(db, 'matches', matchId);
     await withFirestoreTimeout(
       setDoc(matchRef, {
         matchId,
-        roomId: roomCode,
+        roomId: normalizedCode,
         hostId: user.uid,
         mode: roomMode,
         status: 'starting',
@@ -1728,27 +2490,31 @@ export async function startOnlineMatch(roomCode: string): Promise<string> {
       'Tempo limite ao criar sessão de partida.'
     );
 
-    // Atualiza sala para status: "starting" para disparar transição imediata em todos os convidados
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      matchId,
+      status: 'starting',
+      startAt,
+      activeCharacterIds,
+      loadingReadyUids: [user.uid],
+      lastActivityMs: startAt,
+    });
+
     await withFirestoreTimeout(
-      setDoc(
-        roomRef,
-        buildSanitizedRoomPayload(roomCode, d, {
-          matchId,
-          status: 'starting',
-          startAt,
-          activeCharacterIds,
-          loadingReadyUids: [user.uid],
-          lastActivityMs: startAt,
-        })
-      ),
+      setDoc(roomRef, nextPayload),
       8000,
       'Tempo limite ao sincronizar início da partida.'
     );
 
-    void updateUserPresence('playing', roomCode);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(startAt),
+    });
+
+    void updateUserPresence('playing', normalizedCode);
     return matchId;
   } catch (err) {
-    handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
+    handleFirestoreError(err, OperationType.UPDATE, `rooms/${normalizedCode}`);
   }
 }
 
@@ -1759,15 +2525,26 @@ export async function startOnlineMatch(roomCode: string): Promise<string> {
  */
 export async function markPlayerMatchLoadingReady(roomCode: string): Promise<void> {
   const user = auth.currentUser;
-  if (!user || !roomCode) return;
-  const roomRef = doc(db, 'rooms', roomCode);
+  if (!user || !roomCode || isInQuotaBackoff()) return;
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', normalizedCode);
+
   try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const d = snap.data();
-    const readyList = Array.isArray(d.loadingReadyUids)
-      ? Array.from(new Set([...(d.loadingReadyUids as string[]), user.uid]))
-      : [user.uid];
+    let d = cachedRoomDocsByCode.get(normalizedCode);
+    if (!d) {
+      const snap = await getDoc(roomRef);
+      if (!snap.exists()) return;
+      d = snap.data();
+    }
+
+    if (d.status === 'playing' || d.status === 'finished') {
+      return;
+    }
+
+    const existingReady = Array.isArray(d.loadingReadyUids)
+      ? (d.loadingReadyUids as string[])
+      : [];
+    const readyList = Array.from(new Set([...existingReady, user.uid]));
 
     const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
     const humanUids = Object.values(slots)
@@ -1779,38 +2556,26 @@ export async function markPlayerMatchLoadingReady(roomCode: string): Promise<voi
     const nextStatus =
       d.status === 'starting' && allHumansReady ? 'playing' : d.status;
 
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        status: nextStatus,
-        loadingReadyUids: readyList,
-        lastActivityMs: Date.now(),
-      })
-    );
-
-    if (nextStatus === 'playing' && d.matchId) {
-      const matchRef = doc(db, 'matches', String(d.matchId));
-      const matchSnap = await getDoc(matchRef);
-      if (matchSnap.exists()) {
-        const md = matchSnap.data();
-        await setDoc(matchRef, {
-          matchId: String(md.matchId || d.matchId),
-          roomId: String(md.roomId || roomCode),
-          hostId: String(md.hostId || d.hostUid || user.uid),
-          mode: md.mode === '2v2' ? '2v2' : '4v4',
-          status: 'playing',
-          players: Array.isArray(md.players) ? md.players.slice(0, 16) : [user.uid],
-          bots: Array.isArray(md.bots) ? md.bots.slice(0, 16) : [],
-          score: md.score && typeof md.score === 'object' ? md.score : { teamA: 0, teamB: 0 },
-          ball: md.ball && typeof md.ball === 'object' ? md.ball : { x: 0, y: 0.22, z: 0 },
-          startAt: typeof md.startAt === 'number' ? Math.floor(md.startAt) : Date.now(),
-          createdAt: md.createdAt instanceof Timestamp ? md.createdAt : serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        }).catch(() => {});
-      }
+    // Se o UID já estava na lista e o status não mudou, evita gravação redundante!
+    if (existingReady.includes(user.uid) && nextStatus === d.status) {
+      return;
     }
-  } catch {
-    // Ignore transient race
+
+    const nowMs = Date.now();
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      status: nextStatus,
+      loadingReadyUids: readyList,
+      lastActivityMs: nowMs,
+    });
+
+    await setDoc(roomRef, nextPayload);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+  } catch (err) {
+    logFirestoreWarn(`Aviso em markPlayerMatchLoadingReady (${normalizedCode})`, err);
   }
 }
 
@@ -1820,80 +2585,50 @@ export async function markPlayerMatchLoadingReady(roomCode: string): Promise<voi
  */
 export async function promoteRoomToPlaying(roomCode: string): Promise<void> {
   const user = auth.currentUser;
-  if (!user || !roomCode) return;
-  const roomRef = doc(db, 'rooms', roomCode);
+  if (!user || !roomCode || isInQuotaBackoff()) return;
+  const normalizedCode = roomCode.trim().toUpperCase();
+  const roomRef = doc(db, 'rooms', normalizedCode);
+
   try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const d = snap.data();
+    let d = cachedRoomDocsByCode.get(normalizedCode);
+    if (!d) {
+      const snap = await getDoc(roomRef);
+      if (!snap.exists()) return;
+      d = snap.data();
+    }
     if (d.status === 'finished' || d.status === 'playing') return;
 
     const readyList = Array.isArray(d.loadingReadyUids)
       ? Array.from(new Set([...(d.loadingReadyUids as string[]), user.uid]))
       : [user.uid];
+    const nowMs = Date.now();
+    const nextPayload = buildSanitizedRoomPayload(normalizedCode, d, {
+      status: 'playing',
+      loadingReadyUids: readyList,
+      lastActivityMs: nowMs,
+    });
 
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        status: 'playing',
-        loadingReadyUids: readyList,
-        lastActivityMs: Date.now(),
-      })
-    );
-
-    if (d.matchId) {
-      const matchRef = doc(db, 'matches', String(d.matchId));
-      const matchSnap = await getDoc(matchRef);
-      if (matchSnap.exists()) {
-        const md = matchSnap.data();
-        await setDoc(matchRef, {
-          matchId: String(md.matchId || d.matchId),
-          roomId: String(md.roomId || roomCode),
-          hostId: String(md.hostId || d.hostUid || user.uid),
-          mode: md.mode === '2v2' ? '2v2' : '4v4',
-          status: 'playing',
-          players: Array.isArray(md.players) ? md.players.slice(0, 16) : [user.uid],
-          bots: Array.isArray(md.bots) ? md.bots.slice(0, 16) : [],
-          score: md.score && typeof md.score === 'object' ? md.score : { teamA: 0, teamB: 0 },
-          ball: md.ball && typeof md.ball === 'object' ? md.ball : { x: 0, y: 0.22, z: 0 },
-          startAt: typeof md.startAt === 'number' ? Math.floor(md.startAt) : Date.now(),
-          createdAt: md.createdAt instanceof Timestamp ? md.createdAt : serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        }).catch(() => {});
-      }
-    }
-  } catch {
-    // Ignore race condition if another client already promoted the room
+    await setDoc(roomRef, nextPayload);
+    cachedRoomDocsByCode.set(normalizedCode, {
+      ...d,
+      ...nextPayload,
+      updatedAt: Timestamp.fromMillis(nowMs),
+    });
+  } catch (err) {
+    logFirestoreWarn(`Aviso em promoteRoomToPlaying (${normalizedCode})`, err);
   }
 }
 
+/**
+ * A física em 30Hz/60FPS (posições, rotações, animações, velocidades e bola) trafega
+ * exclusivamente pelo servidor WebSocket autoritativo (realtimeMatchClient / server.ts).
+ * Nunca grava snapshots de física frame a frame no Firestore.
+ */
 export async function publishHostMatchSnapshot(
-  roomCode: string,
-  snapshot: MultiplayerMatchSnapshot
+  _roomCode: string,
+  _snapshot: MultiplayerMatchSnapshot
 ): Promise<void> {
-  const user = auth.currentUser;
-  if (!user) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const d = snap.data();
-    if (d.hostUid !== user.uid || d.status === 'finished') return;
-
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        homeGoals: snapshot.homeGoals,
-        awayGoals: snapshot.awayGoals,
-        half: snapshot.half,
-        remainingSeconds: Math.max(0, Math.floor(snapshot.remainingSeconds)),
-        matchSnapshot: snapshot,
-        lastActivityMs: Date.now(),
-      })
-    );
-  } catch {
-    // Ignore high-frequency sync conflict
-  }
+  // No-op no Firestore: evita consumo de cota em 60 FPS
 }
 
 export interface ClientInputState {
@@ -1906,29 +2641,23 @@ export interface ClientInputState {
 }
 
 export async function publishClientInput(
-  roomCode: string,
-  input: ClientInputState
+  _roomCode: string,
+  _input: ClientInputState
 ): Promise<void> {
-  const user = auth.currentUser;
-  if (!user) return;
-  const roomRef = doc(db, 'rooms', roomCode);
-  try {
-    const snap = await getDoc(roomRef);
-    if (!snap.exists()) return;
-    const d = snap.data();
-    if (d.status === 'finished') return;
-    const inputs = { ...(d.inputs || {}), [user.uid]: input };
-    await setDoc(
-      roomRef,
-      buildSanitizedRoomPayload(roomCode, d, {
-        inputs,
-        lastActivityMs: Date.now(),
-      })
-    );
-  } catch {
-    // Ignore transient network lag
-  }
+  // No-op no Firestore: comandos de input trafegam pelo WebSocket de baixa latência
 }
+
+// Multiplexador de subscribeToRoom por roomCode (garante apenas 1 onSnapshot por sala mesmo com App + Modal abertos)
+interface SharedRoomSubscription {
+  subscribers: Set<
+    (room: (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null) => void
+  >;
+  unsubSnap: (() => void) | null;
+  unsubAuth: (() => void) | null;
+  activeUid: string | null;
+  latestState: (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null;
+}
+const sharedRoomSubscriptions = new Map<string, SharedRoomSubscription>();
 
 export function subscribeToRoom(
   roomCode: string,
@@ -1936,49 +2665,163 @@ export function subscribeToRoom(
     room: (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null
   ) => void
 ): () => void {
-  const roomRef = doc(db, 'rooms', roomCode);
-  return onSnapshot(
-    roomRef,
-    (snap) => {
-      if (!snap.exists()) {
-        cb(null);
+  const normalizedCode = roomCode.trim().toUpperCase();
+  let entry = sharedRoomSubscriptions.get(normalizedCode);
+
+  if (!entry) {
+    entry = {
+      subscribers: new Set(),
+      unsubSnap: null,
+      unsubAuth: null,
+      activeUid: null,
+      latestState: null,
+    };
+    sharedRoomSubscriptions.set(normalizedCode, entry);
+  }
+
+  entry.subscribers.add(cb);
+
+  if (entry.latestState) {
+    cb(entry.latestState);
+  } else {
+    const cachedDoc = cachedRoomDocsByCode.get(normalizedCode);
+    if (cachedDoc) {
+      cb({
+        ...mapDocToRoomState(cachedDoc),
+        inputs: (cachedDoc.inputs as Record<string, ClientInputState>) || {},
+      });
+    }
+  }
+
+  if (!entry.unsubAuth) {
+    const currentEntry = entry;
+    currentEntry.unsubAuth = subscribeToAuthReady((user) => {
+      const nextUid = user?.uid ?? null;
+      if (nextUid === currentEntry.activeUid && currentEntry.unsubSnap) {
         return;
       }
-      const d = snap.data();
-      cb({
-        ...mapDocToRoomState(d),
-        inputs: (d.inputs as Record<string, ClientInputState>) || {},
-      });
-    },
-    (err) => {
-      console.warn('Error listening to room:', err);
-      cb(null);
+      if (currentEntry.unsubSnap) {
+        currentEntry.unsubSnap();
+        currentEntry.unsubSnap = null;
+      }
+      currentEntry.activeUid = nextUid;
+      if (!user || isInQuotaBackoff()) {
+        return;
+      }
+
+      const roomRef = doc(db, 'rooms', normalizedCode);
+      currentEntry.unsubSnap = onSnapshot(
+        roomRef,
+        (snap) => {
+          if (!snap.exists()) {
+            cachedRoomDocsByCode.delete(normalizedCode);
+            currentEntry.latestState = null;
+            currentEntry.subscribers.forEach((sub) => sub(null));
+            return;
+          }
+          const d = snap.data();
+          cachedRoomDocsByCode.set(normalizedCode, d);
+          const mapped = {
+            ...mapDocToRoomState(d),
+            inputs: (d.inputs as Record<string, ClientInputState>) || {},
+          };
+          currentEntry.latestState = mapped;
+          currentEntry.subscribers.forEach((sub) => sub(mapped));
+        },
+        (err) => {
+          logFirestoreWarn(`Erro no listener subscribeToRoom (rooms/${normalizedCode})`, err);
+        }
+      );
+    });
+  }
+
+  return () => {
+    const subEntry = sharedRoomSubscriptions.get(normalizedCode);
+    if (!subEntry) return;
+    subEntry.subscribers.delete(cb);
+    if (subEntry.subscribers.size === 0) {
+      if (subEntry.unsubSnap) {
+        subEntry.unsubSnap();
+        subEntry.unsubSnap = null;
+      }
+      if (subEntry.unsubAuth) {
+        subEntry.unsubAuth();
+        subEntry.unsubAuth = null;
+      }
+      subEntry.activeUid = null;
+      sharedRoomSubscriptions.delete(normalizedCode);
     }
-  );
+  };
 }
 
+// Multiplexador de subscribeToPublicRooms (apenas 1 listener ativo enquanto o lobby estiver aberto)
+const publicRoomsSubscribers = new Set<(rooms: MultiplayerRoomState[]) => void>();
+let sharedPublicRoomsUnsubSnap: (() => void) | null = null;
+let sharedPublicRoomsUnsubAuth: (() => void) | null = null;
+let sharedPublicRoomsActiveUid: string | null = null;
+
 export function subscribeToPublicRooms(cb: (rooms: MultiplayerRoomState[]) => void): () => void {
-  const q = query(collection(db, 'rooms'), limit(30));
-  return onSnapshot(
-    q,
-    (snap) => {
-      const list: MultiplayerRoomState[] = [];
-      const nowMs = Date.now();
-      snap.forEach((docSnap) => {
-        const d = docSnap.data();
-        if (d.status === 'finished') return;
-        const room = mapDocToRoomState(d);
-        // Oculta salas sem atividade recente (> 50s)
-        if (room.lastActivityMs && nowMs - room.lastActivityMs > 50000) return;
-        list.push(room);
-      });
-      list.sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
-      cb(list);
-    },
-    (err) => {
-      console.warn('Error listing public rooms:', err);
+  publicRoomsSubscribers.add(cb);
+  if (cachedPublicRooms.length > 0) {
+    cb(cachedPublicRooms);
+  }
+
+  if (!sharedPublicRoomsUnsubAuth) {
+    sharedPublicRoomsUnsubAuth = subscribeToAuthReady((user) => {
+      const nextUid = user?.uid ?? null;
+      if (nextUid === sharedPublicRoomsActiveUid && sharedPublicRoomsUnsubSnap) {
+        return;
+      }
+      if (sharedPublicRoomsUnsubSnap) {
+        sharedPublicRoomsUnsubSnap();
+        sharedPublicRoomsUnsubSnap = null;
+      }
+      sharedPublicRoomsActiveUid = nextUid;
+      if (!user || isInQuotaBackoff()) {
+        publicRoomsSubscribers.forEach((sub) => sub(cachedPublicRooms));
+        return;
+      }
+
+      const q = query(collection(db, 'rooms'), limit(15));
+      sharedPublicRoomsUnsubSnap = onSnapshot(
+        q,
+        (snap) => {
+          const list: MultiplayerRoomState[] = [];
+          const nowMs = Date.now();
+          snap.forEach((docSnap) => {
+            const d = docSnap.data();
+            if (d.status === 'finished') return;
+            cachedRoomDocsByCode.set(docSnap.id, d);
+            const room = mapDocToRoomState(d);
+            // Oculta salas sem atividade recente (> 120s)
+            if (room.lastActivityMs && nowMs - room.lastActivityMs > 120_000) return;
+            list.push(room);
+          });
+          list.sort((a, b) => (b.lastActivityMs || 0) - (a.lastActivityMs || 0));
+          cachedPublicRooms = list;
+          publicRoomsSubscribers.forEach((sub) => sub(list));
+        },
+        (err) => {
+          logFirestoreWarn('Erro no listener subscribeToPublicRooms (rooms)', err);
+        }
+      );
+    });
+  }
+
+  return () => {
+    publicRoomsSubscribers.delete(cb);
+    if (publicRoomsSubscribers.size === 0) {
+      if (sharedPublicRoomsUnsubSnap) {
+        sharedPublicRoomsUnsubSnap();
+        sharedPublicRoomsUnsubSnap = null;
+      }
+      if (sharedPublicRoomsUnsubAuth) {
+        sharedPublicRoomsUnsubAuth();
+        sharedPublicRoomsUnsubAuth = null;
+      }
+      sharedPublicRoomsActiveUid = null;
     }
-  );
+  };
 }
 
 /**
@@ -1995,7 +2838,7 @@ export async function recordMatchFinished(
   myTeam: 'home' | 'away' = 'home',
   isLegitimateFulltime: boolean = true
 ): Promise<void> {
-  if (!isLegitimateFulltime) return;
+  if (!isLegitimateFulltime || isInQuotaBackoff()) return;
   const user = auth.currentUser;
   if (!user) return;
 
@@ -2017,17 +2860,48 @@ export async function recordMatchFinished(
       });
     }
 
-    // Atualiza estatísticas de carreira do jogador local
     const userRef = doc(db, 'users', user.uid);
+    const didWin = winner === myTeam;
+    const didLose = winner !== 'draw' && winner !== myTeam;
+    const didDraw = winner === 'draw';
+    const myTeamGoals = myTeam === 'home' ? homeGoals : awayGoals;
+    const opponentGoals = myTeam === 'home' ? awayGoals : homeGoals;
+
+    if (cachedMyProfile && cachedMyProfile.uid === user.uid) {
+      const nextWins = Math.floor((cachedMyProfile.wins || 0) + (didWin ? 1 : 0));
+      const nextLosses = Math.floor((cachedMyProfile.losses || 0) + (didLose ? 1 : 0));
+      const nextDraws = Math.floor((cachedMyProfile.draws || 0) + (didDraw ? 1 : 0));
+      const nextGoalsScored = Math.floor((cachedMyProfile.goalsScored || 0) + myTeamGoals);
+      const nextGoalsConceded = Math.floor((cachedMyProfile.goalsConceded || 0) + opponentGoals);
+      const nextMatches = Math.floor((cachedMyProfile.matchesPlayed || 0) + 1);
+
+      await setDoc(userRef, {
+        uid: user.uid,
+        displayName: String(cachedMyProfile.displayName || user.displayName || 'Jogador').slice(0, 28),
+        tagCode:
+          typeof cachedMyProfile.tagCode === 'string' && cachedMyProfile.tagCode.length >= 2
+            ? cachedMyProfile.tagCode.slice(0, 20)
+            : generateTagCode(user.uid),
+        status: 'online',
+        currentRoomCode: '',
+        friends: Array.isArray(cachedMyProfile.friends)
+          ? cachedMyProfile.friends.filter((f): f is string => typeof f === 'string').slice(0, 200)
+          : [],
+        wins: nextWins,
+        losses: nextLosses,
+        draws: nextDraws,
+        goalsScored: nextGoalsScored,
+        goalsConceded: nextGoalsConceded,
+        matchesPlayed: nextMatches,
+        createdAt: Timestamp.fromMillis(cachedMyProfile.createdAt || Date.now()),
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    }
+
     const userSnap = await getDoc(userRef);
     if (userSnap.exists()) {
       const d = userSnap.data();
-      const didWin = winner === myTeam;
-      const didLose = winner !== 'draw' && winner !== myTeam;
-      const didDraw = winner === 'draw';
-      const myTeamGoals = myTeam === 'home' ? homeGoals : awayGoals;
-      const opponentGoals = myTeam === 'home' ? awayGoals : homeGoals;
-
       await setDoc(userRef, {
         uid: user.uid,
         displayName: String(d.displayName || user.displayName || 'Jogador').slice(0, 28),
@@ -2052,8 +2926,8 @@ export async function recordMatchFinished(
         updatedAt: serverTimestamp(),
       });
     }
-  } catch {
-    // Non-fatal history log
+  } catch (err) {
+    logFirestoreWarn('Aviso em recordMatchFinished', err);
   }
 }
 

@@ -274,8 +274,11 @@ service cloud.firestore {
 
     // 3. Friend Requests & Room Invites
     match /friendRequests/{requestId} {
-      allow get, list: if isAuthenticated()
+      allow get: if isAuthenticated()
         && (resource == null || existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
+
+      allow list: if isAuthenticated()
+        && (existing().fromUid == request.auth.uid || existing().toUid == request.auth.uid);
 
       allow create: if isAuthenticated()
         && isValidFriendRequest(incoming())

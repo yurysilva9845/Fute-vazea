@@ -339,7 +339,6 @@ class WebRTCVoiceChatManager {
         if (speakingNow !== this.isSelfSpeaking) {
           this.isSelfSpeaking = speakingNow;
           changed = true;
-          this.publishVoiceStatusIfNeeded(shouldTransmit, speakingNow);
         }
       } else if (this.isSelfSpeaking) {
         this.isSelfSpeaking = false;
@@ -458,6 +457,11 @@ class WebRTCVoiceChatManager {
   }
 
   private listenToRoomSignals(roomCode: string) {
+    if (this.unsubSignals) {
+      this.unsubSignals();
+      this.unsubSignals = null;
+    }
+
     const myUid = auth.currentUser?.uid;
     if (!myUid) return;
 
@@ -473,7 +477,9 @@ class WebRTCVoiceChatManager {
           const payloadStr = String(data.payload || '');
 
           // Remove o sinal consumido
-          deleteDoc(change.doc.ref).catch(() => {});
+          deleteDoc(change.doc.ref).catch((err) => {
+            console.warn('[STF-Voice] Aviso ao remover sinal WebRTC consumido:', err);
+          });
 
           try {
             const pc = this.getOrCreatePeerConnection(fromUid);
@@ -494,13 +500,13 @@ class WebRTCVoiceChatManager {
                 await pc.addIceCandidate(new RTCIceCandidate(cand));
               }
             }
-          } catch {
-            // Ignore transient WebRTC negotiation error
+          } catch (err) {
+            console.warn('[STF-Voice] Aviso de negociação WebRTC transitória:', err);
           }
         });
       },
-      () => {
-        // Ignore snapshot error on room delete
+      (err) => {
+        console.warn(`[STF-Voice] Erro no listener de sinais da sala ${roomCode}:`, err);
       }
     );
   }

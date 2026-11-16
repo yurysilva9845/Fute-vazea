@@ -34,7 +34,6 @@ import {
   subscribeToRoom,
 } from './services/firebase';
 import { presenceService } from './services/presenceService';
-import { sessionCleanupService } from './services/sessionCleanupService';
 import { voiceChatService } from './services/voiceChatService';
 import { realtimeMatchClient } from './services/realtimeMatchClient';
 
@@ -146,15 +145,18 @@ export default function App() {
     };
   }, [inputManager]);
 
-  // Boot-time Firebase auth warm-up, profile room recovery, session cleanup & Fullscreen listener
+  const lastMarkedReadyKeyRef = useRef<string | null>(null);
+
+  // Boot-time Firebase auth warm-up, profile room recovery & Fullscreen listener
   useEffect(() => {
     const startTs = performance.now();
     ensureAuthenticated()
       .then(() => {
         setPingMs(Math.max(12, Math.min(95, Math.round(performance.now() - startTs))));
-        sessionCleanupService.startPeriodicCleanup();
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.warn('[STF-Auth] Aviso na inicialização de sessão no boot:', err);
+      });
 
     const unsubProfile = subscribeToMyProfile((prof) => {
       if (prof?.currentRoomCode && prof.currentRoomCode.trim().length >= 4) {
@@ -168,7 +170,6 @@ export default function App() {
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => {
       unsubProfile();
-      sessionCleanupService.stopPeriodicCleanup();
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
@@ -178,6 +179,7 @@ export default function App() {
   useEffect(() => {
     if (!activeRoomCode) {
       setActiveRoom(null);
+      lastMarkedReadyKeyRef.current = null;
       return;
     }
     const unsub = subscribeToRoom(activeRoomCode, (room) => {
@@ -185,6 +187,7 @@ export default function App() {
         setActiveRoom(null);
         setActiveRoomCode(null);
         setShowMatchLoadingOverlay(false);
+        lastMarkedReadyKeyRef.current = null;
         presenceService.stopRoomPresence();
         voiceChatService.leaveRoomVoice();
         return;
@@ -204,7 +207,12 @@ export default function App() {
         setMultiplayerModalOpen(false);
         setShowMatchLoadingOverlay(true);
         presenceService.startRoomPresence(room.roomCode, 'playing');
-        markPlayerMatchLoadingReady(room.roomCode).catch(() => {});
+        const readyKey = `${room.roomCode}:${room.matchId || 'default'}`;
+        const alreadyReady = Boolean(myUid && (room.loadingReadyUids || []).includes(myUid));
+        if (!alreadyReady && lastMarkedReadyKeyRef.current !== readyKey) {
+          lastMarkedReadyKeyRef.current = readyKey;
+          markPlayerMatchLoadingReady(room.roomCode).catch(() => {});
+        }
       } else if (room.status === 'playing') {
         setMultiplayerModalOpen(false);
         setShowMatchLoadingOverlay(false);

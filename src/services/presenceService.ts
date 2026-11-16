@@ -3,38 +3,68 @@ import { leaveOnlineRoom, sendRoomHeartbeat, updateUserPresence } from './fireba
 /**
  * Gerencia presença em tempo real, heartbeats de sala e desconexão automática
  * ao fechar aba, navegador ou perder conexão com a internet.
+ * Inclui proteção contra loops de onSnapshot (deduplicação de startRoomPresence).
  */
 class PresenceManager {
   private activeRoomCode: string | null = null;
+  private activeStatus: 'in_room' | 'playing' | null = null;
   private heartbeatTimer: number | null = null;
   private listenersBound = false;
 
   public startRoomPresence(roomCode: string, status: 'in_room' | 'playing' = 'in_room') {
-    this.activeRoomCode = roomCode.trim().toUpperCase();
+    const normalized = roomCode.trim().toUpperCase();
+    if (!normalized) return;
+
     this.bindUnloadListeners();
 
-    updateUserPresence(status, this.activeRoomCode).catch(() => {});
-    sendRoomHeartbeat(this.activeRoomCode).catch(() => {});
-
-    if (this.heartbeatTimer !== null && typeof window !== 'undefined') {
-      window.clearInterval(this.heartbeatTimer);
+    // Evita loop infinito: se já estamos monitorando a mesma sala com o mesmo status, não reescreve no Firestore!
+    if (
+      this.activeRoomCode === normalized &&
+      this.activeStatus === status &&
+      this.heartbeatTimer !== null
+    ) {
+      return;
     }
 
-    if (typeof window !== 'undefined') {
-      this.heartbeatTimer = window.setInterval(() => {
-        if (!this.activeRoomCode) return;
-        sendRoomHeartbeat(this.activeRoomCode).catch(() => {});
-      }, 8000);
-    }
-  }
+    const roomChanged = this.activeRoomCode !== normalized;
+    const statusChanged = this.activeStatus !== status;
 
-  public stopRoomPresence() {
-    this.activeRoomCode = null;
+    this.activeRoomCode = normalized;
+    this.activeStatus = status;
+
+    if (roomChanged || statusChanged) {
+      updateUserPresence(status, this.activeRoomCode).catch(() => {});
+    }
+
+    if (roomChanged && status === 'in_room') {
+      sendRoomHeartbeat(this.activeRoomCode).catch(() => {});
+    }
+
     if (this.heartbeatTimer !== null && typeof window !== 'undefined') {
       window.clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
-    updateUserPresence('online', '').catch(() => {});
+
+    if (typeof window !== 'undefined') {
+      this.heartbeatTimer = window.setInterval(() => {
+        if (!this.activeRoomCode || this.activeStatus !== 'in_room') return;
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+        sendRoomHeartbeat(this.activeRoomCode).catch(() => {});
+      }, 45000);
+    }
+  }
+
+  public stopRoomPresence() {
+    const hadRoom = this.activeRoomCode !== null || this.activeStatus !== null;
+    this.activeRoomCode = null;
+    this.activeStatus = null;
+    if (this.heartbeatTimer !== null && typeof window !== 'undefined') {
+      window.clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (hadRoom) {
+      updateUserPresence('online', '').catch(() => {});
+    }
   }
 
   private bindUnloadListeners() {
@@ -45,6 +75,7 @@ class PresenceManager {
       const code = this.activeRoomCode;
       if (code) {
         this.activeRoomCode = null;
+        this.activeStatus = null;
         leaveOnlineRoom(code).catch(() => {});
       }
       updateUserPresence('offline', '').catch(() => {});
@@ -57,3 +88,4 @@ class PresenceManager {
 }
 
 export const presenceService = new PresenceManager();
+
