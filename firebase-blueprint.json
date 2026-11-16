@@ -49,6 +49,7 @@
       "type": "object",
       "properties": {
         "roomCode": { "type": "string", "description": "6-8 character room code." },
+        "matchId": { "type": "string", "description": "Active synchronized match session ID." },
         "roomName": { "type": "string", "description": "Display name of the room (e.g. SEM TERRA FC — SALA #102)." },
         "mode": {
           "type": "string",
@@ -74,12 +75,13 @@
           "items": { "type": "string" },
           "description": "UIDs that have completed pre-match loading synchronization."
         },
+        "startAt": { "type": "integer", "description": "Epoch ms when synchronized match loading started." },
         "lastActivityMs": { "type": "integer", "description": "Epoch ms of last room heartbeat activity." },
         "hostUid": { "type": "string", "description": "UID of the room creator/host." },
         "hostName": { "type": "string", "description": "Display name of the host." },
         "status": {
           "type": "string",
-          "enum": ["waiting", "playing", "finished"],
+          "enum": ["waiting", "starting", "playing", "finished"],
           "description": "Room lifecycle state."
         },
         "homeTeamId": { "type": "string" },
@@ -117,6 +119,38 @@
         "slots",
         "updatedAt",
         "createdAt"
+      ]
+    },
+    "MultiplayerMatch": {
+      "title": "Multiplayer Match Session",
+      "description": "Synchronized active match document shared by host and guests.",
+      "type": "object",
+      "properties": {
+        "matchId": { "type": "string" },
+        "roomId": { "type": "string" },
+        "hostId": { "type": "string" },
+        "mode": { "type": "string", "enum": ["2v2", "4v4"] },
+        "status": { "type": "string", "enum": ["waiting", "starting", "playing", "finished"] },
+        "players": { "type": "array", "items": { "type": "string" } },
+        "bots": { "type": "array", "items": { "type": "string" } },
+        "score": { "type": "object" },
+        "ball": { "type": "object" },
+        "startAt": { "type": "integer" },
+        "createdAt": { "type": "timestamp" },
+        "updatedAt": { "type": "timestamp" }
+      },
+      "required": [
+        "matchId",
+        "roomId",
+        "hostId",
+        "mode",
+        "status",
+        "players",
+        "bots",
+        "score",
+        "startAt",
+        "createdAt",
+        "updatedAt"
       ]
     },
     "VoiceSignal": {
@@ -197,6 +231,10 @@
     "/rooms/{roomId}": {
       "schema": { "$ref": "#/entities/MultiplayerRoom" },
       "description": "Multiplayer rooms indexed by roomCode."
+    },
+    "/matches/{matchId}": {
+      "schema": { "$ref": "#/entities/MultiplayerMatch" },
+      "description": "Synchronized active match sessions indexed by matchId."
     },
     "/rooms/{roomId}/signals/{signalId}": {
       "schema": { "$ref": "#/entities/VoiceSignal" },

@@ -1,9 +1,14 @@
 import { initializeApp } from 'firebase/app';
 import {
+  FirebaseError,
+} from 'firebase/app';
+import {
   getAuth,
   GoogleAuthProvider,
+  linkWithPopup,
   onAuthStateChanged,
   signInAnonymously,
+  signInWithCredential,
   signInWithPopup,
   updateProfile,
   User,
@@ -29,6 +34,7 @@ import {
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
+  AuthUserInfo,
   MatchFormatMode,
   MultiplayerMatchSnapshot,
   MultiplayerRoomState,
@@ -105,11 +111,68 @@ export function handleFirestoreError(
 }
 
 // ============================================================================
-// Authentication & User Profile
+// Authentication, Google Provider Verification & Account Linking
 // ============================================================================
 
 let authReadyPromise: Promise<User> | null = null;
 const authReadyListeners = new Set<(user: User | null) => void>();
+const authStatusListeners = new Set<(info: AuthUserInfo) => void>();
+
+/**
+ * Verifica se o usuário possui o provedor Google ('google.com') vinculado em user.providerData.
+ */
+export function isUserGoogleLinked(
+  user: Pick<User, 'providerData' | 'isAnonymous'> | null | undefined
+): boolean {
+  if (!user || !Array.isArray(user.providerData)) return false;
+  return user.providerData.some((provider) => provider?.providerId === 'google.com');
+}
+
+/**
+ * Extrai informações completas de autenticação e provedores vinculados (Google vs Anônimo).
+ */
+export function extractAuthUserInfo(user: User | null = auth.currentUser): AuthUserInfo {
+  if (!user) {
+    return {
+      uid: '',
+      displayName: '',
+      email: null,
+      photoURL: null,
+      isAnonymous: false,
+      isGoogleLinked: false,
+      providers: [],
+      loginProviderLabel: 'unauthenticated',
+    };
+  }
+
+  const providers = Array.isArray(user.providerData)
+    ? user.providerData.map((p) => p.providerId).filter(Boolean)
+    : [];
+  const googleProvider = Array.isArray(user.providerData)
+    ? user.providerData.find((p) => p.providerId === 'google.com')
+    : undefined;
+  const googleLinked = Boolean(googleProvider);
+
+  return {
+    uid: user.uid,
+    displayName:
+      user.displayName ||
+      googleProvider?.displayName ||
+      `Craque_${user.uid.slice(0, 4).toUpperCase()}`,
+    email: user.email || googleProvider?.email || null,
+    photoURL: user.photoURL || googleProvider?.photoURL || null,
+    isAnonymous: Boolean(user.isAnonymous && !googleLinked),
+    isGoogleLinked: googleLinked,
+    providers,
+    loginProviderLabel: googleLinked ? 'google.com' : 'anonymous',
+  };
+}
+
+function notifyAuthListeners(user: User | null): void {
+  const info = extractAuthUserInfo(user);
+  authReadyListeners.forEach((cb) => cb(user));
+  authStatusListeners.forEach((cb) => cb(info));
+}
 
 onAuthStateChanged(auth, async (user) => {
   if (user) {
@@ -118,9 +181,9 @@ onAuthStateChanged(auth, async (user) => {
     } catch (e) {
       console.warn('Could not initialize user profile yet:', e);
     }
-    authReadyListeners.forEach((cb) => cb(user));
+    notifyAuthListeners(user);
   } else {
-    authReadyListeners.forEach((cb) => cb(null));
+    notifyAuthListeners(null);
   }
 });
 
@@ -133,6 +196,21 @@ export function subscribeToAuthReady(cb: (user: User | null) => void): () => voi
   }
   return () => {
     authReadyListeners.delete(cb);
+  };
+}
+
+export function subscribeToAuthStatus(cb: (info: AuthUserInfo) => void): () => void {
+  authStatusListeners.add(cb);
+  if (auth.currentUser) {
+    cb(extractAuthUserInfo(auth.currentUser));
+  } else {
+    cb(extractAuthUserInfo(null));
+    ensureAuthenticated()
+      .then((u) => cb(extractAuthUserInfo(u)))
+      .catch(() => cb(extractAuthUserInfo(null)));
+  }
+  return () => {
+    authStatusListeners.delete(cb);
   };
 }
 
@@ -169,11 +247,213 @@ export function ensureAuthenticated(): Promise<User> {
   return authReadyPromise;
 }
 
-export async function linkGoogleAccount(): Promise<User> {
+export interface GoogleLinkResult {
+  user: User;
+  mergedFromAnonymous: boolean;
+  alreadyLinked: boolean;
+}
+
+/**
+ * Vincula a conta anônima atual a uma Conta Google usando linkWithPopup para preservar UID,
+ * estatísticas, histórico, amigos e vaga na sala.
+ * Caso a conta Google já exista no Firebase (credential-already-in-use), mescla os dados
+ * da conta anônima para a conta Google existente e migra a vaga na sala ativa.
+ */
+export async function linkGoogleAccount(): Promise<GoogleLinkResult> {
   const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+
+  const currentUser = auth.currentUser;
+
+  // 1. Se o usuário já possui provedor Google vinculado, não abre novo fluxo duplicado
+  if (currentUser && isUserGoogleLinked(currentUser)) {
+    await ensureUserProfile(currentUser);
+    notifyAuthListeners(currentUser);
+    return {
+      user: currentUser,
+      mergedFromAnonymous: false,
+      alreadyLinked: true,
+    };
+  }
+
+  // 2. Se o usuário está autenticado anonimamente, usa linkWithPopup para preservar o UID
+  if (currentUser && currentUser.isAnonymous) {
+    const anonUid = currentUser.uid;
+    let anonProfileData: Record<string, unknown> | null = null;
+    try {
+      const anonSnap = await getDoc(doc(db, 'users', anonUid));
+      if (anonSnap.exists()) {
+        anonProfileData = anonSnap.data();
+      }
+    } catch {
+      // Ignore pre-read error
+    }
+
+    try {
+      const linkedResult = await linkWithPopup(currentUser, provider);
+      const googleName =
+        linkedResult.user.displayName ||
+        linkedResult.user.providerData.find((p) => p.providerId === 'google.com')?.displayName ||
+        undefined;
+      await ensureUserProfile(linkedResult.user, googleName);
+      notifyAuthListeners(linkedResult.user);
+      return {
+        user: linkedResult.user,
+        mergedFromAnonymous: false,
+        alreadyLinked: false,
+      };
+    } catch (err: unknown) {
+      const fbErr = err as FirebaseError | undefined;
+      const code = fbErr?.code || '';
+
+      if (
+        code === 'auth/credential-already-in-use' ||
+        code === 'auth/account-exists-with-different-credential' ||
+        code === 'auth/email-already-in-use'
+      ) {
+        const credential = GoogleAuthProvider.credentialFromError(err as FirebaseError);
+        const signInResult = credential
+          ? await signInWithCredential(auth, credential)
+          : await signInWithPopup(auth, provider);
+        const googleUser = signInResult.user;
+
+        await mergeAnonymousDataIntoGoogleUser(anonUid, anonProfileData, googleUser);
+        notifyAuthListeners(googleUser);
+        return {
+          user: googleUser,
+          mergedFromAnonymous: true,
+          alreadyLinked: false,
+        };
+      }
+
+      throw err;
+    }
+  }
+
+  // 3. Caso não haja usuário logado, autentica com Google diretamente
   const result = await signInWithPopup(auth, provider);
   await ensureUserProfile(result.user);
-  return result.user;
+  notifyAuthListeners(result.user);
+  return {
+    user: result.user,
+    mergedFromAnonymous: false,
+    alreadyLinked: false,
+  };
+}
+
+async function mergeAnonymousDataIntoGoogleUser(
+  anonUid: string,
+  anonData: Record<string, unknown> | null,
+  googleUser: User
+): Promise<void> {
+  if (!anonData || anonUid === googleUser.uid) {
+    await ensureUserProfile(googleUser);
+    return;
+  }
+
+  const googleUserRef = doc(db, 'users', googleUser.uid);
+  const googleSnap = await getDoc(googleUserRef);
+
+  const anonWins = typeof anonData.wins === 'number' ? anonData.wins : 0;
+  const anonLosses = typeof anonData.losses === 'number' ? anonData.losses : 0;
+  const anonDraws = typeof anonData.draws === 'number' ? anonData.draws : 0;
+  const anonGoalsScored = typeof anonData.goalsScored === 'number' ? anonData.goalsScored : 0;
+  const anonGoalsConceded = typeof anonData.goalsConceded === 'number' ? anonData.goalsConceded : 0;
+  const anonMatches = typeof anonData.matchesPlayed === 'number' ? anonData.matchesPlayed : 0;
+  const anonFriends = Array.isArray(anonData.friends) ? (anonData.friends as string[]) : [];
+  const anonRoomCode = typeof anonData.currentRoomCode === 'string' ? anonData.currentRoomCode : '';
+  const anonName = typeof anonData.displayName === 'string' ? anonData.displayName : '';
+  const hasCustomAnonName = Boolean(anonName && !anonName.startsWith('Craque_'));
+
+  const preferredName = (
+    hasCustomAnonName
+      ? anonName
+      : googleUser.displayName || anonName || `Craque_${googleUser.uid.slice(0, 4).toUpperCase()}`
+  ).slice(0, 28);
+
+  if (!googleSnap.exists()) {
+    await setDoc(googleUserRef, {
+      uid: googleUser.uid,
+      displayName: preferredName,
+      tagCode: generateTagCode(googleUser.uid),
+      status: anonData.status || 'online',
+      currentRoomCode: anonRoomCode,
+      friends: anonFriends.filter((id) => id !== googleUser.uid).slice(0, 200),
+      wins: anonWins,
+      losses: anonLosses,
+      draws: anonDraws,
+      goalsScored: anonGoalsScored,
+      goalsConceded: anonGoalsConceded,
+      matchesPlayed: anonMatches,
+      updatedAt: serverTimestamp(),
+      createdAt: serverTimestamp(),
+    });
+  } else {
+    const existing = googleSnap.data();
+    const existingFriends = Array.isArray(existing.friends) ? (existing.friends as string[]) : [];
+    const mergedFriends = Array.from(new Set([...existingFriends, ...anonFriends])).filter(
+      (id) => id !== googleUser.uid
+    );
+
+    await updateDoc(googleUserRef, {
+      uid: existing.uid,
+      displayName: (existing.displayName || preferredName).slice(0, 28),
+      tagCode: existing.tagCode,
+      status: anonRoomCode ? 'in_room' : existing.status || 'online',
+      currentRoomCode: anonRoomCode || existing.currentRoomCode || '',
+      friends: mergedFriends.slice(0, 200),
+      wins: (typeof existing.wins === 'number' ? existing.wins : 0) + anonWins,
+      losses: (typeof existing.losses === 'number' ? existing.losses : 0) + anonLosses,
+      draws: (typeof existing.draws === 'number' ? existing.draws : 0) + anonDraws,
+      goalsScored:
+        (typeof existing.goalsScored === 'number' ? existing.goalsScored : 0) + anonGoalsScored,
+      goalsConceded:
+        (typeof existing.goalsConceded === 'number' ? existing.goalsConceded : 0) +
+        anonGoalsConceded,
+      matchesPlayed:
+        (typeof existing.matchesPlayed === 'number' ? existing.matchesPlayed : 0) + anonMatches,
+      createdAt: existing.createdAt,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  // Se o jogador anônimo estava em uma sala ativa, migra a vaga e liderança para o UID da conta Google
+  if (anonRoomCode) {
+    try {
+      const roomRef = doc(db, 'rooms', anonRoomCode);
+      const roomSnap = await getDoc(roomRef);
+      if (roomSnap.exists()) {
+        const rd = roomSnap.data();
+        const slots: Record<string, MultiplayerSlot> = { ...(rd.slots || {}) };
+        let changed = false;
+        for (const key of Object.keys(slots)) {
+          if (slots[key].uid === anonUid) {
+            slots[key] = {
+              ...slots[key],
+              uid: googleUser.uid,
+              displayName: preferredName,
+              lastSeenMs: Date.now(),
+            };
+            changed = true;
+          }
+        }
+        const nextHostUid = rd.hostUid === anonUid ? googleUser.uid : rd.hostUid;
+        const nextHostName = rd.hostUid === anonUid ? preferredName : rd.hostName;
+        if (changed || rd.hostUid === anonUid) {
+          await updateDoc(roomRef, {
+            ...rd,
+            hostUid: nextHostUid,
+            hostName: nextHostName,
+            slots,
+            lastActivityMs: Date.now(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+    } catch {
+      // Non-fatal room migration
+    }
+  }
 }
 
 function generateTagCode(uid: string): string {
@@ -185,9 +465,11 @@ export async function ensureUserProfile(user: User, preferredNickname?: string):
   const userRef = doc(db, 'users', user.uid);
   try {
     const snap = await getDoc(userRef);
+    const googleName = user.providerData?.find((p) => p.providerId === 'google.com')?.displayName;
     const defaultName =
       preferredNickname?.trim() ||
       user.displayName?.trim() ||
+      googleName?.trim() ||
       `Craque_${user.uid.slice(0, 4).toUpperCase()}`;
 
     if (!snap.exists()) {
@@ -209,9 +491,14 @@ export async function ensureUserProfile(user: User, preferredNickname?: string):
       });
     } else {
       const existing = snap.data();
+      const existingName = typeof existing.displayName === 'string' ? existing.displayName : '';
+      const resolvedName =
+        preferredNickname?.trim() ||
+        (existingName && !existingName.startsWith('Craque_') ? existingName : defaultName);
+
       await updateDoc(userRef, {
         uid: existing.uid,
-        displayName: (preferredNickname?.trim() || existing.displayName || defaultName).slice(0, 28),
+        displayName: resolvedName.slice(0, 28),
         tagCode: existing.tagCode,
         status: existing.status || 'online',
         currentRoomCode: existing.currentRoomCode || '',
@@ -242,6 +529,7 @@ export async function updateNickname(newName: string): Promise<void> {
     // Ignore Auth profile update issues on anonymous users
   }
   await ensureUserProfile(user, cleanName);
+  notifyAuthListeners(auth.currentUser);
 }
 
 export async function updateUserPresence(
@@ -583,6 +871,15 @@ function generateRoomCode(): string {
   return code;
 }
 
+export function generateMatchId(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = 'MTC-';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
 function mapDocToRoomState(d: Record<string, unknown>): MultiplayerRoomState {
   const mode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
   const visibility: RoomVisibility = d.visibility === 'private' ? 'private' : 'public';
@@ -593,6 +890,7 @@ function mapDocToRoomState(d: Record<string, unknown>): MultiplayerRoomState {
 
   return {
     roomCode: String(d.roomCode),
+    matchId: d.matchId ? String(d.matchId) : undefined,
     roomName: String(d.roomName || `SEM TERRA FC — ${String(d.roomCode)}`),
     mode,
     visibility,
@@ -602,6 +900,7 @@ function mapDocToRoomState(d: Record<string, unknown>): MultiplayerRoomState {
     autoFillBots: d.autoFillBots !== false,
     activeCharacterIds,
     loadingReadyUids: Array.isArray(d.loadingReadyUids) ? (d.loadingReadyUids as string[]) : [],
+    startAt: typeof d.startAt === 'number' ? d.startAt : undefined,
     lastActivityMs:
       typeof d.lastActivityMs === 'number'
         ? d.lastActivityMs
@@ -610,7 +909,7 @@ function mapDocToRoomState(d: Record<string, unknown>): MultiplayerRoomState {
         : Date.now(),
     hostUid: String(d.hostUid),
     hostName: String(d.hostName),
-    status: (d.status as 'waiting' | 'playing' | 'finished') || 'waiting',
+    status: (d.status as 'waiting' | 'starting' | 'playing' | 'finished') || 'waiting',
     homeTeamId: String(d.homeTeamId || 'unidos_do_barro'),
     awayTeamId: String(d.awayTeamId || 'rubro_negro_beco'),
     homeScore: typeof d.homeGoals === 'number' ? d.homeGoals : 0,
@@ -657,6 +956,7 @@ export async function createOnlineRoom(
   try {
     await setDoc(roomRef, {
       roomCode,
+      matchId: null,
       roomName,
       mode,
       visibility,
@@ -666,6 +966,7 @@ export async function createOnlineRoom(
       autoFillBots: options?.autoFillBots !== false,
       activeCharacterIds,
       loadingReadyUids: [user.uid],
+      startAt: null,
       lastActivityMs: nowMs,
       hostUid: user.uid,
       hostName,
@@ -743,7 +1044,7 @@ export async function joinOnlineRoom(
   const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
   let existingSlotKey = Object.keys(slots).find((k) => slots[k].uid === user.uid);
 
-  if (d.status === 'playing' && !existingSlotKey) {
+  if ((d.status === 'playing' || d.status === 'starting') && !existingSlotKey) {
     throw new Error('Não é possível entrar: a partida já está em andamento.');
   }
 
@@ -1056,7 +1357,10 @@ export async function leaveOnlineRoom(roomCode: string): Promise<void> {
       const remainingHumans = Object.values(slots).filter((s) => !s.isBot && s.uid);
 
       if (remainingHumans.length === 0) {
-        // Quando o último jogador sair, encerrar e deletar a sala para nunca ficar fantasma
+        // Quando o último jogador sair, encerrar e deletar a sala e o documento da partida
+        if (d.matchId) {
+          await deleteDoc(doc(db, 'matches', String(d.matchId))).catch(() => {});
+        }
         await deleteDoc(roomRef);
       } else {
         let nextHostUid = String(d.hostUid);
@@ -1108,6 +1412,9 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
     for (const docSnap of snap.docs) {
       const d = docSnap.data();
       if (d.status === 'finished') {
+        if (d.matchId) {
+          await deleteDoc(doc(db, 'matches', String(d.matchId))).catch(() => {});
+        }
         await deleteDoc(docSnap.ref).catch(() => {});
         continue;
       }
@@ -1121,6 +1428,9 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
 
       // Sala inteira sem atividade há mais de 45s
       if (nowMs - updatedMs > ROOM_ABANDON_TIMEOUT_MS) {
+        if (d.matchId) {
+          await deleteDoc(doc(db, 'matches', String(d.matchId))).catch(() => {});
+        }
         await deleteDoc(docSnap.ref).catch(() => {});
         continue;
       }
@@ -1138,6 +1448,9 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
 
       const remainingHumans = Object.values(slots).filter((s) => !s.isBot && s.uid);
       if (remainingHumans.length === 0) {
+        if (d.matchId) {
+          await deleteDoc(doc(db, 'matches', String(d.matchId))).catch(() => {});
+        }
         await deleteDoc(docSnap.ref).catch(() => {});
       } else if (slotsChanged) {
         let nextHostUid = String(d.hostUid);
@@ -1161,13 +1474,23 @@ export async function cleanupAbandonedRoomsAndSlots(): Promise<void> {
   }
 }
 
-export async function startOnlineMatch(roomCode: string): Promise<void> {
+/**
+ * Etapa 1 do Início Sincronizado: Host clica em "INICIAR PARTIDA".
+ * Valida a sala, confirma jogadores humanos, preenche vagas restantes com bots,
+ * cria o documento compartilhado /matches/{matchId} e atualiza status da sala para "starting".
+ * Todos os clientes conectados na sala detectam status === "starting" e abrem a tela de carregamento.
+ */
+export async function startOnlineMatch(roomCode: string): Promise<string> {
   const user = await ensureAuthenticated();
   const roomRef = doc(db, 'rooms', roomCode);
   const snap = await getDoc(roomRef);
-  if (!snap.exists()) return;
+  if (!snap.exists()) {
+    throw new Error('Sala não encontrada.');
+  }
   const d = snap.data();
-  if (d.hostUid !== user.uid) return;
+  if (d.hostUid !== user.uid) {
+    throw new Error('Apenas o anfitrião da sala pode iniciar a partida.');
+  }
 
   const roomMode: MatchFormatMode = d.mode === '2v2' ? '2v2' : '4v4';
   const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
@@ -1177,21 +1500,68 @@ export async function startOnlineMatch(roomCode: string): Promise<void> {
     Array.isArray(d.activeCharacterIds) ? d.activeCharacterIds : undefined
   );
 
+  const matchId =
+    d.matchId && typeof d.matchId === 'string' && d.matchId.startsWith('MTC-')
+      ? d.matchId
+      : generateMatchId();
+  const startAt = Date.now();
+
+  const humanPlayers = Object.values(slots)
+    .filter((s) => !s.isBot && s.uid && activeCharacterIds.includes(s.characterId))
+    .map((s) => String(s.uid));
+  const botCharacters = Object.values(slots)
+    .filter((s) => s.isBot && activeCharacterIds.includes(s.characterId))
+    .map((s) => s.characterId);
+
   try {
-    await updateDoc(roomRef, {
-      ...d,
-      status: 'playing',
-      activeCharacterIds,
-      loadingReadyUids: [user.uid],
-      lastActivityMs: Date.now(),
+    // Cria documento compartilhado /matches/{matchId}
+    const matchRef = doc(db, 'matches', matchId);
+    await setDoc(matchRef, {
+      matchId,
+      roomId: roomCode,
+      hostId: user.uid,
+      mode: roomMode,
+      status: 'starting',
+      players: humanPlayers.length > 0 ? humanPlayers : [user.uid],
+      bots: botCharacters,
+      score: {
+        teamA: 0,
+        teamB: 0,
+      },
+      ball: {
+        x: 0,
+        y: 0.22,
+        z: 0,
+      },
+      startAt,
+      createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+
+    // Atualiza sala para status: "starting" para disparar transição imediata em todos os convidados
+    await updateDoc(roomRef, {
+      ...d,
+      matchId,
+      status: 'starting',
+      startAt,
+      activeCharacterIds,
+      loadingReadyUids: [user.uid],
+      lastActivityMs: startAt,
+      updatedAt: serverTimestamp(),
+    });
+
     await updateUserPresence('playing', roomCode);
+    return matchId;
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, `rooms/${roomCode}`);
   }
 }
 
+/**
+ * Etapa 2 do Início Sincronizado: Cada cliente conectado confirma que carregou o campo e personagens.
+ * Quando todos os jogadores humanos da sala confirmarem (ou após o timeout de 5s via promoteRoomToPlaying),
+ * a sala avança automaticamente de "starting" para "playing".
+ */
 export async function markPlayerMatchLoadingReady(roomCode: string): Promise<void> {
   const user = auth.currentUser;
   if (!user || !roomCode) return;
@@ -1200,18 +1570,85 @@ export async function markPlayerMatchLoadingReady(roomCode: string): Promise<voi
     const snap = await getDoc(roomRef);
     if (!snap.exists()) return;
     const d = snap.data();
-    const readyList = Array.isArray(d.loadingReadyUids) ? [...d.loadingReadyUids] : [];
-    if (!readyList.includes(user.uid)) {
-      readyList.push(user.uid);
-      await updateDoc(roomRef, {
-        ...d,
-        loadingReadyUids: readyList,
-        lastActivityMs: Date.now(),
-        updatedAt: serverTimestamp(),
-      });
+    const readyList = Array.isArray(d.loadingReadyUids)
+      ? Array.from(new Set([...(d.loadingReadyUids as string[]), user.uid]))
+      : [user.uid];
+
+    const slots: Record<string, MultiplayerSlot> = { ...(d.slots || {}) };
+    const humanUids = Object.values(slots)
+      .filter((s) => !s.isBot && s.uid)
+      .map((s) => String(s.uid));
+    const allHumansReady =
+      humanUids.length > 0 && humanUids.every((uid) => readyList.includes(uid));
+
+    const nextStatus =
+      d.status === 'starting' && allHumansReady ? 'playing' : d.status;
+
+    await updateDoc(roomRef, {
+      ...d,
+      status: nextStatus,
+      loadingReadyUids: readyList,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+
+    if (nextStatus === 'playing' && d.matchId) {
+      const matchRef = doc(db, 'matches', String(d.matchId));
+      const matchSnap = await getDoc(matchRef);
+      if (matchSnap.exists()) {
+        const md = matchSnap.data();
+        await updateDoc(matchRef, {
+          ...md,
+          status: 'playing',
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      }
     }
   } catch {
     // Ignore transient race
+  }
+}
+
+/**
+ * Promove a sala de "starting" para "playing" (chamado quando todos os humanos estão prontos
+ * ou quando o timeout de 5 segundos de carregamento se esgota).
+ */
+export async function promoteRoomToPlaying(roomCode: string): Promise<void> {
+  const user = auth.currentUser;
+  if (!user || !roomCode) return;
+  const roomRef = doc(db, 'rooms', roomCode);
+  try {
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return;
+    const d = snap.data();
+    if (d.status === 'finished' || d.status === 'playing') return;
+
+    const readyList = Array.isArray(d.loadingReadyUids)
+      ? Array.from(new Set([...(d.loadingReadyUids as string[]), user.uid]))
+      : [user.uid];
+
+    await updateDoc(roomRef, {
+      ...d,
+      status: 'playing',
+      loadingReadyUids: readyList,
+      lastActivityMs: Date.now(),
+      updatedAt: serverTimestamp(),
+    });
+
+    if (d.matchId) {
+      const matchRef = doc(db, 'matches', String(d.matchId));
+      const matchSnap = await getDoc(matchRef);
+      if (matchSnap.exists()) {
+        const md = matchSnap.data();
+        await updateDoc(matchRef, {
+          ...md,
+          status: 'playing',
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      }
+    }
+  } catch {
+    // Ignore race condition if another client already promoted the room
   }
 }
 

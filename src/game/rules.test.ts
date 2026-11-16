@@ -161,3 +161,104 @@ test('formatMatchTime formats seconds into MM:SS', () => {
   assert.equal(formatMatchTime(65), '01:05');
   assert.equal(formatMatchTime(0), '00:00');
 });
+
+test('Google provider identification inspects user.providerData for google.com accurately', async () => {
+  const { isUserGoogleLinked, extractAuthUserInfo } = await import('../services/firebase');
+
+  // Unauthenticated user
+  assert.equal(isUserGoogleLinked(null), false);
+  const unauthInfo = extractAuthUserInfo(null);
+  assert.equal(unauthInfo.uid, '');
+  assert.equal(unauthInfo.isGoogleLinked, false);
+
+  // Anonymous user without google.com in providerData
+  const anonMock = {
+    uid: 'anon_uid_123',
+    isAnonymous: true,
+    displayName: 'Yuri',
+    email: null,
+    photoURL: null,
+    providerData: [],
+  } as any;
+  assert.equal(isUserGoogleLinked(anonMock), false);
+  const anonInfo = extractAuthUserInfo(anonMock);
+  assert.equal(anonInfo.uid, 'anon_uid_123');
+  assert.equal(anonInfo.isAnonymous, true);
+  assert.equal(anonInfo.isGoogleLinked, false);
+
+  // Google-authenticated user with providerId === 'google.com'
+  const googleMock = {
+    uid: 'google_uid_456',
+    isAnonymous: false,
+    displayName: 'Yuri Silva',
+    email: 'yuryofc092@gmail.com',
+    photoURL: 'https://example.com/photo.jpg',
+    providerData: [
+      {
+        providerId: 'google.com',
+        uid: '1092837465',
+        displayName: 'Yuri Silva',
+        email: 'yuryofc092@gmail.com',
+        phoneNumber: null,
+        photoURL: 'https://example.com/photo.jpg',
+      },
+    ],
+  } as any;
+  assert.equal(isUserGoogleLinked(googleMock), true);
+  const googleInfo = extractAuthUserInfo(googleMock);
+  assert.equal(googleInfo.uid, 'google_uid_456');
+  assert.equal(googleInfo.isAnonymous, false);
+  assert.equal(googleInfo.isGoogleLinked, true);
+  assert.equal(googleInfo.email, 'yuryofc092@gmail.com');
+  assert.deepEqual(googleInfo.providers, ['google.com']);
+});
+
+test('Multiplayer synchronization lifecycle enforces roomId, matchId and blocks late joins when starting or playing', async () => {
+  const { isRoomJoinable } = await import('../services/roomService');
+  const { generateMatchId } = await import('../services/matchService');
+
+  const matchId1 = generateMatchId();
+  const matchId2 = generateMatchId();
+  assert.match(matchId1, /^MTC-[A-Z0-9]{6}$/);
+  assert.notEqual(matchId1, matchId2);
+
+  const slots = buildInitialRoomSlots('host_uid', 'HostPlayer', 'home_1');
+  const baseRoom: any = {
+    roomCode: 'STF-102A',
+    roomName: 'SEM TERRA FC — SALA #102',
+    hostUid: 'host_uid',
+    hostName: 'HostPlayer',
+    mode: '4v4',
+    visibility: 'public',
+    maxHumans: 8,
+    humanCount: 1,
+    botFill: true,
+    status: 'waiting',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    slots,
+    activeCharacterIds: resolveActiveCharacterIdsForRoom(slots, '4v4'),
+  };
+
+  // Waiting room with open slots is joinable
+  assert.deepEqual(isRoomJoinable(baseRoom), { joinable: true });
+
+  // Transition to 'starting' (when host clicks INICIAR PARTIDA) blocks new external joins
+  const startingRoom = {
+    ...baseRoom,
+    status: 'starting' as const,
+    matchId: matchId1,
+    startAt: Date.now(),
+  };
+  const startingCheck = isRoomJoinable(startingRoom);
+  assert.equal(startingCheck.joinable, false);
+
+  // Transition to 'playing' also blocks new external joins
+  const playingRoom = {
+    ...startingRoom,
+    status: 'playing' as const,
+  };
+  const playingCheck = isRoomJoinable(playingRoom);
+  assert.equal(playingCheck.joinable, false);
+});
+

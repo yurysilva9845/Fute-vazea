@@ -56,14 +56,15 @@ service cloud.firestore {
           'half', 'remainingSeconds', 'slots', 'updatedAt', 'createdAt'
         ])
         && data.keys().hasOnly([
-          'roomCode', 'roomName', 'mode', 'visibility', 'hasPassword', 'passwordHash',
-          'maxHumans', 'autoFillBots', 'activeCharacterIds', 'loadingReadyUids', 'lastActivityMs',
+          'roomCode', 'matchId', 'roomName', 'mode', 'visibility', 'hasPassword', 'passwordHash',
+          'maxHumans', 'autoFillBots', 'activeCharacterIds', 'loadingReadyUids', 'startAt', 'lastActivityMs',
           'hostUid', 'hostName', 'status',
           'homeTeamId', 'awayTeamId', 'homeGoals', 'awayGoals',
           'half', 'remainingSeconds', 'slots', 'inputs', 'matchSnapshot',
           'updatedAt', 'createdAt'
         ])
         && data.roomCode is string && data.roomCode == roomId && data.roomCode.size() >= 4 && data.roomCode.size() <= 16
+        && (!('matchId' in data) || data.matchId == null || (data.matchId is string && data.matchId.size() <= 32))
         && (!('roomName' in data) || (data.roomName is string && data.roomName.size() >= 1 && data.roomName.size() <= 64))
         && (!('mode' in data) || (data.mode in ['2v2', '4v4']))
         && (!('visibility' in data) || (data.visibility in ['public', 'private']))
@@ -73,10 +74,11 @@ service cloud.firestore {
         && (!('autoFillBots' in data) || (data.autoFillBots is bool))
         && (!('activeCharacterIds' in data) || (data.activeCharacterIds is list && data.activeCharacterIds.size() >= 2 && data.activeCharacterIds.size() <= 8))
         && (!('loadingReadyUids' in data) || (data.loadingReadyUids is list && data.loadingReadyUids.size() <= 16))
+        && (!('startAt' in data) || data.startAt == null || (data.startAt is int && data.startAt >= 0))
         && (!('lastActivityMs' in data) || (data.lastActivityMs is int && data.lastActivityMs >= 0))
         && data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128
         && data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 32
-        && data.status in ['waiting', 'playing', 'finished']
+        && data.status in ['waiting', 'starting', 'playing', 'finished']
         && data.homeTeamId is string && data.homeTeamId.size() >= 1 && data.homeTeamId.size() <= 64
         && data.awayTeamId is string && data.awayTeamId.size() >= 1 && data.awayTeamId.size() <= 64
         && data.homeGoals is int && data.homeGoals >= 0 && data.homeGoals <= 99
@@ -88,6 +90,29 @@ service cloud.firestore {
         && (!('matchSnapshot' in data) || data.matchSnapshot == null || data.matchSnapshot is map)
         && data.updatedAt is timestamp
         && data.createdAt is timestamp;
+    }
+
+    function isValidMultiplayerMatch(data, matchId) {
+      return data.keys().hasAll([
+          'matchId', 'roomId', 'hostId', 'mode', 'status',
+          'players', 'bots', 'score', 'startAt', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'matchId', 'roomId', 'hostId', 'mode', 'status',
+          'players', 'bots', 'score', 'ball', 'startAt', 'createdAt', 'updatedAt'
+        ])
+        && data.matchId is string && data.matchId == matchId && data.matchId.size() >= 4 && data.matchId.size() <= 32
+        && data.roomId is string && data.roomId.size() >= 4 && data.roomId.size() <= 16
+        && data.hostId is string && data.hostId.size() >= 1 && data.hostId.size() <= 128
+        && data.mode in ['2v2', '4v4']
+        && data.status in ['waiting', 'starting', 'playing', 'finished']
+        && data.players is list && data.players.size() <= 16
+        && data.bots is list && data.bots.size() <= 16
+        && data.score is map
+        && (!('ball' in data) || data.ball == null || data.ball is map)
+        && data.startAt is int && data.startAt >= 0
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
     }
 
     function isValidVoiceSignal(data) {
@@ -197,7 +222,7 @@ service cloud.firestore {
           // Host can update match state, scores, phase, or transfer host on leave
           existing().hostUid == request.auth.uid
           || (
-            // Non-host participants can update slots (join/leave/ready/mic), inputs, loadingReadyUids, or inherit host on host timeout/exit
+            // Non-host participants can update slots (join/leave/ready/mic), inputs, loadingReadyUids, promote starting->playing, or inherit host on host timeout/exit
             incoming().homeGoals == existing().homeGoals
             && incoming().awayGoals == existing().awayGoals
             && incoming().homeTeamId == existing().homeTeamId
@@ -220,6 +245,26 @@ service cloud.firestore {
 
         allow update: if false;
       }
+    }
+
+    // 2B. Multiplayer Active Matches
+    match /matches/{matchId} {
+      allow get, list: if isAuthenticated();
+
+      allow create: if isAuthenticated()
+        && isValidMultiplayerMatch(incoming(), matchId)
+        && incoming().hostId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isAuthenticated()
+        && isValidMultiplayerMatch(incoming(), matchId)
+        && incoming().matchId == existing().matchId
+        && incoming().roomId == existing().roomId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+
+      allow delete: if isAuthenticated();
     }
 
     // 3. Friend Requests & Room Invites

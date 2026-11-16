@@ -1,9 +1,12 @@
 import { OnlineUserProfile } from '../types/game';
 import {
   ensureUserProfile,
+  extractAuthUserInfo,
   getCurrentAuthUser,
+  isUserGoogleLinked,
   linkGoogleAccount,
   subscribeToAuthReady,
+  subscribeToAuthStatus,
   subscribeToMyProfile,
   updateNickname,
   updateUserPresence,
@@ -11,9 +14,12 @@ import {
 
 export {
   ensureUserProfile,
+  extractAuthUserInfo,
   getCurrentAuthUser,
+  isUserGoogleLinked,
   linkGoogleAccount,
   subscribeToAuthReady,
+  subscribeToAuthStatus,
   subscribeToMyProfile,
   updateNickname,
   updateUserPresence,

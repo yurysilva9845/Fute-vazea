@@ -1,5 +1,7 @@
 import {
+  generateMatchId,
   markPlayerMatchLoadingReady,
+  promoteRoomToPlaying,
   publishClientInput,
   publishHostMatchSnapshot,
   recordMatchFinished,
@@ -7,9 +9,12 @@ import {
 } from './firebase';
 
 export {
+  generateMatchId,
   markPlayerMatchLoadingReady,
+  promoteRoomToPlaying,
   publishClientInput,
   publishHostMatchSnapshot,
   recordMatchFinished,
   startOnlineMatch,
 };
+

@@ -9,6 +9,7 @@ test('firestore.rules enforces global default deny and all collections including
   assert.ok(rulesSource.includes('match /{document=**} {\n      allow read, write: if false;\n    }'));
   assert.ok(rulesSource.includes('match /users/{userId}'));
   assert.ok(rulesSource.includes('match /rooms/{roomId}'));
+  assert.ok(rulesSource.includes('match /matches/{matchId}'));
   assert.ok(rulesSource.includes('match /signals/{signalId}'));
   assert.ok(rulesSource.includes('match /friendRequests/{requestId}'));
   assert.ok(rulesSource.includes('match /matchHistory/{matchId}'));
@@ -43,4 +44,7 @@ test('Dirty Dozen payloads are blocked by validation helpers and action gates', 
   assert.ok(rulesSource.includes('allow update, delete: if false;'));
   // 13. WebRTC voice signaling validation
   assert.ok(rulesSource.includes("data.type in ['offer', 'answer', 'ice']"));
+  // 14. Two-stage synchronized match start ('waiting', 'starting', 'playing', 'finished')
+  assert.ok(rulesSource.includes("data.status in ['waiting', 'starting', 'playing', 'finished']"));
 });
+

@@ -70,7 +70,7 @@ export function isRoomJoinable(room: MultiplayerRoomState): {
   if (room.status === 'finished') {
     return { joinable: false, reason: 'Esta partida já foi encerrada.' };
   }
-  if (room.status === 'playing') {
+  if (room.status === 'playing' || room.status === 'starting') {
     return { joinable: false, reason: 'Partida já em andamento.' };
   }
   const mode: MatchFormatMode = room.mode === '2v2' ? '2v2' : '4v4';
@@ -81,3 +81,4 @@ export function isRoomJoinable(room: MultiplayerRoomState): {
   }
   return { joinable: true };
 }
+

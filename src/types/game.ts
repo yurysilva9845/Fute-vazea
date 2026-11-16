@@ -340,8 +340,20 @@ export interface MultiplayerMatchSnapshot {
   timestamp: number;
 }
 
+export interface AuthUserInfo {
+  uid: string;
+  displayName: string;
+  email: string | null;
+  photoURL: string | null;
+  isAnonymous: boolean;
+  isGoogleLinked: boolean;
+  providers: string[];
+  loginProviderLabel: 'google.com' | 'anonymous' | 'unauthenticated';
+}
+
 export interface MultiplayerRoomState {
   roomCode: string;
+  matchId?: string;
   roomName?: string;
   mode?: MatchFormatMode;
   visibility?: RoomVisibility;
@@ -351,10 +363,11 @@ export interface MultiplayerRoomState {
   autoFillBots?: boolean;
   activeCharacterIds?: string[];
   loadingReadyUids?: string[];
+  startAt?: number;
   lastActivityMs?: number;
   hostUid: string;
   hostName: string;
-  status: 'waiting' | 'playing' | 'finished';
+  status: 'waiting' | 'starting' | 'playing' | 'finished';
   homeTeamId: string;
   awayTeamId: string;
   homeScore: number;
@@ -364,5 +377,6 @@ export interface MultiplayerRoomState {
   slots: Record<string, MultiplayerSlot>;
   matchState: MultiplayerMatchSnapshot | null;
 }
+
 
 

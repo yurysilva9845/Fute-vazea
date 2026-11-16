@@ -34,6 +34,7 @@ import { VarzeaInputManager } from './controls';
 import { audioEngine } from './audio';
 import {
   auth,
+  ClientInputState,
   publishClientInput,
   publishHostMatchSnapshot,
 } from '../services/firebase';
@@ -57,7 +58,7 @@ interface MatchCanvasProps {
   settings: GameSettings;
   inputManager: VarzeaInputManager;
   restartSignal: number;
-  activeRoom?: MultiplayerRoomState | null;
+  activeRoom?: (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null;
   onlineControlledCharacterId?: string;
   onScoreAndClockUpdate: (
     homeGoals: number,
@@ -456,6 +457,11 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
         propsRef.current.onlineControlledCharacterId || 'home_1';
     };
 
+    let guestFulltimeHandled = false;
+    let lastGuestHomeGoals = 0;
+    let lastGuestAwayGoals = 0;
+    const lastRemoteActionTsByUid: Record<string, number> = {};
+
     const resetFullMatch = () => {
       stats.homeGoals = 0;
       stats.awayGoals = 0;
@@ -468,6 +474,9 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       stats.homePossessionFrames = 1;
       stats.awayPossessionFrames = 1;
       stats.scorers = [];
+      guestFulltimeHandled = false;
+      lastGuestHomeGoals = 0;
+      lastGuestAwayGoals = 0;
       currentHalf = 1;
       remainingHalfSeconds = propsRef.current.settings.halfDurationSeconds;
       matchPhase = 'open_play';
@@ -711,7 +720,7 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
       if (hitstopTimer > 0) {
         hitstopTimer = Math.max(0, hitstopTimer - dt);
       } else if (isSimulating) {
-        // If Online Non-Host Client: interpolate authoritative ball, clock, score & non-controlled players from room.matchState
+        // If Online Non-Host Client: interpolate authoritative ball, clock, score, goal events & non-controlled players from room.matchState
         if (isOnlineMatch && !isOnlineHost && room?.matchState) {
           const ms = room.matchState;
           ballState.x = THREE.MathUtils.lerp(ballState.x, ms.ball.x, 0.35);
@@ -725,6 +734,57 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
           bannerMessage = ms.bannerMessage;
           bannerSubtext = ms.bannerSubtext;
 
+          // Sync score & detect newly scored goals on Guest client
+          const nextHomeGoals = typeof ms.homeGoals === 'number' ? ms.homeGoals : room.homeScore || 0;
+          const nextAwayGoals = typeof ms.awayGoals === 'number' ? ms.awayGoals : room.awayScore || 0;
+
+          if (nextHomeGoals > lastGuestHomeGoals || nextAwayGoals > lastGuestAwayGoals) {
+            const scoredHome = nextHomeGoals > lastGuestHomeGoals;
+            lastGuestHomeGoals = nextHomeGoals;
+            lastGuestAwayGoals = nextAwayGoals;
+            stats.homeGoals = nextHomeGoals;
+            stats.awayGoals = nextAwayGoals;
+            world.triggerNetRipple(scoredHome ? 'right' : 'left');
+            audioEngine.playGoalCelebration();
+            cameraRig.addTrauma(0.45);
+            world.particles.spawnBurst(ballState.x, ballState.y, ballState.z, 'dust', 20);
+          } else {
+            stats.homeGoals = nextHomeGoals;
+            stats.awayGoals = nextAwayGoals;
+          }
+
+          currentHalf = ms.half || room.half || 1;
+          remainingHalfSeconds =
+            typeof ms.remainingSeconds === 'number'
+              ? ms.remainingSeconds
+              : room.remainingSeconds ?? remainingHalfSeconds;
+
+          const secInt = Math.max(0, Math.ceil(remainingHalfSeconds));
+          if (
+            secInt !== lastReportedSecond ||
+            stats.homeGoals !== lastGuestHomeGoals ||
+            stats.awayGoals !== lastGuestAwayGoals
+          ) {
+            lastReportedSecond = secInt;
+            currentProps.onScoreAndClockUpdate(
+              stats.homeGoals,
+              stats.awayGoals,
+              currentHalf,
+              secInt,
+              matchPhase
+            );
+          }
+
+          if (
+            (ms.phase === 'fulltime' || room.status === 'finished') &&
+            currentProps.screenState === 'playing' &&
+            !guestFulltimeHandled
+          ) {
+            guestFulltimeHandled = true;
+            audioEngine.playWhistle('fulltime');
+            currentProps.onMatchFinished({ ...stats });
+          }
+
           playersState.forEach((p) => {
             if (p.id !== controlledPlayerId && ms.players?.[p.id]) {
               const netP = ms.players[p.id];
@@ -735,6 +795,12 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
               p.vz = netP.vz;
               p.facingAngle = netP.facingAngle;
               p.animState = netP.animState;
+            } else if (p.id === controlledPlayerId && ms.players?.[p.id] && matchPhase !== 'open_play') {
+              // During kickoff/celebration resets, align controlled player with host position
+              const netP = ms.players[p.id];
+              p.x = THREE.MathUtils.lerp(p.x, netP.x, 0.25);
+              p.z = THREE.MathUtils.lerp(p.z, netP.z, 0.25);
+              p.y = getTerrainHeightAt(p.x, p.z);
             }
           });
         }
@@ -852,25 +918,21 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
 
           // If online host, check if this character is controlled by another remote human client
           const slotInfo = room?.slots?.[p.id];
-          const isRemoteHumanOnHost =
+          const isRemoteHumanOnHost = Boolean(
             isOnlineMatch &&
-            isOnlineHost &&
-            slotInfo &&
-            !slotInfo.isBot &&
-            slotInfo.uid &&
-            slotInfo.uid !== myUid;
-
-          if (isRemoteHumanOnHost && room?.matchState?.players?.[p.id]) {
-            const remoteP = room.matchState.players[p.id];
-            p.x = THREE.MathUtils.lerp(p.x, remoteP.x, 0.4);
-            p.z = THREE.MathUtils.lerp(p.z, remoteP.z, 0.4);
-            p.y = getTerrainHeightAt(p.x, p.z);
-            p.vx = remoteP.vx;
-            p.vz = remoteP.vz;
-            p.facingAngle = remoteP.facingAngle;
-            p.animState = remoteP.animState;
-            continue;
-          }
+              isOnlineHost &&
+              slotInfo &&
+              !slotInfo.isBot &&
+              slotInfo.uid &&
+              slotInfo.uid !== myUid
+          );
+          const remoteInput =
+            isRemoteHumanOnHost && slotInfo?.uid
+              ? room?.inputs?.[slotInfo.uid]
+              : undefined;
+          const hasFreshRemoteInput = Boolean(
+            remoteInput && Date.now() - (remoteInput.timestamp || 0) < 12000
+          );
 
           // If online non-host client, only simulate the locally controlled player
           if (isOnlineMatch && !isOnlineHost && !isUserControlled) {
@@ -1028,8 +1090,67 @@ export const MatchCanvas: React.FC<MatchCanvasProps> = ({
                   aimZ
                 );
               }
+            } else if (isRemoteHumanOnHost && hasFreshRemoteInput && remoteInput && slotInfo?.uid) {
+              // Authoritative simulation of remote human guest inputs on the Host
+              moveX = THREE.MathUtils.clamp(remoteInput.moveX || 0, -1, 1);
+              moveZ = THREE.MathUtils.clamp(remoteInput.moveZ || 0, -1, 1);
+              wantSprint = Boolean(remoteInput.sprint) && p.stamina > 8;
+
+              const isNewActionPacket =
+                remoteInput.action !== 'none' &&
+                remoteInput.timestamp !== lastRemoteActionTsByUid[slotInfo.uid];
+
+              if (isNewActionPacket) {
+                lastRemoteActionTsByUid[slotInfo.uid] = remoteInput.timestamp;
+                const distBall = Math.hypot(ballState.x - p.x, ballState.z - p.z);
+
+                if (remoteInput.action === 'tackle' && p.tackleCooldown <= 0) {
+                  p.tackleCooldown = 1.25;
+                  p.animState = 'tackle';
+                  p.animTimer = 0;
+                  const lungeSpeed = 9.2 * p.config.tackleStat;
+                  p.vx = Math.sin(p.facingAngle) * lungeSpeed;
+                  p.vz = Math.cos(p.facingAngle) * lungeSpeed;
+                  audioEngine.playSlideTackle(p.inPuddle);
+                  world.particles.spawnBurst(
+                    p.x,
+                    0.05,
+                    p.z,
+                    p.inPuddle ? 'water' : 'mud',
+                    10
+                  );
+                } else if (remoteInput.action === 'pass' && distBall < 1.55) {
+                  const mates = playersState.filter(
+                    (m) => m.team === p.team && m.id !== p.id
+                  );
+                  const targetMate = mates[0];
+                  executeBallStrike(
+                    p,
+                    'pass',
+                    0.68,
+                    targetMate ? targetMate.x : undefined,
+                    targetMate ? targetMate.z : undefined
+                  );
+                } else if (remoteInput.action === 'shoot' && distBall < 1.65) {
+                  const targetGoalX =
+                    p.team === 'home'
+                      ? DEFAULT_PITCH.width / 2
+                      : -DEFAULT_PITCH.width / 2;
+                  const aimZ =
+                    Math.abs(moveZ) > 0.15
+                      ? moveZ * (DEFAULT_PITCH.goalWidth * 0.45)
+                      : (Math.random() - 0.5) * 1.3;
+                  executeBallStrike(
+                    p,
+                    'shoot',
+                    remoteInput.kickPower || 0.78,
+                    targetGoalX,
+                    aimZ
+                  );
+                }
+              }
             } else {
-              // AI control for teammates and opponents (Primo, Bicudo, Ismael, Felipe)
+              // AI control for bots (or fallback if remote human temporarily has no input packet)
               const ai = computeAIDecision(
                 p,
                 ballState,

@@ -23,11 +23,14 @@ import { MatchLoadingOverlay } from './components/MatchLoadingOverlay';
 import { CharacterSelect3DModal } from './components/CharacterSelect3DModal';
 import { audioEngine } from './game/audio';
 import {
+  ClientInputState,
   ensureAuthenticated,
   getCurrentAuthUser,
   leaveOnlineRoom,
   markPlayerMatchLoadingReady,
+  promoteRoomToPlaying,
   recordMatchFinished,
+  subscribeToMyProfile,
   subscribeToRoom,
 } from './services/firebase';
 import { presenceService } from './services/presenceService';
@@ -44,6 +47,11 @@ export default function App() {
     }
     return 'title';
   });
+
+  const screenStateRef = useRef<GameScreenState>(screenState);
+  useEffect(() => {
+    screenStateRef.current = screenState;
+  }, [screenState]);
 
   const [homeTeam, setHomeTeam] = useState<TeamConfig>(AVAILABLE_TEAMS[0]);
   const [awayTeam, setAwayTeam] = useState<TeamConfig>(AVAILABLE_TEAMS[2]);
@@ -103,7 +111,9 @@ export default function App() {
   const [multiplayerModalOpen, setMultiplayerModalOpen] = useState<boolean>(false);
   const [characterSelectModalOpen, setCharacterSelectModalOpen] = useState<boolean>(false);
   const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
-  const [activeRoom, setActiveRoom] = useState<MultiplayerRoomState | null>(null);
+  const [activeRoom, setActiveRoom] = useState<
+    (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null
+  >(null);
   const [onlineControlledCharId, setOnlineControlledCharId] = useState<string>('home_1');
   const [showMatchLoadingOverlay, setShowMatchLoadingOverlay] = useState<boolean>(false);
   const [pingMs, setPingMs] = useState<number>(18);
@@ -117,7 +127,7 @@ export default function App() {
     };
   }, [inputManager]);
 
-  // Boot-time Firebase auth warm-up, session cleanup & Fullscreen listener
+  // Boot-time Firebase auth warm-up, profile room recovery, session cleanup & Fullscreen listener
   useEffect(() => {
     const startTs = performance.now();
     ensureAuthenticated()
@@ -127,17 +137,25 @@ export default function App() {
       })
       .catch(() => {});
 
+    const unsubProfile = subscribeToMyProfile((prof) => {
+      if (prof?.currentRoomCode && prof.currentRoomCode.trim().length >= 4) {
+        setActiveRoomCode((prev) => prev || prof.currentRoomCode.trim().toUpperCase());
+      }
+    });
+
     const onFullscreenChange = () => {
       setIsFullscreen(Boolean(document.fullscreenElement));
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => {
+      unsubProfile();
       sessionCleanupService.stopPeriodicCleanup();
       document.removeEventListener('fullscreenchange', onFullscreenChange);
     };
   }, []);
 
-  // Keep activeRoom synced in real time during gameplay and detect my controlled character
+  // Persistent root room listener: keeps activeRoom synced in real time and automatically transitions
+  // both Host (Client A) and Guest (Client B) when room.status becomes 'starting' or 'playing'
   useEffect(() => {
     if (!activeRoomCode) {
       setActiveRoom(null);
@@ -147,6 +165,7 @@ export default function App() {
       if (!room) {
         setActiveRoom(null);
         setActiveRoomCode(null);
+        setShowMatchLoadingOverlay(false);
         presenceService.stopRoomPresence();
         voiceChatService.leaveRoomVoice();
         return;
@@ -161,9 +180,31 @@ export default function App() {
           setOnlineControlledCharId(mySlot.characterId);
         }
       }
+
+      if (room.status === 'starting') {
+        setMultiplayerModalOpen(false);
+        setShowMatchLoadingOverlay(true);
+        presenceService.startRoomPresence(room.roomCode, 'playing');
+        markPlayerMatchLoadingReady(room.roomCode).catch(() => {});
+      } else if (room.status === 'playing') {
+        setMultiplayerModalOpen(false);
+        setShowMatchLoadingOverlay(false);
+        presenceService.startRoomPresence(room.roomCode, 'playing');
+        if (
+          screenStateRef.current !== 'playing' &&
+          screenStateRef.current !== 'paused' &&
+          screenStateRef.current !== 'gameover'
+        ) {
+          inputManager.clearAll();
+          audioEngine.stopMenuBatucada();
+          setRestartSignal((s) => s + 1);
+          document.body.dataset.state = 'playing';
+          setScreenState('playing');
+        }
+      }
     });
     return () => unsub();
-  }, [activeRoomCode]);
+  }, [activeRoomCode, inputManager]);
 
   const hudUpdateRef = useRef<LiveHUDUpdate>({
     controlledPlayerName: 'Yuri',
@@ -439,11 +480,30 @@ export default function App() {
     []
   );
 
+  const handlePlayerLoadedInOverlay = useCallback(() => {
+    if (activeRoomCode) {
+      markPlayerMatchLoadingReady(activeRoomCode).catch(() => {});
+    }
+  }, [activeRoomCode]);
+
   const handleCompleteMatchLoading = useCallback(() => {
+    if (activeRoomCode) {
+      promoteRoomToPlaying(activeRoomCode).catch(() => {});
+    }
     setShowMatchLoadingOverlay(false);
     setRestartSignal((s) => s + 1);
     handleStartMatch();
-  }, [handleStartMatch]);
+  }, [activeRoomCode, handleStartMatch]);
+
+  const handleOpenMultiplayerModal = useCallback(() => {
+    if (
+      typeof window !== 'undefined' &&
+      (window.innerWidth <= 920 || 'ontouchstart' in window)
+    ) {
+      requestFullscreenAndLandscape();
+    }
+    setMultiplayerModalOpen(true);
+  }, [requestFullscreenAndLandscape]);
 
   return (
     <main className="relative w-full h-full overflow-hidden bg-stone-950 select-none">
@@ -472,6 +532,7 @@ export default function App() {
           room={activeRoom}
           homeTeam={homeTeam}
           awayTeam={awayTeam}
+          onPlayerLoaded={handlePlayerLoadedInOverlay}
           onReadyToPlay={handleCompleteMatchLoading}
         />
       )}
@@ -487,7 +548,7 @@ export default function App() {
           activeRoom={activeRoom}
           onStartMatch={handleStartMatch}
           onStartFullscreenMatch={handleStartFullscreenMatch}
-          onOpenMultiplayer={() => setMultiplayerModalOpen(true)}
+          onOpenMultiplayer={handleOpenMultiplayerModal}
           onSelectHomeTeam={handleSelectHomeTeam}
           onSelectAwayTeam={handleSelectAwayTeam}
           onUpdatePlayer={handleUpdateHomePlayer}
