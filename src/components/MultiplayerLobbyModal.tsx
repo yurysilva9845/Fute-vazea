@@ -41,6 +41,7 @@ import {
 } from '../services/botService';
 import {
   ALL_CHARACTERS,
+  clearGameBackendError,
   clearQuotaBackoffForManualRetry,
   createOnlineRoom,
   extractAuthUserInfo,
@@ -52,6 +53,7 @@ import {
   joinOnlineRoom,
   leaveOnlineRoom,
   linkGoogleAccount,
+  removeFriendByTag,
   respondToFriendRequest,
   selectRoomCharacter,
   sendFriendRequestByTag,
@@ -59,6 +61,7 @@ import {
   startOnlineMatch,
   subscribeToAuthStatus,
   subscribeToFriendsProfiles,
+  subscribeToGameBackendState,
   subscribeToIncomingRequests,
   subscribeToMyProfile,
   subscribeToOnlinePlayers,
@@ -213,11 +216,18 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
       setIncomingRequests(reqs);
     });
 
+    const unsubBackend = subscribeToGameBackendState((state) => {
+      if (state.lastError) {
+        setFeedbackMsg({ text: state.lastError, isError: true });
+      }
+    });
+
     return () => {
       unsubQuota();
       unsubAuth();
       unsubProfile();
       unsubReqs();
+      unsubBackend();
       sessionCleanupService.stopPeriodicCleanup();
     };
   }, []);
@@ -244,20 +254,16 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     return () => unsubOnline();
   }, [tab]);
 
-  // Inscreve nos perfis de amigos apenas quando na aba de Amigos ou Sala de Equipes
+  // Inscreve nos perfis de amigos via rpc_get_my_friends + Realtime quando na aba de Amigos ou Sala de Equipes
   useEffect(() => {
     if (tab !== 'friends' && tab !== 'room') {
       return;
     }
-    if (!myProfile || !myProfile.friends || myProfile.friends.length === 0) {
-      setFriendsList([]);
-      return;
-    }
-    const unsubFriends = subscribeToFriendsProfiles(myProfile.friends, (friends) => {
+    const unsubFriends = subscribeToFriendsProfiles(myProfile?.friends || [], (friends) => {
       setFriendsList(friends);
     });
     return () => unsubFriends();
-  }, [tab, myProfile?.friends?.join(',')]);
+  }, [tab, authInfo.uid, myProfile?.friends?.join(',')]);
 
   useEffect(() => {
     if (!activeRoomCode) {
@@ -531,13 +537,26 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     if (res.ok) setFriendSearchInput('');
   };
 
+  const handleRemoveFriend = async (friend: OnlineUserProfile) => {
+    if (!friend.tagCode) return;
+    const res = await removeFriendByTag(friend.tagCode);
+    showToast(res.message, !res.ok);
+    if (res.ok) {
+      setFriendsList((prev) => prev.filter((item) => item.uid !== friend.uid));
+    }
+  };
+
   const handleInviteFriendToRoom = async (friend: OnlineUserProfile) => {
     if (!currentRoom) {
       showToast('Crie ou entre em uma sala primeiro para convidar amigos!', true);
       return;
     }
-    await sendRoomInviteToFriend(friend.uid, friend.displayName, currentRoom.roomCode);
-    showToast(`Convite da sala ${currentRoom.roomCode} enviado para ${friend.displayName}!`);
+    try {
+      await sendRoomInviteToFriend(friend.uid, friend.displayName, currentRoom.roomCode);
+      showToast(`Convite da sala ${currentRoom.roomCode} enviado para ${friend.displayName}!`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? e.message : 'Erro ao enviar convite.', true);
+    }
   };
 
   // Timeout de segurança para garantir que o overlay "ENTRANDO NA SALA..." nunca trave indefinidamente
@@ -2010,6 +2029,14 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                                 Convidar
                               </button>
                             )}
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveFriend(f)}
+                              title={`Remover ${f.displayName} (${f.tagCode})`}
+                              className="bg-red-950/70 hover:bg-red-900 text-red-300 border border-red-800/60 text-[10px] font-bold uppercase px-2 py-1 rounded cursor-pointer"
+                            >
+                              Remover
+                            </button>
                           </div>
                         </div>
                       ))}

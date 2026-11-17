@@ -789,7 +789,7 @@ test('ETAPA 2 — Migração Firestore -> Supabase: JWT Firebase Auth, Publishab
   assert.equal(checkValid.needsRefresh, false);
   assert.equal(checkValid.uid, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
 
-  // 1b. Token Firebase sem role = authenticated sinaliza needsRefresh: true para forçar renovação da Custom Claim
+  // 1b. Token Firebase sem role = authenticated no frontend não exige refresh (Supabase valida o token sob role anon)
   const missingRoleJwt = makeFakeJwt({
     iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
     aud: 'gen-lang-client-0384619138',
@@ -799,7 +799,12 @@ test('ETAPA 2 — Migração Firestore -> Supabase: JWT Firebase Auth, Publishab
   const checkMissingRole = validateFirebaseJwtClaims(missingRoleJwt, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
   assert.equal(checkMissingRole.valid, true);
   assert.equal(checkMissingRole.hasAuthenticatedRole, false);
-  assert.equal(checkMissingRole.needsRefresh, true);
+  assert.equal(checkMissingRole.needsRefresh, false);
+  assert.equal(
+    validateFirebaseJwtClaims(missingRoleJwt, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1', nowSec, true)
+      .needsRefresh,
+    true
+  );
 
   // 2. Token próximo de expirar (< 60s) exige renovação automática (needsRefresh: true)
   const expiringJwt = makeFakeJwt({
@@ -1177,5 +1182,109 @@ test('AUDITORIA SQL E 12 TESTES OBRIGATÓRIOS DE SEGURANÇA SUPABASE (RLS, JWT r
   assert.equal(joinedPrivate.passwordHash, null);
 });
 
+test('INTEGRAÇÃO COMPLETA SUPABASE (gameBackend.ts): 14 RPCs, Mapeamento Relacional de Slots (room_participants) e Ausência Total de Firestore', async () => {
+  const fs = await import('node:fs');
+  const gameBackend = await import('../services/gameBackend');
 
+  // 1. Verifica que todas as 14 RPCs do Supabase estão exportadas em src/services/gameBackend.ts
+  const requiredRpcWrappers = [
+    'rpcEnsureUserProfileAtomic',
+    'rpcCreateRoomAtomic',
+    'rpcJoinRoomAtomic',
+    'rpcLeaveRoomAtomic',
+    'rpcSelectCharacterAtomic',
+    'rpcToggleReadyAtomic',
+    'rpcStartMatchAtomic',
+    'rpcSendFriendRequest',
+    'rpcRespondFriendRequest',
+    'rpcRemoveFriend',
+    'rpcGetPublicLobby',
+    'rpcGetRoomLobby',
+    'rpcGetMyFriends',
+    'rpcGetFriendRequests',
+  ] as const;
 
+  for (const fnName of requiredRpcWrappers) {
+    assert.equal(
+      typeof (gameBackend as Record<string, unknown>)[fnName],
+      'function',
+      `Função ${fnName} deve estar exportada em src/services/gameBackend.ts`
+    );
+  }
+
+  // 2. Verifica reconstrução relacional de rooms + room_participants -> 8 slots com bots automáticos
+  const relationalRoom = gameBackend.mapRpcRoomToRoomState({
+    room: {
+      room_code: 'STF-REL1',
+      host_id: 'uid_host_1',
+      room_name: 'Arena Relacional Supabase',
+      mode: '2v2',
+      visibility: 'public',
+      status: 'waiting',
+      max_players: 4,
+    },
+    participants: [
+      {
+        user_id: 'uid_host_1',
+        display_name: 'Yuri Host',
+        team: 'home',
+        character_id: 'home_1',
+        is_ready: true,
+        is_loading_ready: true,
+      },
+      {
+        user_id: 'uid_guest_2',
+        display_name: 'Primo Guest',
+        team: 'away',
+        character_id: 'away_2',
+        is_ready: false,
+        is_loading_ready: false,
+      },
+    ],
+  });
+
+  assert.equal(relationalRoom.roomCode, 'STF-REL1');
+  assert.equal(relationalRoom.hostUid, 'uid_host_1');
+  assert.equal(relationalRoom.hostName, 'Yuri Host');
+  assert.equal(relationalRoom.mode, '2v2');
+  assert.equal(Object.keys(relationalRoom.slots).length, 8);
+  assert.equal(relationalRoom.slots['home_1'].uid, 'uid_host_1');
+  assert.equal(relationalRoom.slots['home_1'].isBot, false);
+  assert.equal(relationalRoom.slots['away_2'].uid, 'uid_guest_2');
+  assert.equal(relationalRoom.slots['away_2'].isBot, false);
+  assert.equal(relationalRoom.slots['away_2'].isReady, false);
+  assert.equal(relationalRoom.slots['home_2'].isBot, true);
+  assert.deepEqual(relationalRoom.loadingReadyUids, ['uid_host_1']);
+
+  // 3. Verifica mapeamento de solicitações de amizade do RPC rpc_get_friend_requests
+  const mappedReq = gameBackend.mapRpcFriendRequestToDoc({
+    id: 'req-uuid-001',
+    sender_id: 'uid_sender_99',
+    sender_name: 'Careca Várzea',
+    sender_tag: '#STFCARE',
+    receiver_id: 'uid_host_1',
+    status: 'pending',
+    created_at: new Date().toISOString(),
+  });
+  assert.equal(mappedReq.id, 'req-uuid-001');
+  assert.equal(mappedReq.fromUid, 'uid_sender_99');
+  assert.equal(mappedReq.fromName, 'Careca Várzea');
+  assert.equal(mappedReq.fromTag, '#STFCARE');
+  assert.equal(mappedReq.toUid, 'uid_host_1');
+  assert.equal(mappedReq.status, 'pending');
+
+  // 4. Confirma que firebase/firestore foi 100% removido de firebase.ts, gameBackend.ts, supabaseDataService.ts e voiceChatService.ts
+  const filesWithoutFirestore = [
+    './src/services/firebase.ts',
+    './src/services/gameBackend.ts',
+    './src/services/supabaseDataService.ts',
+    './src/services/voiceChatService.ts',
+  ];
+  for (const filePath of filesWithoutFirestore) {
+    const src = fs.readFileSync(filePath, 'utf8');
+    assert.ok(
+      !src.includes('firebase/firestore'),
+      `O arquivo ${filePath} não deve importar firebase/firestore`
+    );
+  }
+});

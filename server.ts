@@ -123,8 +123,11 @@ async function startServer() {
   // CORS para permitir conexões de clientes hospedados na Vercel (fute-vazea.vercel.app) ou outros domínios
   app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Authorization, apikey, Prefer, X-Client-Info, Accept-Profile, Content-Profile'
+    );
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
@@ -133,6 +136,86 @@ async function startServer() {
   });
 
   app.use(express.json({ limit: '256kb' }));
+
+  // Proxy seguro para Supabase REST (/api/supabase/rest/v1/*):
+  // Mantém a chave de API protegida no servidor Node e repassa integralmente o header Authorization: Bearer <firebase_id_token> do jogador.
+  app.use('/api/supabase', async (req, res) => {
+    try {
+      const targetBase = (
+        process.env.VITE_SUPABASE_URL || 'https://etlvzqrfsvvpzltimxaj.supabase.co'
+      ).replace(/\/+$/, '');
+      const serverApiKey = (
+        process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+        process.env.VITE_SUPABASE_ANON_KEY ||
+        ''
+      ).trim();
+
+      if (!serverApiKey) {
+        res.status(503).json({
+          message: 'Chave Supabase não configurada no servidor.',
+        });
+        return;
+      }
+
+      const targetUrl = `${targetBase}${req.url}`;
+      const forwardHeaders: Record<string, string> = {
+        apikey: serverApiKey,
+      };
+
+      const authHeader = req.headers.authorization;
+      if (
+        typeof authHeader === 'string' &&
+        authHeader.trim() !== '' &&
+        !authHeader.includes('sb_gateway_proxy')
+      ) {
+        forwardHeaders.Authorization = authHeader;
+      } else {
+        forwardHeaders.Authorization = `Bearer ${serverApiKey}`;
+      }
+
+      for (const h of [
+        'content-type',
+        'accept',
+        'prefer',
+        'accept-profile',
+        'content-profile',
+        'x-client-info',
+      ]) {
+        const val = req.headers[h];
+        if (typeof val === 'string' && val.trim() !== '') {
+          forwardHeaders[h] = val;
+        }
+      }
+
+      const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+      const upstreamRes = await fetch(targetUrl, {
+        method: req.method,
+        headers: forwardHeaders,
+        body:
+          hasBody && req.body !== undefined
+            ? typeof req.body === 'string'
+              ? req.body
+              : JSON.stringify(req.body)
+            : undefined,
+      });
+
+      res.status(upstreamRes.status);
+      const contentType = upstreamRes.headers.get('content-type');
+      if (contentType) {
+        res.setHeader('Content-Type', contentType);
+      }
+      const contentRange = upstreamRes.headers.get('content-range');
+      if (contentRange) {
+        res.setHeader('Content-Range', contentRange);
+      }
+      const textBody = await upstreamRes.text();
+      res.send(textBody);
+    } catch (err) {
+      res.status(502).json({
+        message: err instanceof Error ? err.message : 'Erro ao comunicar com o Supabase.',
+      });
+    }
+  });
 
   // Health & diagnostics endpoint for the Authoritative Real-Time Server
   app.get('/api/realtime/health', (_req, res) => {

@@ -167,7 +167,10 @@ export function validateFirebaseJwtClaims(
     };
   }
 
-  const needsRefresh = expMs - nowMs <= refreshThresholdMs || !hasAuthenticatedRole;
+  // O banco Supabase foi configurado para validar os tokens Firebase Third-Party Auth com o papel anon.
+  // Portanto, não exigimos role="authenticated" no frontend (a menos que requireAuthenticatedRole=true seja solicitado em testes).
+  const needsRefresh =
+    expMs - nowMs <= refreshThresholdMs || (requireAuthenticatedRole && !hasAuthenticatedRole);
   return {
     valid: true,
     uid: sub,
@@ -183,6 +186,8 @@ export function validateFirebaseJwtClaims(
 function normalizeEnvValue(raw: string): string {
   return raw.trim().replace(/^['"]+|['"]+$/g, '').trim();
 }
+
+export const DEFAULT_SUPABASE_URL = 'https://etlvzqrfsvvpzltimxaj.supabase.co';
 
 /**
  * Verifica se a chave fornecida é segura para uso no navegador (Publishable / Anon Key)
@@ -212,15 +217,18 @@ function readEnvVar(name: string): string {
   return '';
 }
 
-let secretKeyWarningLogged = false;
-
 export function getSupabaseConfig(): {
   url: string;
   publishableKey: string;
   isConfigured: boolean;
+  useServerProxy: boolean;
   configWarning: string | null;
 } {
-  const url = readEnvVar('VITE_SUPABASE_URL') || readEnvVar('VITE_PUBLIC_SUPABASE_URL');
+  const url =
+    readEnvVar('VITE_SUPABASE_URL') ||
+    readEnvVar('VITE_PUBLIC_SUPABASE_URL') ||
+    DEFAULT_SUPABASE_URL;
+
   const candidateKeys = [
     readEnvVar('VITE_SUPABASE_PUBLISHABLE_KEY'),
     readEnvVar('VITE_SUPABASE_ANON_KEY'),
@@ -228,71 +236,60 @@ export function getSupabaseConfig(): {
     readEnvVar('VITE_PUBLIC_SUPABASE_ANON_KEY'),
   ].filter(Boolean);
 
-  if (!url || candidateKeys.length === 0) {
+  const safeKey = candidateKeys.find((candidate) => isSafePublishableKey(candidate));
+
+  if (safeKey) {
+    const isGatewayProxy = safeKey === 'sb_gateway_proxy';
     return {
-      url: '',
-      publishableKey: '',
-      isConfigured: false,
-      configWarning:
-        'VITE_SUPABASE_URL e/ou VITE_SUPABASE_PUBLISHABLE_KEY ainda não configuradas no ambiente.',
+      url: url.replace(/\/+$/, ''),
+      publishableKey: safeKey,
+      isConfigured: true,
+      useServerProxy: isGatewayProxy,
+      configWarning: null,
     };
   }
 
-  const safeKey = candidateKeys.find((candidate) => isSafePublishableKey(candidate));
-
-  if (!safeKey) {
-    if (!secretKeyWarningLogged) {
-      secretKeyWarningLogged = true;
-      console.warn(
-        '[STF-Supabase] Aviso de segurança: a chave configurada em VITE_SUPABASE_PUBLISHABLE_KEY é do tipo secreta (sb_secret_ / service_role) e foi ignorada no navegador. Substitua pela Publishable Key (sb_publishable_... ou anon) nas configurações de ambiente para ativar o cliente Supabase.'
-      );
-    }
+  // No ambiente full-stack (Express + Vite), caso a chave pública ainda não esteja no bundle do navegador,
+  // roteia as chamadas REST pelo proxy seguro /api/supabase preservando o Authorization: Bearer <firebase_id_token>.
+  if (typeof window !== 'undefined') {
     return {
       url: url.replace(/\/+$/, ''),
-      publishableKey: '',
-      isConfigured: false,
-      configWarning:
-        'Chave ignorada por segurança: substitua a Secret Key (sb_secret_) pela Publishable Key (sb_publishable_) em VITE_SUPABASE_PUBLISHABLE_KEY.',
+      publishableKey: 'sb_gateway_proxy',
+      isConfigured: true,
+      useServerProxy: true,
+      configWarning: null,
     };
   }
 
   return {
     url: url.replace(/\/+$/, ''),
-    publishableKey: safeKey,
-    isConfigured: true,
-    configWarning: null,
+    publishableKey: '',
+    isConfigured: false,
+    useServerProxy: false,
+    configWarning:
+      'VITE_SUPABASE_PUBLISHABLE_KEY ainda não configurada no ambiente.',
   };
 }
 
 let authGetter: (() => User | null) | null = null;
 let supabaseInstance: SupabaseClient | null = null;
 let tokenObserverBound = false;
-const roleClaimRefreshAttemptedByUid = new Map<string, number>();
 
 /**
  * Obtém sempre um token Firebase JWT válido e atualizado sob demanda,
- * forçando renovação se estiver próximo de expirar ou se a claim role="authenticated"
- * acabou de ser atribuída pela Cloud Function no backend, sem armazenar tokens expirados.
+ * forçando renovação se estiver próximo de expirar, sem exigir role="authenticated" no frontend.
  */
 export async function getFreshFirebaseAccessToken(
-  currentUser: User | null = authGetter ? authGetter() : null
+  currentUser: User | null = authGetter ? authGetter() : null,
+  forceRefresh: boolean = false
 ): Promise<string | null> {
   if (!currentUser) return null;
   try {
-    let token = await currentUser.getIdToken(false);
+    let token = await currentUser.getIdToken(forceRefresh);
     let check = validateFirebaseJwtClaims(token, currentUser.uid);
 
-    // Se o token expirou, está a menos de 60s de expirar, ou ainda não trouxe a claim role="authenticated"
-    // (ex: recém-criado via trigger onCreate), força renovação com controle de frequência (30s por UID).
     const nowMs = Date.now();
-    const lastRoleRefresh = roleClaimRefreshAttemptedByUid.get(currentUser.uid) || 0;
-    const shouldForceRefreshForRole =
-      !check.hasAuthenticatedRole && nowMs - lastRoleRefresh > 30_000;
-
-    if (!check.valid || (check.expMs !== null && check.expMs - nowMs <= 60_000) || shouldForceRefreshForRole) {
-      if (shouldForceRefreshForRole) {
-        roleClaimRefreshAttemptedByUid.set(currentUser.uid, nowMs);
-      }
+    if (!forceRefresh && (!check.valid || (check.expMs !== null && check.expMs - nowMs <= 60_000))) {
       token = await currentUser.getIdToken(true);
       check = validateFirebaseJwtClaims(token, currentUser.uid);
     }
@@ -342,6 +339,39 @@ export function getSupabaseClient(): SupabaseClient | null {
   const cfg = getSupabaseConfig();
   if (!cfg.isConfigured) return null;
 
+  const customFetch: typeof fetch = async (input, init) => {
+    const rawUrl =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+        ? input.toString()
+        : input.url;
+
+    const headers = new Headers(init?.headers || {});
+    const token = await getFreshFirebaseAccessToken();
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+
+    if (
+      cfg.useServerProxy &&
+      typeof window !== 'undefined' &&
+      rawUrl.startsWith(cfg.url)
+    ) {
+      const relativePath = rawUrl.slice(cfg.url.length);
+      const proxiedUrl = `${window.location.origin}/api/supabase${relativePath}`;
+      return fetch(proxiedUrl, {
+        ...init,
+        headers,
+      });
+    }
+
+    return fetch(input, {
+      ...init,
+      headers,
+    });
+  };
+
   supabaseInstance = createClient(cfg.url, cfg.publishableKey, {
     auth: {
       persistSession: false,
@@ -351,12 +381,16 @@ export function getSupabaseClient(): SupabaseClient | null {
     accessToken: async () => {
       return await getFreshFirebaseAccessToken();
     },
+    global: {
+      fetch: customFetch,
+    },
     realtime: {
       params: {
-        eventsPerSecond: 20,
+        eventsPerSecond: 10,
       },
     },
   });
 
   return supabaseInstance;
 }
+

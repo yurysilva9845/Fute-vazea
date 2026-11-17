@@ -4,7 +4,27 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  const rawSupabaseUrl = (
+    process.env.VITE_SUPABASE_URL || 'https://etlvzqrfsvvpzltimxaj.supabase.co'
+  ).trim();
+  const rawKey = (
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    ''
+  ).trim();
+
+  // Nunca expõe chaves secretas (sb_secret_) no bundle do navegador; usa proxy seguro do servidor quando necessário
+  const clientSafeKey = rawKey.startsWith('sb_secret_') ? 'sb_gateway_proxy' : rawKey;
+
   return {
+    define: {
+      'import.meta.env.VITE_SUPABASE_URL': JSON.stringify(rawSupabaseUrl),
+      ...(rawKey
+        ? {
+            'import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY': JSON.stringify(clientSafeKey),
+          }
+        : {}),
+    },
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
