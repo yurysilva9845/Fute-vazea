@@ -1,0 +1,12 @@
+# Configuração do Projeto Supabase para SEM TERRA FC
+# Documenta a integração oficial Third-Party Auth com Firebase Authentication
+
+project_id = "sem-terra-fc"
+
+[auth]
+enabled = true
+
+# Integração oficial Firebase Authentication -> Supabase (Validação de Emissor, Audiência e Identidade sub/uid)
+[auth.third_party.firebase]
+enabled = true
+project_id = "gen-lang-client-0384619138"

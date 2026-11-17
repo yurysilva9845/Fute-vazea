@@ -22,8 +22,88 @@ interface TimestampedSnapshot {
   snapshot: MultiplayerMatchSnapshot;
 }
 
+const DEFAULT_CLOUD_RUN_BACKEND_HOST =
+  'ais-pre-vjvg452vafw2n3arhxoh2l-129611115171.us-east1.run.app';
+const MAX_RECONNECT_ATTEMPTS = 6;
+
+/**
+ * Resolve a lista ordenada de endpoints WebSocket candidatos:
+ * 1. Variável de ambiente VITE_WS_URL (se configurada na Vercel ou .env).
+ * 2. Se não estiver em domínio estático `.vercel.app` (ex.: localhost, Cloud Run `.run.app`, servidor Node próprio),
+ *    usa `${protocol}//${window.location.host}/ws/match`.
+ * 3. Se estiver em `.vercel.app` (onde a Vercel serve apenas o bundle estático e não executa `server.ts`),
+ *    usa o servidor Node.js/Cloud Run autoritativo do projeto como endpoint primário e evita falhar em `wss://*.vercel.app/ws/match`.
+ */
+export function resolveWsCandidateUrls(
+  envWsUrl?: string,
+  locationObj?: { protocol: string; host: string; hostname: string }
+): string[] {
+  const candidates: string[] = [];
+  const configured = (
+    envWsUrl ??
+    (typeof import.meta !== 'undefined' && import.meta.env
+      ? (import.meta.env.VITE_WS_URL as string | undefined)
+      : undefined) ??
+    ''
+  ).trim();
+
+  if (configured) {
+    const normalized = configured.endsWith('/ws/match')
+      ? configured
+      : `${configured.replace(/\/+$/, '')}/ws/match`;
+    candidates.push(normalized);
+  }
+
+  const loc =
+    locationObj ??
+    (typeof window !== 'undefined'
+      ? {
+          protocol: window.location.protocol,
+          host: window.location.host,
+          hostname: window.location.hostname,
+        }
+      : null);
+
+  if (loc && loc.host) {
+    const isVercelStaticHost = loc.hostname.endsWith('.vercel.app');
+    const protocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    const sameOriginWs = `${protocol}//${loc.host}/ws/match`;
+    const cloudRunWs = `wss://${DEFAULT_CLOUD_RUN_BACKEND_HOST}/ws/match`;
+
+    if (isVercelStaticHost) {
+      // Em deploy estático na Vercel, conecta diretamente ao servidor Node.js/Cloud Run com suporte a HTTP Upgrade WebSocket
+      if (!candidates.includes(cloudRunWs)) {
+        candidates.push(cloudRunWs);
+      }
+    } else {
+      if (!candidates.includes(sameOriginWs)) {
+        candidates.push(sameOriginWs);
+      }
+      if (!candidates.includes(cloudRunWs)) {
+        candidates.push(cloudRunWs);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * Calcula atraso de reconexão usando backoff exponencial com jitter aleatório (sem loops infinitos).
+ */
+export function computeReconnectDelayMs(attempt: number, randomValue = Math.random()): number {
+  const clampedAttempt = Math.max(0, Math.min(attempt, MAX_RECONNECT_ATTEMPTS));
+  const baseMs = Math.min(12000, 600 * Math.pow(2, clampedAttempt));
+  const jitterMs = Math.floor(Math.max(0, Math.min(1, randomValue)) * 450);
+  return baseMs + jitterMs;
+}
+
 export class RealtimeMatchClient {
   private ws: WebSocket | null = null;
+  private isConnecting = false;
+  private candidateUrls: string[] = [];
+  private candidateIndex = 0;
+
   private roomCode: string | null = null;
   private matchId: string | null = null;
   private uid: string | null = null;
@@ -44,8 +124,66 @@ export class RealtimeMatchClient {
   private reconnectAttempt = 0;
   private reconnectTimer: number | null = null;
   private pingTimer: number | null = null;
+  private httpFallbackPollTimer: number | null = null;
+  private broadcastChannel: BroadcastChannel | null = null;
   private intentionalClose = false;
   private lastPingMs = 18;
+  private webrtcSignalListeners = new Set<
+    (signal: {
+      roomCode: string;
+      fromUid: string;
+      toUid: string;
+      signalType: 'offer' | 'answer' | 'ice';
+      payload: string;
+    }) => void
+  >();
+
+  public subscribeToWebRtcSignals(
+    cb: (signal: {
+      roomCode: string;
+      fromUid: string;
+      toUid: string;
+      signalType: 'offer' | 'answer' | 'ice';
+      payload: string;
+    }) => void
+  ): () => void {
+    this.webrtcSignalListeners.add(cb);
+    return () => {
+      this.webrtcSignalListeners.delete(cb);
+    };
+  }
+
+  public sendWebRtcSignal(params: {
+    roomCode: string;
+    fromUid: string;
+    toUid: string;
+    signalType: 'offer' | 'answer' | 'ice';
+    payload: string;
+  }): boolean {
+    const packet = {
+      type: 'webrtc_signal',
+      roomCode: params.roomCode,
+      fromUid: params.fromUid,
+      toUid: params.toUid,
+      signalType: params.signalType,
+      payload: params.payload,
+    };
+    this.broadcastCrossTab({ ...packet, senderUid: params.fromUid });
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.sendRaw(packet);
+      return true;
+    }
+    if (typeof fetch === 'function') {
+      const baseUrl = this.getHttpRelayBaseUrl();
+      fetch(`${baseUrl}/api/realtime/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(packet),
+      }).catch(() => {});
+      return true;
+    }
+    return false;
+  }
 
   public setCallbacks(callbacks: RealtimeMatchClientCallbacks) {
     this.callbacks = { ...this.callbacks, ...callbacks };
@@ -73,8 +211,39 @@ export class RealtimeMatchClient {
     slots: Record<string, MultiplayerSlot>;
     halfDurationSeconds: number;
   }) {
-    this.roomCode = params.roomCode.toUpperCase();
-    this.matchId = params.matchId;
+    const nextRoomCode = params.roomCode.trim().toUpperCase();
+    const nextMatchId = params.matchId;
+
+    // Evita reconexões concorrentes desnecessárias se já estiver conectado ou conectando na mesma sala/partida
+    if (
+      this.roomCode === nextRoomCode &&
+      this.matchId === nextMatchId &&
+      this.uid === params.uid &&
+      (this.isConnecting ||
+        (this.ws &&
+          (this.ws.readyState === WebSocket.OPEN ||
+            this.ws.readyState === WebSocket.CONNECTING)))
+    ) {
+      this.slots = params.slots;
+      this.slotId = params.slotId;
+      return;
+    }
+
+    // Fecha conexão anterior de forma controlada caso estivesse em outra sala
+    if (this.ws) {
+      try {
+        this.ws.onclose = null;
+        this.ws.onerror = null;
+        this.ws.onmessage = null;
+        this.ws.close(1000, 'Switching match session');
+      } catch {
+        // Ignore
+      }
+      this.ws = null;
+    }
+
+    this.roomCode = nextRoomCode;
+    this.matchId = nextMatchId;
     this.uid = params.uid;
     this.displayName = params.displayName || 'Jogador';
     this.slotId = params.slotId;
@@ -82,29 +251,85 @@ export class RealtimeMatchClient {
     this.slots = params.slots;
     this.halfDurationSeconds = params.halfDurationSeconds;
     this.intentionalClose = false;
+    this.isConnecting = false;
+    this.reconnectAttempt = 0;
+    this.candidateUrls = resolveWsCandidateUrls();
+    this.candidateIndex = 0;
     this.seq = 0;
     this.pendingCommands = [];
     this.snapshotBuffer = [];
 
+    this.setupCrossTabBroadcastChannel(nextRoomCode);
     this.openSocket(false);
+  }
+
+  private setupCrossTabBroadcastChannel(roomCode: string) {
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.close();
+      } catch {
+        // Ignore
+      }
+      this.broadcastChannel = null;
+    }
+
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      try {
+        const bc = new BroadcastChannel(`stf_match_${roomCode}`);
+        bc.onmessage = (ev) => {
+          if (!ev?.data || typeof ev.data !== 'object') return;
+          const msg = ev.data as Record<string, unknown>;
+          if (msg.senderUid === this.uid) return;
+          this.handleMessage(msg);
+        };
+        this.broadcastChannel = bc;
+      } catch {
+        // BroadcastChannel opcional
+      }
+    }
   }
 
   private openSocket(isReconnect: boolean) {
     if (typeof window === 'undefined' || !this.roomCode || !this.uid) return;
+    if (this.isConnecting) return; // Impede tentativas simultâneas de conexão
+
     this.clearTimers();
 
-    this.setStatus(isReconnect ? 'reconnecting' : 'connecting');
+    if (this.candidateUrls.length === 0) {
+      this.candidateUrls = resolveWsCandidateUrls();
+    }
+    const wsUrl =
+      this.candidateUrls[this.candidateIndex % Math.max(1, this.candidateUrls.length)];
+    if (!wsUrl) {
+      this.setStatus('disconnected');
+      return;
+    }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/match`;
+    this.isConnecting = true;
+    this.setStatus(isReconnect ? 'reconnecting' : 'connecting');
 
     try {
       const socket = new WebSocket(wsUrl);
       this.ws = socket;
 
+      const handshakeTimeout = window.setTimeout(() => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          try {
+            socket.close();
+          } catch {
+            // Ignore
+          }
+        }
+      }, 5500);
+
       socket.onopen = () => {
+        window.clearTimeout(handshakeTimeout);
+        this.isConnecting = false;
         this.reconnectAttempt = 0;
+        this.stopHttpFallbackRelay();
         this.setStatus('connected');
+
+        // Reentra automaticamente na sala e slot corretos ao conectar ou reconectar
         this.sendRaw({
           type: isReconnect ? 'reconnect' : 'join_match',
           roomCode: this.roomCode,
@@ -122,12 +347,12 @@ export class RealtimeMatchClient {
             type: 'ping',
             clientTs: performance.now(),
           });
-        }, 2000);
+        }, 2500);
       };
 
       socket.onmessage = (event) => {
         try {
-          const msg = JSON.parse(String(event.data));
+          const msg = JSON.parse(String(event.data)) as Record<string, unknown>;
           this.handleMessage(msg);
         } catch {
           // Ignore malformed packet
@@ -135,12 +360,17 @@ export class RealtimeMatchClient {
       };
 
       socket.onclose = () => {
-        this.ws = null;
+        window.clearTimeout(handshakeTimeout);
+        this.isConnecting = false;
+        if (this.ws === socket) {
+          this.ws = null;
+        }
         if (this.pingTimer !== null) {
           clearInterval(this.pingTimer);
           this.pingTimer = null;
         }
         if (!this.intentionalClose && this.roomCode && this.uid) {
+          this.candidateIndex = (this.candidateIndex + 1) % Math.max(1, this.candidateUrls.length);
           this.scheduleReconnect();
         } else {
           this.setStatus('disconnected');
@@ -148,9 +378,10 @@ export class RealtimeMatchClient {
       };
 
       socket.onerror = () => {
-        // Handled by onclose
+        // Tratado de forma controlada pelo onclose com backoff exponencial
       };
     } catch {
+      this.isConnecting = false;
       if (!this.intentionalClose) {
         this.scheduleReconnect();
       }
@@ -158,25 +389,103 @@ export class RealtimeMatchClient {
   }
 
   private scheduleReconnect() {
-    if (this.intentionalClose) return;
+    if (this.intentionalClose || this.reconnectTimer !== null) return;
+
+    // Respeita limite máximo de tentativas para nunca criar loops infinitos de reconexão
+    if (this.reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+      this.setStatus('disconnected');
+      this.startHttpFallbackRelay();
+      return;
+    }
+
     this.setStatus('reconnecting');
-    const delays = [500, 1000, 2000, 4000];
-    const delay = delays[Math.min(this.reconnectAttempt, delays.length - 1)];
+    const delay = computeReconnectDelayMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
 
     this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
       this.openSocket(true);
     }, delay);
   }
 
-  private handleMessage(msg: Record<string, unknown>) {
+  private getHttpRelayBaseUrl(): string {
+    const configuredWs = this.candidateUrls[0] || '';
+    if (configuredWs.startsWith('wss://')) {
+      return configuredWs.replace(/^wss:\/\//, 'https://').replace(/\/ws\/match$/, '');
+    }
+    if (configuredWs.startsWith('ws://')) {
+      return configuredWs.replace(/^ws:\/\//, 'http://').replace(/\/ws\/match$/, '');
+    }
+    return `https://${DEFAULT_CLOUD_RUN_BACKEND_HOST}`;
+  }
+
+  private startHttpFallbackRelay() {
+    if (this.httpFallbackPollTimer !== null || typeof window === 'undefined' || !this.roomCode || !this.uid) {
+      return;
+    }
+    const baseUrl = this.getHttpRelayBaseUrl();
+
+    // Registra presença na sessão HTTP compartilhada
+    fetch(`${baseUrl}/api/realtime/command`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'reconnect',
+        roomCode: this.roomCode,
+        matchId: this.matchId,
+        uid: this.uid,
+        displayName: this.displayName,
+        slotId: this.slotId,
+        mode: this.mode,
+        slots: this.slots,
+        halfDurationSeconds: this.halfDurationSeconds,
+      }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data && data.snapshot) {
+          this.setStatus('connected');
+          this.handleMessage(data);
+        }
+      })
+      .catch(() => {});
+
+    this.httpFallbackPollTimer = window.setInterval(() => {
+      if (!this.roomCode || this.intentionalClose) return;
+      fetch(`${baseUrl}/api/realtime/session/${encodeURIComponent(this.roomCode)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data && data.snapshot) {
+            this.setStatus('connected');
+            this.handleMessage({
+              type: 'match_state',
+              roomCode: data.roomCode,
+              matchId: data.matchId,
+              snapshot: data.snapshot,
+              readyUids: data.readyUids,
+            });
+          }
+        })
+        .catch(() => {});
+    }, 120);
+  }
+
+  private stopHttpFallbackRelay() {
+    if (this.httpFallbackPollTimer !== null && typeof window !== 'undefined') {
+      window.clearInterval(this.httpFallbackPollTimer);
+      this.httpFallbackPollTimer = null;
+    }
+  }
+
+  public handleMessage(msg: Record<string, unknown>) {
     const type = String(msg.type || '');
 
-    if (type === 'snapshot' || type === 'joined_ack') {
+    // Aceita tanto 'match_state' (enviado a 30Hz pelo server.ts) quanto 'snapshot' e 'joined_ack'
+    if (type === 'match_state' || type === 'snapshot' || type === 'joined_ack') {
       const snap = msg.snapshot as MultiplayerMatchSnapshot | undefined;
-      if (snap) {
+      if (snap && snap.ball && snap.players) {
         this.latestSnapshot = snap;
-        const now = performance.now();
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
         this.snapshotBuffer.push({ receivedAt: now, snapshot: snap });
         while (this.snapshotBuffer.length > 16) {
           this.snapshotBuffer.shift();
@@ -184,12 +493,23 @@ export class RealtimeMatchClient {
 
         if (this.uid && snap.lastProcessedSeqByUid) {
           const ackSeq = snap.lastProcessedSeqByUid[this.uid] || 0;
-          this.pendingCommands = this.pendingCommands.filter(
-            (cmd) => cmd.seq > ackSeq
-          );
+          this.pendingCommands = this.pendingCommands.filter((cmd) => cmd.seq > ackSeq);
         }
 
         this.callbacks.onSnapshot?.(snap);
+      }
+      if (msg.slots && typeof msg.slots === 'object') {
+        this.slots = msg.slots as Record<string, MultiplayerSlot>;
+      }
+      if (Array.isArray(msg.readyUids)) {
+        this.notifyReadyList(msg.readyUids as string[]);
+      }
+      return;
+    }
+
+    if (type === 'player_joined') {
+      if (msg.slots && typeof msg.slots === 'object') {
+        this.slots = msg.slots as Record<string, MultiplayerSlot>;
       }
       if (Array.isArray(msg.readyUids)) {
         this.notifyReadyList(msg.readyUids as string[]);
@@ -206,8 +526,9 @@ export class RealtimeMatchClient {
 
     if (type === 'pong') {
       const clientTs = Number(msg.clientTs) || 0;
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
       if (clientTs > 0) {
-        const rtt = Math.max(1, Math.round(performance.now() - clientTs));
+        const rtt = Math.max(1, Math.round(now - clientTs));
         this.lastPingMs = Math.round(this.lastPingMs * 0.65 + rtt * 0.35);
         this.callbacks.onPingUpdate?.(this.lastPingMs);
       }
@@ -215,7 +536,28 @@ export class RealtimeMatchClient {
     }
 
     if (type === 'player_replaced_by_bot') {
+      if (msg.slots && typeof msg.slots === 'object') {
+        this.slots = msg.slots as Record<string, MultiplayerSlot>;
+      }
       this.callbacks.onPlayerLeft?.(String(msg.uid || ''), true);
+      return;
+    }
+
+    if (type === 'webrtc_signal') {
+      const sig = {
+        roomCode: String(msg.roomCode || ''),
+        fromUid: String(msg.fromUid || ''),
+        toUid: String(msg.toUid || ''),
+        signalType: String(msg.signalType || 'offer') as 'offer' | 'answer' | 'ice',
+        payload: String(msg.payload || ''),
+      };
+      this.webrtcSignalListeners.forEach((cb) => {
+        try {
+          cb(sig);
+        } catch {
+          // Ignore listener error
+        }
+      });
     }
   }
 
@@ -227,20 +569,21 @@ export class RealtimeMatchClient {
     const humanUids = Object.values(this.slots)
       .filter((s) => !s.isBot && s.uid)
       .map((s) => String(s.uid));
-    const allReady =
-      humanUids.length > 0 && humanUids.every((u) => Boolean(readyByUid[u]));
+    const allReady = humanUids.length > 0 && humanUids.every((u) => Boolean(readyByUid[u]));
     this.callbacks.onPlayerReadyUpdate?.(readyByUid, allReady);
   }
 
   public sendPlayerReady(forceStart = false) {
     if (!this.roomCode || !this.uid) return;
-    this.sendRaw({
+    const payload = {
       type: 'player_ready',
       roomCode: this.roomCode,
       matchId: this.matchId,
       uid: this.uid,
       forceStart,
-    });
+    };
+    this.sendRaw(payload);
+    this.broadcastCrossTab({ ...payload, senderUid: this.uid });
   }
 
   public sendInputCommand(
@@ -260,7 +603,7 @@ export class RealtimeMatchClient {
     dt: number
   ): number {
     if (!this.roomCode || !this.uid) return this.seq;
-    const now = performance.now();
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
     const action: WsInputCommand['action'] = input.tackle
       ? 'tackle'
       : input.shoot
@@ -291,11 +634,11 @@ export class RealtimeMatchClient {
       roomCode: this.roomCode,
       matchId: this.matchId || undefined,
       slotId: input.slotId,
-      moveX: Number(input.moveX.toFixed(3)),
-      moveZ: Number(input.moveZ.toFixed(3)),
-      sprint: input.sprint,
+      moveX: Number(Math.max(-1, Math.min(1, input.moveX)).toFixed(3)),
+      moveZ: Number(Math.max(-1, Math.min(1, input.moveZ)).toFixed(3)),
+      sprint: Boolean(input.sprint),
       action,
-      kickPower: Number(input.shootPower.toFixed(2)),
+      kickPower: Number(Math.max(0.25, Math.min(1, input.shootPower)).toFixed(2)),
     };
 
     this.pendingCommands.push({
@@ -310,6 +653,18 @@ export class RealtimeMatchClient {
       type: 'input_cmd',
       command: cmd,
     });
+
+    if (this.httpFallbackPollTimer !== null && typeof fetch === 'function') {
+      const baseUrl = this.getHttpRelayBaseUrl();
+      fetch(`${baseUrl}/api/realtime/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'input_cmd',
+          command: cmd,
+        }),
+      }).catch(() => {});
+    }
 
     return this.seq;
   }
@@ -351,7 +706,8 @@ export class RealtimeMatchClient {
     if (this.snapshotBuffer.length === 0) return this.latestSnapshot;
     if (this.snapshotBuffer.length === 1) return this.snapshotBuffer[0].snapshot;
 
-    const targetTime = performance.now() - renderDelayMs;
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const targetTime = now - renderDelayMs;
     for (let i = this.snapshotBuffer.length - 1; i >= 1; i--) {
       const newer = this.snapshotBuffer[i];
       const older = this.snapshotBuffer[i - 1];
@@ -404,6 +760,7 @@ export class RealtimeMatchClient {
 
   public disconnect(notifyLeave = true) {
     this.intentionalClose = true;
+    this.isConnecting = false;
     if (notifyLeave && this.roomCode && this.uid) {
       this.sendRaw({
         type: 'leave_match',
@@ -413,9 +770,21 @@ export class RealtimeMatchClient {
       });
     }
     this.clearTimers();
+    this.stopHttpFallbackRelay();
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.close();
+      } catch {
+        // Ignore
+      }
+      this.broadcastChannel = null;
+    }
     if (this.ws) {
       try {
-        this.ws.close();
+        this.ws.onclose = null;
+        this.ws.onerror = null;
+        this.ws.onmessage = null;
+        this.ws.close(1000, 'Client left match');
       } catch {
         // Ignore close errors
       }
@@ -427,6 +796,16 @@ export class RealtimeMatchClient {
     this.snapshotBuffer = [];
     this.latestSnapshot = null;
     this.setStatus('disconnected');
+  }
+
+  private broadcastCrossTab(payload: Record<string, unknown>) {
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.postMessage(payload);
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   private sendRaw(payload: Record<string, unknown>) {
@@ -459,3 +838,4 @@ export class RealtimeMatchClient {
 }
 
 export const realtimeMatchClient = new RealtimeMatchClient();
+

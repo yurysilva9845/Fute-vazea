@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Mic, MicOff, Radio, Volume2, VolumeX } from 'lucide-react';
 import { voiceChatService, VoiceStateSnapshot } from '../services/voiceChatService';
 
@@ -14,6 +14,7 @@ export const VoiceControlsBar: React.FC<VoiceControlsBarProps> = ({
   const [voiceState, setVoiceState] = useState<VoiceStateSnapshot>(() =>
     voiceChatService.getSnapshot()
   );
+  const pttButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     return voiceChatService.subscribe((snap) => {
@@ -21,25 +22,59 @@ export const VoiceControlsBar: React.FC<VoiceControlsBarProps> = ({
     });
   }, [roomCode]);
 
+  // Registra touchstart / touchend / touchcancel com { passive: false } para permitir preventDefault sem aviso no console
+  useEffect(() => {
+    const btn = pttButtonRef.current;
+    if (!btn) return;
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      void voiceChatService.setPushToTalkPressed(true);
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      void voiceChatService.setPushToTalkPressed(false);
+    };
+
+    btn.addEventListener('touchstart', onTouchStart, { passive: false });
+    btn.addEventListener('touchend', onTouchEnd, { passive: false });
+    btn.addEventListener('touchcancel', onTouchEnd, { passive: false });
+
+    return () => {
+      btn.removeEventListener('touchstart', onTouchStart);
+      btn.removeEventListener('touchend', onTouchEnd);
+      btn.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, [compact]);
+
   const speakingPeers = Object.values(voiceState.peers).filter((p) => p.isSpeaking);
   const connectedPeersCount = Object.values(voiceState.peers).length;
 
   const handleToggleOpenMic = () => {
     if (voiceState.mode === 'open_mic') {
-      voiceChatService.setTransmissionMode('muted');
+      void voiceChatService.setTransmissionMode('muted');
     } else {
-      voiceChatService.setTransmissionMode('open_mic');
+      void voiceChatService.setTransmissionMode('open_mic');
     }
   };
 
-  const handlePttStart = (e: React.MouseEvent | React.TouchEvent) => {
-    e.preventDefault();
-    voiceChatService.setPushToTalkPressed(true);
+  const handlePttMouseDown = (e: React.MouseEvent) => {
+    if (e.cancelable) {
+      e.preventDefault();
+    }
+    void voiceChatService.setPushToTalkPressed(true);
   };
 
-  const handlePttEnd = (e: React.MouseEvent | React.TouchEvent) => {
-    e.preventDefault();
-    voiceChatService.setPushToTalkPressed(false);
+  const handlePttMouseUp = (e: React.MouseEvent) => {
+    if (e.cancelable) {
+      e.preventDefault();
+    }
+    void voiceChatService.setPushToTalkPressed(false);
   };
 
   if (compact) {
@@ -72,14 +107,13 @@ export const VoiceControlsBar: React.FC<VoiceControlsBarProps> = ({
         </button>
 
         <button
+          ref={pttButtonRef}
           type="button"
-          onMouseDown={handlePttStart}
-          onMouseUp={handlePttEnd}
-          onMouseLeave={handlePttEnd}
-          onTouchStart={handlePttStart}
-          onTouchEnd={handlePttEnd}
+          onMouseDown={handlePttMouseDown}
+          onMouseUp={handlePttMouseUp}
+          onMouseLeave={handlePttMouseUp}
           title="Segure para Falar (Push-to-Talk)"
-          className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-colors select-none cursor-pointer ${
+          className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-colors select-none touch-none cursor-pointer ${
             voiceState.isPushToTalkActive
               ? 'bg-amber-500 text-stone-950 shadow-sm shadow-amber-500/40'
               : 'bg-stone-800 hover:bg-stone-700 text-amber-300 border border-amber-500/30'
@@ -178,13 +212,12 @@ export const VoiceControlsBar: React.FC<VoiceControlsBarProps> = ({
         </button>
 
         <button
+          ref={pttButtonRef}
           type="button"
-          onMouseDown={handlePttStart}
-          onMouseUp={handlePttEnd}
-          onMouseLeave={handlePttEnd}
-          onTouchStart={handlePttStart}
-          onTouchEnd={handlePttEnd}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-black uppercase tracking-wider transition-colors select-none cursor-pointer ${
+          onMouseDown={handlePttMouseDown}
+          onMouseUp={handlePttMouseUp}
+          onMouseLeave={handlePttMouseUp}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-black uppercase tracking-wider transition-colors select-none touch-none cursor-pointer ${
             voiceState.isPushToTalkActive
               ? 'bg-amber-500 text-stone-950 shadow-md shadow-amber-500/30'
               : 'bg-stone-800 hover:bg-stone-700 text-amber-300 border border-amber-500/40'

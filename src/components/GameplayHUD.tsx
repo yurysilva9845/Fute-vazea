@@ -216,6 +216,52 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
     inputManager.touchSprintHeld = false;
   };
 
+  // Registra touchstart, touchmove, touchend e touchcancel com { passive: false } no joystick
+  // para garantir controle fluido e permitir preventDefault sem avisos de listener passivo
+  useEffect(() => {
+    const base = joystickBaseRef.current;
+    if (!base) return;
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      const touch = e.changedTouches[0];
+      if (touch) {
+        handleJoystickMove(touch.clientX, touch.clientY);
+      }
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      const touch = e.targetTouches[0] || e.changedTouches[0];
+      if (touch) {
+        handleJoystickMove(touch.clientX, touch.clientY);
+      }
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      if (e.cancelable) {
+        e.preventDefault();
+      }
+      resetJoystick();
+    };
+
+    base.addEventListener('touchstart', onTouchStart, { passive: false });
+    base.addEventListener('touchmove', onTouchMove, { passive: false });
+    base.addEventListener('touchend', onTouchEnd, { passive: false });
+    base.addEventListener('touchcancel', onTouchEnd, { passive: false });
+
+    return () => {
+      base.removeEventListener('touchstart', onTouchStart);
+      base.removeEventListener('touchmove', onTouchMove);
+      base.removeEventListener('touchend', onTouchEnd);
+      base.removeEventListener('touchcancel', onTouchEnd);
+    };
+  }, [isMobileDevice]);
+
   const cycleCameraMode = (e: React.MouseEvent<HTMLButtonElement>) => {
     e.currentTarget.blur();
     const order: CameraMode[] = ['follow', 'overview', 'sideline', 'close'];
@@ -542,8 +588,14 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
           <div
             ref={joystickBaseRef}
             onPointerDown={(e) => {
-              e.preventDefault();
-              e.currentTarget.setPointerCapture(e.pointerId);
+              if (e.cancelable) {
+                e.preventDefault();
+              }
+              try {
+                e.currentTarget.setPointerCapture(e.pointerId);
+              } catch {
+                // Ignore pointer capture issues on synthetic touch
+              }
               activePointerId.current = e.pointerId;
               handleJoystickMove(e.clientX, e.clientY);
             }}
@@ -559,7 +611,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               transform: `scale(${settings.mobileControls?.scale ?? 1})`,
               transformOrigin: 'bottom left',
             }}
-            className="pointer-events-auto relative w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-stone-950/60 border-2 border-stone-400/50 flex items-center justify-center touch-none shadow-xl"
+            className="pointer-events-auto relative w-28 h-28 sm:w-36 sm:h-36 rounded-full bg-stone-950/60 border-2 border-stone-400/50 flex items-center justify-center touch-none select-none shadow-xl"
           >
             <div
               ref={joystickKnobRef}
@@ -573,7 +625,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               transform: `scale(${settings.mobileControls?.scale ?? 1})`,
               transformOrigin: 'bottom right',
             }}
-            className={`pointer-events-auto grid grid-cols-3 items-end touch-none ${
+            className={`pointer-events-auto grid grid-cols-3 items-end touch-none select-none ${
               settings.mobileControls?.layoutPreset === 'compacto'
                 ? 'gap-1.5'
                 : settings.mobileControls?.layoutPreset === 'espacado'
@@ -584,11 +636,11 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             <button
               type="button"
               onPointerDown={(e) => {
-                e.preventDefault();
+                if (e.cancelable) e.preventDefault();
                 audioEngine.triggerVibration(15);
                 inputManager.triggerTouchAction('switch');
               }}
-              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-stone-900/70 active:bg-stone-700 border-2 border-stone-400/50 text-stone-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg leading-tight px-1"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-stone-900/70 active:bg-stone-700 border-2 border-stone-400/50 text-stone-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg leading-tight px-1 touch-none select-none"
             >
               <span>TROCAR</span>
               <span className="text-[9px] text-amber-300">JOGADOR</span>
@@ -597,11 +649,11 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             <button
               type="button"
               onPointerDown={(e) => {
-                e.preventDefault();
+                if (e.cancelable) e.preventDefault();
                 audioEngine.triggerVibration(25);
                 inputManager.triggerTouchAction('tackle');
               }}
-              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-orange-950/75 active:bg-orange-800 border-2 border-orange-400/60 text-orange-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-orange-950/75 active:bg-orange-800 border-2 border-orange-400/60 text-orange-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg touch-none select-none"
             >
               <span>CARRINHO</span>
             </button>
@@ -609,7 +661,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             <button
               type="button"
               onPointerDown={(e) => {
-                e.preventDefault();
+                if (e.cancelable) e.preventDefault();
                 inputManager.touchSprintHeld = true;
               }}
               onPointerUp={() => {
@@ -618,7 +670,7 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
               onPointerCancel={() => {
                 inputManager.touchSprintHeld = false;
               }}
-              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-emerald-950/75 active:bg-emerald-700 border-2 border-emerald-400/60 text-emerald-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg"
+              className="w-16 h-14 sm:w-20 sm:h-16 rounded-2xl bg-emerald-950/75 active:bg-emerald-700 border-2 border-emerald-400/60 text-emerald-100 font-extrabold text-[10px] sm:text-xs flex flex-col items-center justify-center shadow-lg touch-none select-none"
             >
               <span>CORRER</span>
             </button>
@@ -626,11 +678,11 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             <button
               type="button"
               onPointerDown={(e) => {
-                e.preventDefault();
+                if (e.cancelable) e.preventDefault();
                 audioEngine.triggerVibration(18);
                 inputManager.triggerTouchAction('pass');
               }}
-              className="w-16 h-16 sm:w-20 sm:h-18 rounded-2xl bg-sky-950/80 active:bg-sky-700 border-2 border-sky-400/70 text-sky-100 font-extrabold text-xs sm:text-sm flex flex-col items-center justify-center shadow-xl"
+              className="w-16 h-16 sm:w-20 sm:h-18 rounded-2xl bg-sky-950/80 active:bg-sky-700 border-2 border-sky-400/70 text-sky-100 font-extrabold text-xs sm:text-sm flex flex-col items-center justify-center shadow-xl touch-none select-none"
             >
               <span>PASSE</span>
             </button>
@@ -638,13 +690,13 @@ export const GameplayHUD: React.FC<GameplayHUDProps> = ({
             <button
               type="button"
               onPointerDown={(e) => {
-                e.preventDefault();
+                if (e.cancelable) e.preventDefault();
                 audioEngine.triggerVibration(30);
                 inputManager.setTouchKickHold(true);
               }}
               onPointerUp={() => inputManager.setTouchKickHold(false)}
               onPointerCancel={() => inputManager.setTouchKickHold(false)}
-              className="col-span-2 h-16 sm:h-18 rounded-2xl bg-amber-500/85 active:bg-amber-400 border-2 border-amber-200 text-stone-950 font-extrabold text-sm sm:text-base tracking-wide flex flex-col items-center justify-center shadow-xl px-2"
+              className="col-span-2 h-16 sm:h-18 rounded-2xl bg-amber-500/85 active:bg-amber-400 border-2 border-amber-200 text-stone-950 font-extrabold text-sm sm:text-base tracking-wide flex flex-col items-center justify-center shadow-xl px-2 touch-none select-none"
             >
               <span>CHUTAR</span>
               <span className="text-[9px] sm:text-[10px] font-bold text-stone-900">

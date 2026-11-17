@@ -1,20 +1,13 @@
-import {
-  addDoc,
-  collection,
-  deleteDoc,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  where,
-} from 'firebase/firestore';
+import { RealtimeChannel } from '@supabase/supabase-js';
 import { MultiplayerSlot, VoicePeerState, VoiceTransmissionMode } from '../types/game';
-import { auth, db, updatePlayerVoiceStatusInRoom } from './firebase';
+import { auth, updatePlayerVoiceStatusInRoom } from './firebase';
+import { realtimeMatchClient } from './realtimeMatchClient';
+import { getSupabaseClient } from './supabaseClient';
 
 const RTC_CONFIGURATION: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
   ],
 };
 
@@ -27,15 +20,17 @@ export interface VoiceStateSnapshot {
   muteAll: boolean;
   volume: number; // 0.0 - 1.0
   micPermissionError: string | null;
+  signalingTransport: 'supabase_broadcast' | 'websocket_relay';
   peers: Record<string, VoicePeerState>;
 }
 
 /**
- * Serviço de Comunicação por Voz em Tempo Real (WebRTC + Firestore Signaling).
+ * Serviço de Comunicação por Voz em Tempo Real (WebRTC + Supabase Realtime Broadcast / WebSocket Relay).
+ * - Migração completa da sinalização WebRTC: NÃO grava ofertas SDP/ICE no Firestore nem em tabelas SQL.
+ * - Utiliza Supabase Realtime Broadcast (canal efêmero em memória `webrtc_voice_${roomCode}`)
+ *   com relay simultâneo pelo WebSocket autoritativo (`/ws/match`).
  * - Inicia mutado por padrão ao entrar na sala.
  * - Suporta Microfone Aberto (Open Mic), Segurar para Falar (Push-to-Talk) e Silenciar Todos.
- * - Detecta atividade de voz em tempo real via Web Audio AnalyserNode.
- * - Encerra todas as conexões WebRTC e trilhas de microfone imediatamente ao sair da sala.
  */
 class WebRTCVoiceChatManager {
   private roomCode: string | null = null;
@@ -54,7 +49,11 @@ class WebRTCVoiceChatManager {
   private remoteAudioElements = new Map<string, HTMLAudioElement>();
   private peersState = new Map<string, VoicePeerState>();
 
-  private unsubSignals: (() => void) | null = null;
+  private supabaseBroadcastChannel: RealtimeChannel | null = null;
+  private supabaseChannelSubscribed = false;
+  private unsubWsSignals: (() => void) | null = null;
+  private localBroadcastChannel: BroadcastChannel | null = null;
+  private processedSignalHashes = new Set<string>();
   private vadInterval: number | null = null;
   private listeners = new Set<(state: VoiceStateSnapshot) => void>();
   private lastPublishedMic = false;
@@ -87,6 +86,9 @@ class WebRTCVoiceChatManager {
       muteAll: this.muteAll,
       volume: this.volume,
       micPermissionError: this.micPermissionError,
+      signalingTransport: this.supabaseChannelSubscribed
+        ? 'supabase_broadcast'
+        : 'websocket_relay',
       peers: peersObj,
     };
   }
@@ -97,7 +99,7 @@ class WebRTCVoiceChatManager {
   }
 
   /**
-   * Conecta ao canal de sinalização WebRTC da sala atual.
+   * Conecta ao canal de sinalização WebRTC da sala atual via Supabase Realtime Broadcast + WebSocket Relay.
    * Comportamento padrão ao entrar: microfone mutado ('muted').
    */
   public joinRoomVoice(roomCode: string, slots: Record<string, MultiplayerSlot>) {
@@ -144,8 +146,8 @@ class WebRTCVoiceChatManager {
           connectionState: existingPeer?.connectionState ?? 'connecting',
         });
 
-        // Determinismo para evitar glare: UID lexicograficamente menor inicia a oferta WebRTC
-        if (!this.peerConnections.has(slot.uid) && myUid < slot.uid) {
+        // Só inicia oferta WebRTC se o jogador local já ativou o microfone
+        if (this.localStream && !this.peerConnections.has(slot.uid) && myUid < slot.uid) {
           this.initiatePeerOffer(slot.uid).catch(() => {});
         }
       }
@@ -236,7 +238,6 @@ class WebRTCVoiceChatManager {
 
       this.setupLocalVoiceAnalyser(this.localStream);
 
-      // Adiciona as tracks de áudio às conexões existentes e renegocia
       for (const [peerUid, pc] of this.peerConnections.entries()) {
         this.localStream.getAudioTracks().forEach((track) => {
           const alreadyAdded = pc.getSenders().some((s) => s.track === track);
@@ -345,7 +346,6 @@ class WebRTCVoiceChatManager {
         changed = true;
       }
 
-      // Analisa áudio recebido dos colegas na sala
       this.peerAnalysers.forEach((analyser, peerUid) => {
         const peer = this.peersState.get(peerUid);
         if (!peer) return;
@@ -375,6 +375,26 @@ class WebRTCVoiceChatManager {
     updatePlayerVoiceStatusInRoom(this.roomCode, micEnabled, isSpeaking).catch(() => {});
   }
 
+  private waitForIceGathering(pc: RTCPeerConnection, timeoutMs = 380): Promise<void> {
+    if (pc.iceGatheringState === 'complete') {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pc.removeEventListener('icegatheringstatechange', onStateChange);
+        resolve();
+      }, timeoutMs);
+      const onStateChange = () => {
+        if (pc.iceGatheringState === 'complete') {
+          clearTimeout(timer);
+          pc.removeEventListener('icegatheringstatechange', onStateChange);
+          resolve();
+        }
+      };
+      pc.addEventListener('icegatheringstatechange', onStateChange);
+    });
+  }
+
   private getOrCreatePeerConnection(peerUid: string): RTCPeerConnection {
     const existing = this.peerConnections.get(peerUid);
     if (existing) return existing;
@@ -387,12 +407,6 @@ class WebRTCVoiceChatManager {
         pc.addTrack(track, this.localStream!);
       });
     }
-
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate && this.roomCode) {
-        this.sendSignal(peerUid, 'ice', JSON.stringify(ev.candidate.toJSON())).catch(() => {});
-      }
-    };
 
     pc.onconnectionstatechange = () => {
       const peer = this.peersState.get(peerUid);
@@ -437,9 +451,17 @@ class WebRTCVoiceChatManager {
       offerToReceiveVideo: false,
     });
     await pc.setLocalDescription(offer);
-    await this.sendSignal(peerUid, 'offer', JSON.stringify(offer));
+    await this.waitForIceGathering(pc, 380);
+    if (pc.localDescription) {
+      await this.sendSignal(peerUid, 'offer', JSON.stringify(pc.localDescription));
+    }
   }
 
+  /**
+   * Envia o sinal WebRTC via Supabase Realtime Broadcast (primário)
+   * e simultaneamente pelo relay em memória do servidor WebSocket (/ws/match),
+   * sem gerar nenhuma gravação em disco no Firestore ou PostgreSQL.
+   */
   private async sendSignal(
     toUid: string,
     type: 'offer' | 'answer' | 'ice',
@@ -447,68 +469,174 @@ class WebRTCVoiceChatManager {
   ): Promise<void> {
     const myUid = auth.currentUser?.uid;
     if (!myUid || !this.roomCode) return;
-    await addDoc(collection(db, 'rooms', this.roomCode, 'signals'), {
+
+    const signalPacket = {
+      roomCode: this.roomCode,
       fromUid: myUid,
       toUid,
-      type,
+      signalType: type,
       payload,
-      createdAt: serverTimestamp(),
+      sentAt: Date.now(),
+    };
+
+    // 1. Supabase Realtime Broadcast (quando configurado e inscrito)
+    if (this.supabaseBroadcastChannel && this.supabaseChannelSubscribed) {
+      try {
+        await this.supabaseBroadcastChannel.send({
+          type: 'broadcast',
+          event: 'webrtc_signal',
+          payload: signalPacket,
+        });
+      } catch {
+        // Fallback automático via WebSocket relay abaixo
+      }
+    }
+
+    // 2. Relay de baixa latência via WebSocket /ws/match + BroadcastChannel local
+    realtimeMatchClient.sendWebRtcSignal({
+      roomCode: this.roomCode,
+      fromUid: myUid,
+      toUid,
+      signalType: type,
+      payload,
     });
+
+    if (this.localBroadcastChannel) {
+      try {
+        this.localBroadcastChannel.postMessage(signalPacket);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  private async handleIncomingSignal(params: {
+    roomCode: string;
+    fromUid: string;
+    toUid: string;
+    signalType: 'offer' | 'answer' | 'ice';
+    payload: string;
+  }): Promise<void> {
+    const myUid = auth.currentUser?.uid;
+    if (!myUid || !this.roomCode) return;
+    if (params.roomCode.toUpperCase() !== this.roomCode) return;
+    if (params.toUid !== myUid || params.fromUid === myUid) return;
+
+    // Deduplicação caso o mesmo pacote chegue pelo Supabase Broadcast e pelo WebSocket relay
+    const dedupKey = `${params.fromUid}:${params.signalType}:${params.payload.slice(0, 96)}`;
+    if (this.processedSignalHashes.has(dedupKey)) return;
+    this.processedSignalHashes.add(dedupKey);
+    if (this.processedSignalHashes.size > 120) {
+      const oldest = this.processedSignalHashes.values().next().value;
+      if (oldest) this.processedSignalHashes.delete(oldest);
+    }
+
+    try {
+      const pc = this.getOrCreatePeerConnection(params.fromUid);
+      if (params.signalType === 'offer') {
+        const desc = JSON.parse(params.payload) as RTCSessionDescriptionInit;
+        await pc.setRemoteDescription(new RTCSessionDescription(desc));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await this.waitForIceGathering(pc, 380);
+        if (pc.localDescription) {
+          await this.sendSignal(params.fromUid, 'answer', JSON.stringify(pc.localDescription));
+        }
+      } else if (params.signalType === 'answer') {
+        const desc = JSON.parse(params.payload) as RTCSessionDescriptionInit;
+        if (pc.signalingState === 'have-local-offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(desc));
+        }
+      } else if (params.signalType === 'ice') {
+        const cand = JSON.parse(params.payload) as RTCIceCandidateInit;
+        if (pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
+        }
+      }
+    } catch (err) {
+      console.warn('[STF-Voice] Aviso de negociação WebRTC transitória:', err);
+    }
   }
 
   private listenToRoomSignals(roomCode: string) {
-    if (this.unsubSignals) {
-      this.unsubSignals();
-      this.unsubSignals = null;
+    this.teardownSignalChannels();
+
+    // 1. Inscreve no canal Supabase Realtime Broadcast (se Supabase estiver configurado)
+    const sbClient = getSupabaseClient();
+    if (sbClient) {
+      const channel = sbClient.channel(`webrtc_voice_${roomCode}`, {
+        config: {
+          broadcast: { self: false },
+        },
+      });
+
+      channel
+        .on('broadcast', { event: 'webrtc_signal' }, (event) => {
+          const data = (event?.payload || {}) as Record<string, unknown>;
+          void this.handleIncomingSignal({
+            roomCode: String(data.roomCode || roomCode),
+            fromUid: String(data.fromUid || ''),
+            toUid: String(data.toUid || ''),
+            signalType: String(data.signalType || 'offer') as 'offer' | 'answer' | 'ice',
+            payload: String(data.payload || ''),
+          });
+        })
+        .subscribe((status) => {
+          this.supabaseChannelSubscribed = status === 'SUBSCRIBED';
+          this.notify();
+        });
+
+      this.supabaseBroadcastChannel = channel;
     }
 
-    const myUid = auth.currentUser?.uid;
-    if (!myUid) return;
+    // 2. Inscreve no relay WebSocket (/ws/match) para funcionamento imediato mesmo sem banco
+    this.unsubWsSignals = realtimeMatchClient.subscribeToWebRtcSignals((sig) => {
+      void this.handleIncomingSignal(sig);
+    });
 
-    const q = query(collection(db, 'rooms', roomCode, 'signals'), where('toUid', '==', myUid));
-    this.unsubSignals = onSnapshot(
-      q,
-      (snap) => {
-        snap.docChanges().forEach(async (change) => {
-          if (change.type !== 'added') return;
-          const data = change.doc.data();
-          const fromUid = String(data.fromUid);
-          const sigType = String(data.type) as 'offer' | 'answer' | 'ice';
-          const payloadStr = String(data.payload || '');
-
-          // Remove o sinal consumido
-          deleteDoc(change.doc.ref).catch((err) => {
-            console.warn('[STF-Voice] Aviso ao remover sinal WebRTC consumido:', err);
+    // 3. BroadcastChannel para abas no mesmo navegador
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      try {
+        const bc = new BroadcastChannel(`stf_voice_${roomCode}`);
+        bc.onmessage = (ev) => {
+          const data = (ev?.data || {}) as Record<string, unknown>;
+          void this.handleIncomingSignal({
+            roomCode: String(data.roomCode || roomCode),
+            fromUid: String(data.fromUid || ''),
+            toUid: String(data.toUid || ''),
+            signalType: String(data.signalType || 'offer') as 'offer' | 'answer' | 'ice',
+            payload: String(data.payload || ''),
           });
-
-          try {
-            const pc = this.getOrCreatePeerConnection(fromUid);
-            if (sigType === 'offer') {
-              const desc = JSON.parse(payloadStr) as RTCSessionDescriptionInit;
-              await pc.setRemoteDescription(new RTCSessionDescription(desc));
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              await this.sendSignal(fromUid, 'answer', JSON.stringify(answer));
-            } else if (sigType === 'answer') {
-              const desc = JSON.parse(payloadStr) as RTCSessionDescriptionInit;
-              if (pc.signalingState === 'have-local-offer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(desc));
-              }
-            } else if (sigType === 'ice') {
-              const cand = JSON.parse(payloadStr) as RTCIceCandidateInit;
-              if (pc.remoteDescription) {
-                await pc.addIceCandidate(new RTCIceCandidate(cand));
-              }
-            }
-          } catch (err) {
-            console.warn('[STF-Voice] Aviso de negociação WebRTC transitória:', err);
-          }
-        });
-      },
-      (err) => {
-        console.warn(`[STF-Voice] Erro no listener de sinais da sala ${roomCode}:`, err);
+        };
+        this.localBroadcastChannel = bc;
+      } catch {
+        // Ignore
       }
-    );
+    }
+  }
+
+  private teardownSignalChannels() {
+    if (this.supabaseBroadcastChannel) {
+      const sbClient = getSupabaseClient();
+      if (sbClient) {
+        void sbClient.removeChannel(this.supabaseBroadcastChannel);
+      }
+      this.supabaseBroadcastChannel = null;
+      this.supabaseChannelSubscribed = false;
+    }
+    if (this.unsubWsSignals) {
+      this.unsubWsSignals();
+      this.unsubWsSignals = null;
+    }
+    if (this.localBroadcastChannel) {
+      try {
+        this.localBroadcastChannel.close();
+      } catch {
+        // Ignore
+      }
+      this.localBroadcastChannel = null;
+    }
+    this.processedSignalHashes.clear();
   }
 
   private closePeer(peerUid: string) {
@@ -534,10 +662,7 @@ class WebRTCVoiceChatManager {
    * Desconecta imediatamente todas as conexões de voz WebRTC e desliga o microfone físico.
    */
   public leaveRoomVoice() {
-    if (this.unsubSignals) {
-      this.unsubSignals();
-      this.unsubSignals = null;
-    }
+    this.teardownSignalChannels();
     if (this.vadInterval !== null && typeof window !== 'undefined') {
       window.clearInterval(this.vadInterval);
       this.vadInterval = null;
@@ -574,3 +699,4 @@ class WebRTCVoiceChatManager {
 }
 
 export const voiceChatService = new WebRTCVoiceChatManager();
+

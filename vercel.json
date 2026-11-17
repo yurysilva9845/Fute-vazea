@@ -1,0 +1,20 @@
+{
+  "rewrites": [
+    {
+      "source": "/ws/match",
+      "destination": "https://ais-pre-vjvg452vafw2n3arhxoh2l-129611115171.us-east1.run.app/ws/match"
+    },
+    {
+      "source": "/api/ws/match",
+      "destination": "https://ais-pre-vjvg452vafw2n3arhxoh2l-129611115171.us-east1.run.app/api/ws/match"
+    },
+    {
+      "source": "/api/realtime/:path*",
+      "destination": "https://ais-pre-vjvg452vafw2n3arhxoh2l-129611115171.us-east1.run.app/api/realtime/:path*"
+    },
+    {
+      "source": "/((?!assets/|favicon\\.ico).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

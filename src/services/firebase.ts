@@ -47,11 +47,38 @@ import {
   resolveActiveCharacterIdsForRoom,
 } from './botService';
 import { CreateRoomParams, hashRoomPassword } from './roomService';
+import { bindFirebaseAuthToSupabase } from './supabaseClient';
+import {
+  createSupabaseOnlineRoom,
+  ensureSupabaseUserProfile,
+  getSupabaseDiagnostics,
+  isSupabaseReady,
+  joinSupabaseOnlineRoom,
+  leaveSupabaseOnlineRoom,
+  markSupabasePlayerMatchLoadingReady,
+  promoteSupabaseRoomToPlaying,
+  recordSupabaseMatchFinished,
+  respondToSupabaseFriendRequest,
+  selectSupabaseRoomCharacter,
+  sendSupabaseFriendRequestByTag,
+  sendSupabaseRoomInvite,
+  startSupabaseOnlineMatch,
+  subscribeToSupabaseFriendsProfiles,
+  subscribeToSupabaseIncomingRequests,
+  subscribeToSupabaseOnlinePlayers,
+  subscribeToSupabasePublicRooms,
+  subscribeToSupabaseRoom,
+  subscribeToSupabaseUserProfile,
+  toggleSupabasePlayerReady,
+  updateSupabaseUserPresence,
+} from './supabaseDataService';
 
 // Singleton initialization: prevents multiple Firebase App / Auth instances across hot reloads or re-imports
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+bindFirebaseAuthToSupabase(auth);
+export { getSupabaseDiagnostics };
 
 export enum OperationType {
   CREATE = 'create',
@@ -120,7 +147,7 @@ function notifyQuotaStatusListeners(): void {
   });
 }
 
-function registerQuotaExhausted(context: string, error: unknown): void {
+export function registerQuotaExhausted(context: string, error: unknown): void {
   const nextAttempt = Math.min(6, quotaState.attempt + 1);
   // Backoff exponencial com jitter aleatório (15s, 30s, 60s, 120s, até 300s + 0..5s jitter)
   const baseDelayMs = Math.min(300_000, 15_000 * Math.pow(2, nextAttempt - 1));
@@ -891,14 +918,41 @@ export async function ensureUserProfile(user: User, preferredNickname?: string):
 
   const syncTask = (async () => {
     const userRef = doc(db, 'users', user.uid);
+    const googleName = user.providerData?.find((p) => p.providerId === 'google.com')?.displayName;
+    const defaultName =
+      preferredNickname?.trim() ||
+      user.displayName?.trim() ||
+      googleName?.trim() ||
+      `Craque_${user.uid.slice(0, 4).toUpperCase()}`;
+
     try {
+      // Se o Supabase estiver ativo, verifica primeiro se há dados legados no Firestore para migrar sem apagá-los
+      if (await isSupabaseReady()) {
+        let legacyData: Record<string, unknown> | null = null;
+        if (!isInQuotaBackoff()) {
+          try {
+            const legacySnap = await getDoc(userRef);
+            if (legacySnap.exists()) {
+              legacyData = legacySnap.data();
+            }
+          } catch {
+            // Prossegue mesmo se o Firestore estiver offline/cota excedida
+          }
+        }
+        const sbProfile = await ensureSupabaseUserProfile({
+          uid: user.uid,
+          defaultDisplayName: defaultName,
+          preferredNickname,
+          firestoreLegacyData: legacyData,
+        });
+        if (sbProfile) {
+          cachedMyProfile = sbProfile;
+          syncedProfileUids.add(user.uid);
+          return;
+        }
+      }
+
       const snap = await getDoc(userRef);
-      const googleName = user.providerData?.find((p) => p.providerId === 'google.com')?.displayName;
-      const defaultName =
-        preferredNickname?.trim() ||
-        user.displayName?.trim() ||
-        googleName?.trim() ||
-        `Craque_${user.uid.slice(0, 4).toUpperCase()}`;
 
       if (!snap.exists()) {
         const newProfileDoc = {
@@ -1073,6 +1127,11 @@ export async function updateUserPresence(
     };
   }
 
+  if (await isSupabaseReady()) {
+    const ok = await updateSupabaseUserPresence(user.uid, status, cleanRoom);
+    if (ok) return;
+  }
+
   const userRef = doc(db, 'users', user.uid);
   try {
     // Usa o perfil em cache local para evitar getDoc antes do setDoc
@@ -1213,6 +1272,17 @@ export function subscribeToMyProfile(
         return;
       }
 
+      if (getSupabaseDiagnostics().activeBackend === 'supabase') {
+        sharedMyProfileUnsubDoc = subscribeToSupabaseUserProfile(user.uid, (sbProf) => {
+          cachedMyProfile = sbProf;
+          if (sbProf) {
+            syncedProfileUids.add(user.uid);
+          }
+          myProfileSubscribers.forEach((sub) => sub(cachedMyProfile));
+        });
+        return;
+      }
+
       const userRef = doc(db, 'users', user.uid);
       sharedMyProfileUnsubDoc = onSnapshot(
         userRef,
@@ -1267,6 +1337,14 @@ export function subscribeToOnlinePlayers(cb: (players: OnlineUserProfile[]) => v
 
       if (!user || isInQuotaBackoff()) {
         onlinePlayersSubscribers.forEach((sub) => sub(cachedOnlinePlayers));
+        return;
+      }
+
+      if (getSupabaseDiagnostics().activeBackend === 'supabase') {
+        sharedOnlinePlayersUnsubSnap = subscribeToSupabaseOnlinePlayers((list) => {
+          cachedOnlinePlayers = list;
+          onlinePlayersSubscribers.forEach((sub) => sub(list));
+        });
         return;
       }
 
@@ -1340,6 +1418,11 @@ export async function sendFriendRequestByTag(
   let meName = cachedMyProfile?.displayName || user.displayName || 'Jogador';
   let meTag = cachedMyProfile?.tagCode || generateTagCode(user.uid);
 
+  if (await isSupabaseReady()) {
+    const sbResult = await sendSupabaseFriendRequestByTag(user.uid, meName, meTag, search);
+    if (sbResult) return sbResult;
+  }
+
   if (!cachedMyProfile || cachedMyProfile.uid !== user.uid) {
     const mySnap = await getDoc(doc(db, 'users', user.uid));
     if (!mySnap.exists()) {
@@ -1411,6 +1494,18 @@ export async function sendRoomInviteToFriend(
   const meName = cachedMyProfile?.displayName || user.displayName || 'Craque';
   const meTag = cachedMyProfile?.tagCode || generateTagCode(user.uid);
 
+  if (await isSupabaseReady()) {
+    const ok = await sendSupabaseRoomInvite(
+      user.uid,
+      String(meName),
+      String(meTag),
+      friendUid,
+      friendName,
+      roomCode
+    );
+    if (ok) return;
+  }
+
   try {
     await addDoc(collection(db, 'friendRequests'), {
       fromUid: user.uid,
@@ -1435,6 +1530,10 @@ export async function respondToFriendRequest(
 ): Promise<void> {
   if (isInQuotaBackoff()) return;
   const user = await ensureAuthenticated();
+  if (await isSupabaseReady()) {
+    const ok = await respondToSupabaseFriendRequest(user.uid, request, accept);
+    if (ok) return;
+  }
   const reqRef = doc(db, 'friendRequests', request.id);
 
   try {
@@ -1517,6 +1616,14 @@ export function subscribeToIncomingRequests(
       if (!user || isInQuotaBackoff()) {
         if (!user) cachedIncomingRequests = [];
         incomingRequestsSubscribers.forEach((sub) => sub(cachedIncomingRequests));
+        return;
+      }
+
+      if (getSupabaseDiagnostics().activeBackend === 'supabase') {
+        sharedIncomingUnsubSnap = subscribeToSupabaseIncomingRequests(user.uid, (list) => {
+          cachedIncomingRequests = list;
+          incomingRequestsSubscribers.forEach((sub) => sub(list));
+        });
         return;
       }
 
@@ -1608,6 +1715,13 @@ export function subscribeToFriendsProfiles(
     activeUid = nextUid;
     if (!user || isInQuotaBackoff()) {
       cb(cachedFriendsByKey.get(cacheKey) || []);
+      return;
+    }
+    if (getSupabaseDiagnostics().activeBackend === 'supabase') {
+      unsubSnap = subscribeToSupabaseFriendsProfiles(slice, (list) => {
+        cachedFriendsByKey.set(cacheKey, list);
+        cb(list);
+      });
       return;
     }
     const q = query(collection(db, 'users'), where('uid', 'in', slice));
@@ -1713,6 +1827,21 @@ export async function createOnlineRoom(
     'Anfitrião'
   ).slice(0, 28);
 
+  if (await isSupabaseReady()) {
+    const sbRoom = await createSupabaseOnlineRoom({
+      hostUid: user.uid,
+      hostName,
+      homeTeamId,
+      awayTeamId,
+      halfDurationSeconds,
+      options,
+    });
+    if (sbRoom) {
+      void updateUserPresence('in_room', sbRoom.roomCode);
+      return sbRoom;
+    }
+  }
+
   const roomCode = generateRoomCode();
   const mode: MatchFormatMode = options?.mode === '2v2' ? '2v2' : '4v4';
   const visibility: RoomVisibility = options?.visibility === 'private' ? 'private' : 'public';
@@ -1814,6 +1943,26 @@ export async function joinOnlineRoom(
 ): Promise<MultiplayerRoomState | null> {
   const user = await ensureAuthenticated();
   const roomCode = roomCodeInput.trim().toUpperCase();
+  const myNameForJoin = (
+    cachedMyProfile?.displayName ||
+    user.displayName ||
+    'Jogador'
+  ).slice(0, 28);
+
+  if (await isSupabaseReady()) {
+    const sbJoined = await joinSupabaseOnlineRoom({
+      roomCode,
+      uid: user.uid,
+      displayName: myNameForJoin,
+      passwordInput,
+      expectedMode,
+    });
+    if (sbJoined) {
+      void updateUserPresence('in_room', roomCode);
+      return sbJoined;
+    }
+  }
+
   const roomRef = doc(db, 'rooms', roomCode);
 
   const snap = await withFirestoreTimeout(
@@ -1975,6 +2124,22 @@ export async function selectRoomCharacter(
   }
   const user = await ensureAuthenticated();
   const normalizedCode = roomCode.trim().toUpperCase();
+  const myNameForSelect = (
+    cachedMyProfile?.displayName ||
+    user.displayName ||
+    'Jogador'
+  ).slice(0, 28);
+
+  if (await isSupabaseReady()) {
+    const sbSelect = await selectSupabaseRoomCharacter(
+      normalizedCode,
+      user.uid,
+      myNameForSelect,
+      targetCharacterId
+    );
+    if (sbSelect) return sbSelect;
+  }
+
   const roomRef = doc(db, 'rooms', normalizedCode);
 
   let d = cachedRoomDocsByCode.get(normalizedCode);
@@ -2069,6 +2234,10 @@ export async function togglePlayerReadyInRoom(roomCode: string, ready?: boolean)
   const user = auth.currentUser;
   if (!user || !roomCode || isInQuotaBackoff()) return;
   const normalizedCode = roomCode.trim().toUpperCase();
+  if (await isSupabaseReady()) {
+    const ok = await toggleSupabasePlayerReady(normalizedCode, user.uid, ready);
+    if (ok) return;
+  }
   const roomRef = doc(db, 'rooms', normalizedCode);
 
   let d = cachedRoomDocsByCode.get(normalizedCode);
@@ -2252,6 +2421,15 @@ export async function leaveOnlineRoom(roomCode: string): Promise<void> {
   lastRoomHeartbeatMsByCode.delete(normalizedCode);
   lastVoiceMicWriteByCode.delete(normalizedCode);
 
+  if (await isSupabaseReady()) {
+    const ok = await leaveSupabaseOnlineRoom(normalizedCode, user.uid);
+    if (ok) {
+      cachedRoomDocsByCode.delete(normalizedCode);
+      void updateUserPresence('online', '');
+      return;
+    }
+  }
+
   if (isInQuotaBackoff()) {
     cachedRoomDocsByCode.delete(normalizedCode);
     return;
@@ -2422,6 +2600,13 @@ export async function cleanupAbandonedRoomsAndSlots(force: boolean = false): Pro
 export async function startOnlineMatch(roomCode: string): Promise<string> {
   const user = await ensureAuthenticated();
   const normalizedCode = roomCode.trim().toUpperCase();
+  if (await isSupabaseReady()) {
+    const sbMatchId = await startSupabaseOnlineMatch(normalizedCode, user.uid);
+    if (sbMatchId) {
+      void updateUserPresence('playing', normalizedCode);
+      return sbMatchId;
+    }
+  }
   const roomRef = doc(db, 'rooms', normalizedCode);
 
   let d = cachedRoomDocsByCode.get(normalizedCode);
@@ -2527,6 +2712,10 @@ export async function markPlayerMatchLoadingReady(roomCode: string): Promise<voi
   const user = auth.currentUser;
   if (!user || !roomCode || isInQuotaBackoff()) return;
   const normalizedCode = roomCode.trim().toUpperCase();
+  if (await isSupabaseReady()) {
+    const ok = await markSupabasePlayerMatchLoadingReady(normalizedCode, user.uid);
+    if (ok) return;
+  }
   const roomRef = doc(db, 'rooms', normalizedCode);
 
   try {
@@ -2587,6 +2776,10 @@ export async function promoteRoomToPlaying(roomCode: string): Promise<void> {
   const user = auth.currentUser;
   if (!user || !roomCode || isInQuotaBackoff()) return;
   const normalizedCode = roomCode.trim().toUpperCase();
+  if (await isSupabaseReady()) {
+    const ok = await promoteSupabaseRoomToPlaying(normalizedCode, user.uid);
+    if (ok) return;
+  }
   const roomRef = doc(db, 'rooms', normalizedCode);
 
   try {
@@ -2709,6 +2902,14 @@ export function subscribeToRoom(
         return;
       }
 
+      if (getSupabaseDiagnostics().activeBackend === 'supabase') {
+        currentEntry.unsubSnap = subscribeToSupabaseRoom(normalizedCode, (mapped) => {
+          currentEntry.latestState = mapped;
+          currentEntry.subscribers.forEach((sub) => sub(mapped));
+        });
+        return;
+      }
+
       const roomRef = doc(db, 'rooms', normalizedCode);
       currentEntry.unsubSnap = onSnapshot(
         roomRef,
@@ -2782,6 +2983,14 @@ export function subscribeToPublicRooms(cb: (rooms: MultiplayerRoomState[]) => vo
         return;
       }
 
+      if (getSupabaseDiagnostics().activeBackend === 'supabase') {
+        sharedPublicRoomsUnsubSnap = subscribeToSupabasePublicRooms((list) => {
+          cachedPublicRooms = list;
+          publicRoomsSubscribers.forEach((sub) => sub(list));
+        });
+        return;
+      }
+
       const q = query(collection(db, 'rooms'), limit(15));
       sharedPublicRoomsUnsubSnap = onSnapshot(
         q,
@@ -2844,6 +3053,20 @@ export async function recordMatchFinished(
 
   const winner: 'home' | 'away' | 'draw' =
     homeGoals > awayGoals ? 'home' : awayGoals > homeGoals ? 'away' : 'draw';
+
+  if (await isSupabaseReady()) {
+    const ok = await recordSupabaseMatchFinished({
+      uid: user.uid,
+      roomCode,
+      homeTeamName,
+      awayTeamName,
+      homeGoals,
+      awayGoals,
+      participantUids,
+      myTeam,
+    });
+    if (ok) return;
+  }
 
   try {
     if (roomCode) {

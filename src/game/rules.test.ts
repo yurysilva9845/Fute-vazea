@@ -549,3 +549,633 @@ test('Firestore resource-exhausted handling, exponential backoff, presence dedup
     'PresenceManager must deduplicate startRoomPresence calls for identical roomCode and status'
   );
 });
+
+test('ETAPA 2, 3, 4 & 5 — Real WebSocket /ws/match 2-client communication, Vercel URL resolution, backoff + jitter, and non-passive touch listeners', async () => {
+  const http = await import('node:http');
+  const fs = await import('node:fs');
+  const { WebSocketServer, WebSocket } = await import('ws');
+  const {
+    RealtimeMatchClient,
+    resolveWsCandidateUrls,
+    computeReconnectDelayMs,
+  } = await import('../services/realtimeMatchClient');
+  const { AuthoritativeMatchRegistry, SERVER_TICK_DT } = await import(
+    '../server/authoritativeMatchEngine'
+  );
+
+  // 1. WebSocket URL resolution for fute-vazea.vercel.app vs Cloud Run vs custom VITE_WS_URL
+  const vercelUrls = resolveWsCandidateUrls('', {
+    protocol: 'https:',
+    host: 'fute-vazea.vercel.app',
+    hostname: 'fute-vazea.vercel.app',
+  });
+  assert.equal(
+    vercelUrls[0],
+    'wss://ais-pre-vjvg452vafw2n3arhxoh2l-129611115171.us-east1.run.app/ws/match',
+    'On static .vercel.app without VITE_WS_URL, must route directly to the authoritative Cloud Run WebSocket backend'
+  );
+
+  const customEnvUrls = resolveWsCandidateUrls('wss://realtime.semterrafc.com', {
+    protocol: 'https:',
+    host: 'fute-vazea.vercel.app',
+    hostname: 'fute-vazea.vercel.app',
+  });
+  assert.equal(customEnvUrls[0], 'wss://realtime.semterrafc.com/ws/match');
+
+  // 2. Exponential backoff with jitter increases monotonically and caps cleanly
+  const d0 = computeReconnectDelayMs(0, 0.5);
+  const d1 = computeReconnectDelayMs(1, 0.5);
+  const d2 = computeReconnectDelayMs(2, 0.5);
+  assert.ok(d1 > d0 && d2 > d1, `Expected exponential backoff d0=${d0} < d1=${d1} < d2=${d2}`);
+
+  // 3. Spin up real HTTP + WebSocketServer on /ws/match and connect 2 separate WebSocket clients (Browser A & Browser B)
+  const registry = new AuthoritativeMatchRegistry();
+  const server = http.createServer();
+  const wss = new WebSocketServer({ noServer: true });
+  const roomPeers = new Map<string, Set<InstanceType<typeof WebSocket>>>();
+
+  server.on('upgrade', (req, socket, head) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/ws/match') {
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    } else {
+      socket.destroy();
+    }
+  });
+
+  wss.on('connection', (ws) => {
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(String(raw));
+      if (msg.type === 'join_match' || msg.type === 'reconnect') {
+        const roomCode = String(msg.roomCode).toUpperCase();
+        const session = registry.getOrCreateSession({
+          roomCode,
+          matchId: msg.matchId,
+          hostUid: msg.uid,
+          mode: '2v2',
+          homeTeamName: 'Sem Terra FC',
+          awayTeamName: 'Rubro-Negro do Beco',
+          halfDurationSeconds: 180,
+          aiDifficulty: 'equilibrado',
+          slots: msg.slots || {},
+        });
+        session.handlePlayerReconnect(msg.uid, msg.displayName, msg.slotId);
+        if (!roomPeers.has(roomCode)) roomPeers.set(roomCode, new Set());
+        roomPeers.get(roomCode)!.add(ws);
+
+        ws.send(
+          JSON.stringify({
+            type: 'joined_ack',
+            roomCode,
+            matchId: session.matchId,
+            snapshot: session.getSnapshot(),
+            slots: session.slots,
+            readyUids: Array.from(session.readyUids),
+          })
+        );
+      } else if (msg.type === 'input_cmd') {
+        const cmd = msg.command;
+        const session = registry.getSession(cmd.roomCode);
+        if (session) {
+          session.submitCommand(cmd);
+          const snap = session.stepTick(SERVER_TICK_DT);
+          const payload = JSON.stringify({
+            type: 'match_state',
+            roomCode: session.roomCode,
+            matchId: session.matchId,
+            snapshot: snap,
+          });
+          for (const peer of roomPeers.get(session.roomCode) || []) {
+            if (peer.readyState === WebSocket.OPEN) peer.send(payload);
+          }
+        }
+      }
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as { port: number };
+  const wsUrl = `ws://127.0.0.1:${addr.port}/ws/match`;
+
+  const clientA = new RealtimeMatchClient();
+  const clientB = new RealtimeMatchClient();
+  let clientAReceivedMatchState = false;
+  let clientBReceivedMatchState = false;
+
+  clientA.setCallbacks({
+    onSnapshot: (snap) => {
+      if ((snap.tick ?? 0) >= 1) clientAReceivedMatchState = true;
+    },
+  });
+  clientB.setCallbacks({
+    onSnapshot: (snap) => {
+      if ((snap.tick ?? 0) >= 1) clientBReceivedMatchState = true;
+    },
+  });
+
+  const initialSlots = buildInitialRoomSlots('uid_host_A', 'Host A', 'home_1');
+  initialSlots.away_1 = {
+    ...initialSlots.away_1,
+    uid: 'uid_guest_B',
+    displayName: 'Guest B',
+    isBot: false,
+    isReady: true,
+  };
+
+  const wsA = new WebSocket(wsUrl);
+  const wsB = new WebSocket(wsUrl);
+
+  wsA.on('message', (data) => clientA.handleMessage(JSON.parse(String(data))));
+  wsB.on('message', (data) => clientB.handleMessage(JSON.parse(String(data))));
+
+  await Promise.all([
+    new Promise<void>((res) => wsA.once('open', () => res())),
+    new Promise<void>((res) => wsB.once('open', () => res())),
+  ]);
+
+  wsA.send(
+    JSON.stringify({
+      type: 'join_match',
+      roomCode: 'STF-PROD1',
+      matchId: 'MTC-PROD01',
+      uid: 'uid_host_A',
+      displayName: 'Host A',
+      slotId: 'home_1',
+      slots: initialSlots,
+    })
+  );
+  wsB.send(
+    JSON.stringify({
+      type: 'join_match',
+      roomCode: 'STF-PROD1',
+      matchId: 'MTC-PROD01',
+      uid: 'uid_guest_B',
+      displayName: 'Guest B',
+      slotId: 'away_1',
+      slots: initialSlots,
+    })
+  );
+
+  // Send movement command from Client A and verify both Client A and Client B receive the 30Hz match_state update
+  wsA.send(
+    JSON.stringify({
+      type: 'input_cmd',
+      command: {
+        seq: 1,
+        timestamp: Date.now(),
+        uid: 'uid_host_A',
+        roomCode: 'STF-PROD1',
+        slotId: 'home_1',
+        moveX: 1,
+        moveZ: 0,
+        sprint: true,
+        action: 'none',
+        kickPower: 0.7,
+      },
+    })
+  );
+
+  await new Promise((res) => setTimeout(res, 60));
+
+  assert.equal(clientAReceivedMatchState, true, 'Client A must receive match_state from /ws/match');
+  assert.equal(clientBReceivedMatchState, true, 'Client B must receive match_state from /ws/match');
+
+  wsA.close();
+  wsB.close();
+  await new Promise<void>((res) => server.close(() => res()));
+
+  // 4. Verify non-passive touch listeners ({ passive: false }) in VoiceControlsBar.tsx and GameplayHUD.tsx
+  const voiceBarSrc = fs.readFileSync('./src/components/VoiceControlsBar.tsx', 'utf8');
+  const hudSrc = fs.readFileSync('./src/components/GameplayHUD.tsx', 'utf8');
+  assert.ok(
+    voiceBarSrc.includes("{ passive: false }") && !voiceBarSrc.includes('onTouchStart='),
+    'VoiceControlsBar must register touchstart/touchend with { passive: false } instead of React passive onTouchStart'
+  );
+  assert.ok(
+    hudSrc.includes("{ passive: false }") && hudSrc.includes('if (e.cancelable)'),
+    'GameplayHUD must register joystick touch listeners with { passive: false } and check e.cancelable'
+  );
+});
+
+test('ETAPA 2 — Migração Firestore -> Supabase: JWT Firebase Auth, Publishable Key, Schema/RPCs SQL, Mapeadores e WebRTC Broadcast', async () => {
+  const fs = await import('node:fs');
+  const { validateFirebaseJwtClaims, isSafePublishableKey } = await import(
+    '../services/supabaseClient'
+  );
+  const { mapSupabaseRowToUserProfile, mapSupabaseRowToRoomState } = await import(
+    '../services/supabaseDataService'
+  );
+
+  // Helper para montar um JWT de teste
+  const makeFakeJwt = (payloadObj: Record<string, unknown>) => {
+    const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+    const body = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
+    return `${header}.${body}.signature_placeholder`;
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // 1. Token Firebase válido (iss, aud, sub, exp, role = authenticated)
+  const validJwt = makeFakeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    role: 'authenticated',
+    exp: nowSec + 3600,
+  });
+  const checkValid = validateFirebaseJwtClaims(validJwt, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
+  assert.equal(checkValid.valid, true);
+  assert.equal(checkValid.hasAuthenticatedRole, true);
+  assert.equal(checkValid.needsRefresh, false);
+  assert.equal(checkValid.uid, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
+
+  // 1b. Token Firebase sem role = authenticated sinaliza needsRefresh: true para forçar renovação da Custom Claim
+  const missingRoleJwt = makeFakeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    exp: nowSec + 3600,
+  });
+  const checkMissingRole = validateFirebaseJwtClaims(missingRoleJwt, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
+  assert.equal(checkMissingRole.valid, true);
+  assert.equal(checkMissingRole.hasAuthenticatedRole, false);
+  assert.equal(checkMissingRole.needsRefresh, true);
+
+  // 2. Token próximo de expirar (< 60s) exige renovação automática (needsRefresh: true)
+  const expiringJwt = makeFakeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    role: 'authenticated',
+    exp: nowSec + 25,
+  });
+  const checkExpiring = validateFirebaseJwtClaims(expiringJwt, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
+  assert.equal(checkExpiring.valid, true);
+  assert.equal(checkExpiring.needsRefresh, true);
+
+  // 3. Token expirado ou com emissor incorreto é rejeitado
+  const expiredJwt = makeFakeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    exp: nowSec - 10,
+  });
+  assert.equal(validateFirebaseJwtClaims(expiredJwt).valid, false);
+
+  const wrongIssuerJwt = makeFakeJwt({
+    iss: 'https://securetoken.google.com/outro-projeto',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    exp: nowSec + 3600,
+  });
+  assert.equal(validateFirebaseJwtClaims(wrongIssuerJwt).valid, false);
+
+  // 4. Segurança de chaves Supabase no navegador (aceita Publishable/Anon, bloqueia Secret/service_role)
+  assert.equal(isSafePublishableKey('sb_publishable_AbCdEf123456'), true);
+  assert.equal(isSafePublishableKey(makeFakeJwt({ role: 'anon' })), true);
+  assert.equal(isSafePublishableKey('sb_secret_999999'), false);
+  assert.equal(isSafePublishableKey(makeFakeJwt({ role: 'service_role' })), false);
+
+  // 5. Mapeamento fiel de linhas PostgreSQL para os tipos do jogo
+  const mappedProfile = mapSupabaseRowToUserProfile({
+    uid: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    display_name: 'Yuri OFC',
+    tag_code: '#STFV3XT',
+    status: 'in_room',
+    current_room_code: 'STF-99AA',
+    friends: ['uid_amigo_1', 'uid_amigo_2'],
+    wins: 12,
+    losses: 3,
+    draws: 2,
+    goals_scored: 34,
+    goals_conceded: 11,
+    matches_played: 17,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  assert.equal(mappedProfile.uid, 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1');
+  assert.equal(mappedProfile.displayName, 'Yuri OFC');
+  assert.equal(mappedProfile.wins, 12);
+  assert.equal(mappedProfile.friends.length, 2);
+
+  const sampleSlots = buildInitialRoomSlots('v3xTyuRT7tTCAnFty1zlVYyM6Pl1', 'Yuri OFC', 'home_1');
+  const mappedRoom = mapSupabaseRowToRoomState({
+    room_code: 'STF-99AA',
+    match_id: 'MTC-99AA01',
+    room_name: 'Arena Várzea',
+    mode: '4v4',
+    visibility: 'public',
+    has_password: false,
+    max_humans: 8,
+    auto_fill_bots: true,
+    host_uid: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    host_name: 'Yuri OFC',
+    status: 'waiting',
+    home_team_id: 'unidos_do_barro',
+    away_team_id: 'rubro_negro_beco',
+    home_goals: 2,
+    away_goals: 1,
+    half: 1,
+    remaining_seconds: 150,
+    slots: sampleSlots,
+  });
+  assert.equal(mappedRoom.roomCode, 'STF-99AA');
+  assert.equal(mappedRoom.homeScore, 2);
+  assert.equal(mappedRoom.awayScore, 1);
+
+  // 6. Valida migration SQL versionada e ausência de Firestore em voiceChatService.ts
+  const sqlMigration = fs.readFileSync(
+    './supabase/migrations/20261117000001_sem_terra_fc_schema_rpc_rls.sql',
+    'utf8'
+  );
+  assert.ok(sqlMigration.includes('CREATE OR REPLACE FUNCTION public.rpc_join_room_atomic'));
+  assert.ok(sqlMigration.includes('CREATE OR REPLACE FUNCTION public.rpc_toggle_ready_atomic'));
+  assert.ok(sqlMigration.includes('CREATE OR REPLACE FUNCTION public.rpc_leave_room_atomic'));
+  assert.ok(sqlMigration.includes('FOR UPDATE'));
+
+  const voiceSrc = fs.readFileSync('./src/services/voiceChatService.ts', 'utf8');
+  assert.ok(
+    !voiceSrc.includes('firebase/firestore'),
+    'voiceChatService.ts não deve mais importar firebase/firestore (migrado para Supabase Realtime Broadcast + WebSocket Relay)'
+  );
+});
+
+test('AUDITORIA SQL E 12 TESTES OBRIGATÓRIOS DE SEGURANÇA SUPABASE (RLS, JWT role=authenticated, RPCs Atômicas, Anti-Spoofing e Senhas)', async () => {
+  const fs = await import('node:fs');
+  const { SupabaseSecurityTestHarness, SAFE_ROOM_SELECT_COLUMNS } = await import(
+    '../services/supabaseSecurityVerifier'
+  );
+
+  // Auditoria estática da migration SQL: proíbe COALESCE(public.firebase_uid(), ...) e USING (true) / WITH CHECK (true)
+  const sqlMigration = fs.readFileSync(
+    './supabase/migrations/20261117000001_sem_terra_fc_schema_rpc_rls.sql',
+    'utf8'
+  );
+  assert.ok(
+    !sqlMigration.includes('COALESCE(public.firebase_uid()'),
+    'Migration SQL jamais deve usar COALESCE(public.firebase_uid(), p_uid/uid) como fallback'
+  );
+  assert.ok(
+    !sqlMigration.includes('USING (true)') && !sqlMigration.includes('WITH CHECK (true)'),
+    'Migration SQL não deve conter políticas RLS abertas USING (true) ou WITH CHECK (true)'
+  );
+  assert.ok(
+    sqlMigration.includes("REVOKE SELECT (password_hash, inputs, match_snapshot) ON public.rooms FROM authenticated"),
+    'Migration SQL deve revogar leitura de password_hash na tabela rooms'
+  );
+  assert.ok(
+    !SAFE_ROOM_SELECT_COLUMNS.includes('password_hash'),
+    'SAFE_ROOM_SELECT_COLUMNS nunca deve incluir password_hash'
+  );
+
+  const makeJwt = (payloadObj: Record<string, unknown>) => {
+    const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');
+    const body = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
+    return `${header}.${body}.sig`;
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const tokenPlayerA = makeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'uid_player_A',
+    role: 'authenticated',
+    exp: nowSec + 3600,
+  });
+  const tokenPlayerB = makeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'uid_player_B',
+    role: 'authenticated',
+    exp: nowSec + 3600,
+  });
+  const tokenPlayerC = makeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'uid_player_C',
+    role: 'authenticated',
+    exp: nowSec + 3600,
+  });
+  const tokenWithoutAuthRole = makeJwt({
+    iss: 'https://securetoken.google.com/gen-lang-client-0384619138',
+    aud: 'gen-lang-client-0384619138',
+    sub: 'uid_anon_no_role',
+    role: 'anon',
+    exp: nowSec + 3600,
+  });
+
+  const dbHarness = new SupabaseSecurityTestHarness();
+
+  // Cria perfis legítimos de A, B e C
+  dbHarness.clientUpsertProfile(tokenPlayerA, 'uid_player_A', {
+    display_name: 'Jogador A',
+    tag_code: '#STFAAAA',
+  });
+  dbHarness.clientUpsertProfile(tokenPlayerB, 'uid_player_B', {
+    display_name: 'Jogador B',
+    tag_code: '#STFBBBB',
+  });
+  dbHarness.clientUpsertProfile(tokenPlayerC, 'uid_player_C', {
+    display_name: 'Jogador C',
+    tag_code: '#STFCCCC',
+  });
+
+  // TESTE 1: Jogador A não consegue alterar o perfil de B
+  assert.throws(
+    () =>
+      dbHarness.clientUpsertProfile(tokenPlayerA, 'uid_player_B', {
+        display_name: 'Hackeado por A',
+      }),
+    /RLS_VIOLATION/
+  );
+
+  // TESTE 2: Jogador A não consegue alterar estatísticas de B (nem as próprias diretamente)
+  assert.throws(
+    () =>
+      dbHarness.clientUpsertProfile(tokenPlayerA, 'uid_player_B', {
+        wins: 999,
+      }),
+    /RLS_VIOLATION/
+  );
+  assert.throws(
+    () =>
+      dbHarness.clientUpsertProfile(tokenPlayerA, 'uid_player_A', {
+        wins: 999,
+        goals_scored: 500,
+      }),
+    /STATS_TAMPERING_BLOCKED/
+  );
+
+  // TESTE 3: Jogador A não consegue aceitar solicitação destinada a B
+  const reqId = dbHarness.clientSendFriendRequest(tokenPlayerA, 'uid_player_A', 'uid_player_B');
+  assert.throws(
+    () => dbHarness.rpcRespondFriendRequestAtomic(tokenPlayerA, reqId, 'uid_player_A', true),
+    /FORBIDDEN_RECIPIENT_ONLY/
+  );
+  // Destinatário B consegue aceitar normalmente
+  dbHarness.rpcRespondFriendRequestAtomic(tokenPlayerB, reqId, 'uid_player_B', true);
+  assert.ok(dbHarness.getUserInternal('uid_player_A')?.friends.includes('uid_player_B'));
+  assert.ok(dbHarness.getUserInternal('uid_player_B')?.friends.includes('uid_player_A'));
+
+  // TESTE 4: Usuário sem token válido (null ou sem role='authenticated') não consegue acessar dados protegidos
+  assert.throws(() => dbHarness.clientSelectUsers(null), /AUTH_REQUIRED/);
+  assert.throws(() => dbHarness.clientSelectUsers(tokenWithoutAuthRole), /AUTH_REQUIRED/);
+
+  // TESTE 5: UID falsificado enviado pelo frontend é rejeitado
+  assert.throws(
+    () => dbHarness.clientSendFriendRequest(tokenPlayerA, 'uid_player_B', 'uid_player_C'),
+    /UID_SPOOFING_REJECTED/
+  );
+
+  // TESTE 6: Jogador consegue entrar em uma sala pública disponível
+  dbHarness.rpcCreateRoomAtomic(tokenPlayerA, {
+    roomCode: 'STF-PUB1',
+    roomName: 'Várzea Pública',
+    mode: '2v2',
+    visibility: 'public',
+    maxHumans: 4,
+  });
+  const joinedPublic = await dbHarness.rpcJoinRoomAtomic(tokenPlayerB, {
+    roomCode: 'STF-PUB1',
+    clientUid: 'uid_player_B',
+    displayName: 'Jogador B',
+  });
+  const pubHumans = Object.values(joinedPublic.slots as Record<string, any>).filter(
+    (s: any) => !s.isBot && s.uid
+  );
+  assert.equal(pubHumans.length, 2);
+
+  // TESTE 7: Jogador não consegue entrar em sala privada sem senha correta (nem enviando o hash bcrypt)
+  dbHarness.rpcCreateRoomAtomic(tokenPlayerA, {
+    roomCode: 'STF-PRV1',
+    roomName: 'Várzea Fechada',
+    mode: '4v4',
+    visibility: 'private',
+    plainPassword: 'varzea2026',
+  });
+  await assert.rejects(
+    () =>
+      dbHarness.rpcJoinRoomAtomic(tokenPlayerB, {
+        roomCode: 'STF-PRV1',
+        displayName: 'Jogador B',
+        plainPassword: '',
+      }),
+    /SENHA_OBRIGATORIA/
+  );
+  await assert.rejects(
+    () =>
+      dbHarness.rpcJoinRoomAtomic(tokenPlayerB, {
+        roomCode: 'STF-PRV1',
+        displayName: 'Jogador B',
+        plainPassword: 'senha_errada',
+      }),
+    /Senha incorreta/
+  );
+  // Tentativa de pass-the-hash também falha
+  const internalRoom = dbHarness.getRoomInternal('STF-PRV1');
+  await assert.rejects(
+    () =>
+      dbHarness.rpcJoinRoomAtomic(tokenPlayerB, {
+        roomCode: 'STF-PRV1',
+        displayName: 'Jogador B',
+        plainPassword: internalRoom?.password_hash,
+      }),
+    /Senha incorreta/
+  );
+  // Com a senha correta em texto plano, entra normalmente
+  const joinedPrivate = await dbHarness.rpcJoinRoomAtomic(tokenPlayerB, {
+    roomCode: 'STF-PRV1',
+    displayName: 'Jogador B',
+    plainPassword: 'varzea2026',
+  });
+  assert.equal(joinedPrivate.roomCode, 'STF-PRV1');
+
+  // TESTE 8: Dois jogadores tentando ocupar a última vaga simultaneamente não causam duplicidade
+  dbHarness.rpcCreateRoomAtomic(tokenPlayerA, {
+    roomCode: 'STF-RACE',
+    roomName: 'Sala Disputada',
+    mode: '2v2',
+    visibility: 'public',
+    maxHumans: 2, // Apenas 1 vaga restante além do host A!
+  });
+  const [resB, resC] = await Promise.allSettled([
+    dbHarness.rpcJoinRoomAtomic(tokenPlayerB, {
+      roomCode: 'STF-RACE',
+      displayName: 'Jogador B',
+    }),
+    dbHarness.rpcJoinRoomAtomic(tokenPlayerC, {
+      roomCode: 'STF-RACE',
+      displayName: 'Jogador C',
+    }),
+  ]);
+  const fulfilledCount = [resB, resC].filter((r) => r.status === 'fulfilled').length;
+  const rejectedCount = [resB, resC].filter((r) => r.status === 'rejected').length;
+  assert.equal(fulfilledCount, 1, 'Exatamente 1 jogador deve conseguir a última vaga');
+  assert.equal(rejectedCount, 1, 'O segundo jogador concorrente deve receber Sala lotada');
+
+  // TESTE 9: Jogador consegue sair da sala sem corromper os slots (e transfere liderança se for o host)
+  dbHarness.rpcLeaveRoomAtomic(tokenPlayerA, 'STF-PUB1', 'uid_player_A');
+  const pubAfterHostLeave = dbHarness.getRoomInternal('STF-PUB1');
+  assert.ok(pubAfterHostLeave, 'Sala continua ativa pois Jogador B ainda está nela');
+  assert.equal(
+    pubAfterHostLeave?.host_uid,
+    'uid_player_B',
+    'Liderança transferida automaticamente para Jogador B'
+  );
+  assert.equal(
+    Object.keys(pubAfterHostLeave?.slots || {}).length,
+    8,
+    'Todos os 8 slots permanecem íntegros'
+  );
+
+  // TESTE 10: Somente participantes autorizados conseguem alterar sua prontidão
+  assert.throws(
+    () => dbHarness.rpcToggleReadyAtomic(tokenPlayerC, 'STF-PUB1', 'uid_player_C', false),
+    /NOT_A_ROOM_PARTICIPANT/
+  );
+  assert.throws(
+    () => dbHarness.rpcToggleReadyAtomic(tokenPlayerB, 'STF-PUB1', 'uid_player_A', false),
+    /UID_SPOOFING_REJECTED/
+  );
+  const toggledRoom = dbHarness.rpcToggleReadyAtomic(
+    tokenPlayerB,
+    'STF-PUB1',
+    'uid_player_B',
+    false
+  );
+  const slotB = Object.values(toggledRoom.slots as Record<string, any>).find(
+    (s: any) => s.uid === 'uid_player_B'
+  );
+  assert.equal(slotB.isReady, false);
+
+  // TESTE 11: Um jogador não consegue manipular resultados de partidas
+  // Jogador C (fora da sala STF-PRV1) tenta forjar resultado
+  assert.throws(
+    () => dbHarness.rpcRecordMatchFinishedAtomic(tokenPlayerC, 'STF-PRV1', 10, 0),
+    /NOT_MATCH_PARTICIPANT/
+  );
+  // Tentativa de finalizar partida antes de iniciá-la (status === 'waiting') é bloqueada
+  assert.throws(
+    () => dbHarness.rpcRecordMatchFinishedAtomic(tokenPlayerA, 'STF-PRV1', 3, 1),
+    /MATCH_NOT_ACTIVE/
+  );
+  // Host inicia a partida legitimamente e finaliza 1 vez
+  dbHarness.rpcStartMatchAtomic(tokenPlayerA, 'STF-PRV1');
+  const recordedFirst = dbHarness.rpcRecordMatchFinishedAtomic(tokenPlayerA, 'STF-PRV1', 3, 1);
+  assert.equal(recordedFirst, true);
+  // Tentativa de enviar o resultado uma segunda vez (replay para inflar vitórias/gols) retorna false sem somar novamente
+  const recordedSecond = dbHarness.rpcRecordMatchFinishedAtomic(tokenPlayerA, 'STF-PRV1', 10, 0);
+  assert.equal(recordedSecond, false);
+  assert.equal(dbHarness.getUserInternal('uid_player_A')?.matches_played, 1);
+
+  // TESTE 12: Hashes de senhas não aparecem nas consultas públicas do lobby nem no retorno das RPCs
+  const lobbyRooms = dbHarness.queryPublicRoomsLobbyView(tokenPlayerA);
+  for (const r of lobbyRooms) {
+    assert.equal(r.passwordHash, null, 'passwordHash deve ser sempre null no lobby');
+    assert.equal((r as any).password_hash, undefined, 'password_hash nunca deve vazar');
+  }
+  assert.equal(joinedPrivate.passwordHash, null);
+});
+
+
+
