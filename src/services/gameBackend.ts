@@ -14,10 +14,58 @@ import {
 import type { ClientInputState, FriendRequestDoc } from './firebase';
 import { CreateRoomParams } from './roomService';
 import {
+  getCurrentFirebaseUid,
   getFreshFirebaseAccessToken,
   getSupabaseClient,
   getSupabaseConfig,
 } from './supabaseClient';
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Valida se uma string possui formato UUID canônico (usado apenas para IDs internos:
+ * `friend_requests.id`, `friendships.id`, `room_participants.id`, `matches.match_id`, `match_history.id`).
+ * UIDs do Firebase NUNCA são UUID (devem permanecer TEXT).
+ */
+export function isValidUuid(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  return UUID_REGEX.test(value.trim());
+}
+
+/**
+ * Valida se um identificador é um UID Firebase válido em formato TEXT (1 a 128 caracteres).
+ */
+export function isValidFirebaseUid(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const clean = value.trim();
+  return clean.length >= 1 && clean.length <= 128;
+}
+
+/**
+ * Detecta se um erro retornado pelo PostgreSQL/PostgREST é o erro `22P02`
+ * (`invalid input syntax for type uuid`) causado por uma função RPC ou policy legada
+ * no banco que ainda invoca `auth.uid()` sobre o UID TEXT do Firebase.
+ */
+export function isUuidSyntaxError22P02(err: unknown): boolean {
+  if (!err) return false;
+  const code =
+    err instanceof GameBackendError
+      ? err.code
+      : typeof (err as Record<string, unknown>).code === 'string'
+      ? String((err as Record<string, unknown>).code)
+      : '';
+  const msg =
+    err instanceof Error
+      ? err.message
+      : typeof (err as Record<string, unknown>).message === 'string'
+      ? String((err as Record<string, unknown>).message)
+      : String(err);
+  return (
+    code === '22P02' ||
+    msg.includes('22P02') ||
+    msg.toLowerCase().includes('invalid input syntax for type uuid')
+  );
+}
 
 // ============================================================================
 // 1. TIPOS DAS RPCs E TABELAS REAIS DO SUPABASE (https://etlvzqrfsvvpzltimxaj.supabase.co)
@@ -281,8 +329,18 @@ export function mapRawToUserProfile(
   const nestedUser =
     raw.user && typeof raw.user === 'object' ? (raw.user as Record<string, unknown>) : raw;
 
+  // Nunca utiliza `nestedUser.id` se ele for um UUID de registro interno (ex.: friendships.id ou room_participants.id)
+  const candidateId =
+    typeof nestedUser.id === 'string' && !isValidUuid(nestedUser.id) ? nestedUser.id : '';
+
   const uid = String(
-    nestedUser.uid || nestedUser.user_id || nestedUser.friend_id || nestedUser.id || fallbackUid || ''
+    nestedUser.uid ||
+      nestedUser.user_id ||
+      nestedUser.friend_id ||
+      nestedUser.friend_uid ||
+      candidateId ||
+      fallbackUid ||
+      ''
   ).trim();
   const displayName = String(
     nestedUser.display_name ||
@@ -450,8 +508,9 @@ export function buildSlotsFromParticipants(
         ? (rawP.user as Record<string, unknown>)
         : null;
 
+    // Importante: nunca usar `rawP.id` como fallback se for UUID da linha `room_participants.id`
     const uid = String(
-      rawP.user_id || rawP.uid || nestedUser?.uid || rawP.id || ''
+      rawP.user_id || rawP.uid || nestedUser?.uid || ''
     ).trim();
     if (!uid) continue;
 
@@ -758,7 +817,7 @@ export function mapRpcFriendRequestToDoc(raw: Record<string, unknown>): FriendRe
       : 'pending';
 
   return {
-    id: String(raw.id || raw.request_id || ''),
+    id: String(raw.id || raw.request_id || '').trim(),
     fromUid,
     fromName,
     fromTag,
@@ -799,7 +858,12 @@ async function invokeSupabaseRpc<T = unknown>(
     const { data, error } = await client.rpc(rpcName, args);
     if (error) {
       const cleanMessage = error.message || `Falha na execução de ${rpcName}`;
-      endBackendOperation(cleanMessage);
+      // Se for erro 22P02 de função legada com auth.uid(), não polui lastError global pois o fallback de tabela tratará
+      const is22P02 =
+        error.code === '22P02' ||
+        cleanMessage.includes('22P02') ||
+        cleanMessage.toLowerCase().includes('invalid input syntax for type uuid');
+      endBackendOperation(is22P02 ? null : cleanMessage);
       throw new GameBackendError(cleanMessage, rpcName, error.code || 'PGRST_ERROR');
     }
 
@@ -818,53 +882,118 @@ async function invokeSupabaseRpc<T = unknown>(
 
 // ============================================================================
 // 5. CHAMADAS TIPADAS PARA TODAS AS 14 RPCs DISPONÍVEIS
+//    (COM FALLBACK ATÔMICO NAS TABELAS REAIS DO POSTGRESQL EM CASO DE 22P02)
 // ============================================================================
 
 /**
  * 5.1. Perfil: `rpc_ensure_user_profile_atomic({ p_display_name })`
- * Cria ou atualiza o perfil do jogador autenticado no Supabase usando o token Firebase.
+ * Cria ou atualiza o perfil do jogador autenticado no Supabase usando o token Firebase (UID TEXT).
  */
 export async function rpcEnsureUserProfileAtomic(params: {
   uid: string;
   displayName: string;
 }): Promise<OnlineUserProfile & { friends: string[] }> {
+  const cleanUid = String(params.uid || getCurrentFirebaseUid() || '').trim();
   const cleanName = (params.displayName || '').trim().slice(0, 28) || 'Jogador da Várzea';
-  const data = await invokeSupabaseRpc<unknown>('rpc_ensure_user_profile_atomic', {
-    p_display_name: cleanName,
-  });
 
-  const unwrapped = unwrapRpcPayload(data);
-  if (unwrapped) {
-    const profile = mapRawToUserProfile(unwrapped, params.uid);
-    // Se a RPC retornar apenas { uid, display_name, tag_code, ... }, busca lista de amigos atualizada em background ou mantém
-    return profile;
+  try {
+    const data = await invokeSupabaseRpc<unknown>('rpc_ensure_user_profile_atomic', {
+      p_display_name: cleanName,
+    });
+
+    const unwrapped = unwrapRpcPayload(data);
+    if (unwrapped) {
+      return mapRawToUserProfile(unwrapped, cleanUid);
+    }
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
   }
 
-  // Caso a RPC retorne void ou escalar, lê a linha real criada em public.users
+  // Lê ou grava diretamente na tabela real `public.users` (uid TEXT) + `public.presences` (user_id TEXT)
   const client = getSupabaseClient();
-  if (client && params.uid) {
-    const { data: userRow, error } = await client
+  if (client && cleanUid) {
+    const { data: existingRow } = await client
       .from('users')
       .select('*')
-      .eq('uid', params.uid)
+      .eq('uid', cleanUid)
       .maybeSingle();
 
-    if (error) {
-      throw new GameBackendError(
-        error.message,
-        'rpc_ensure_user_profile_atomic',
-        error.code || 'SELECT_USER_ERROR'
+    if (existingRow) {
+      const existingObj = existingRow as Record<string, unknown>;
+      const updatedName =
+        params.displayName?.trim() ? cleanName : String(existingObj.display_name || cleanName);
+      const { data: updatedRow } = await client
+        .from('users')
+        .update({
+          display_name: updatedName,
+          status: existingObj.status === 'offline' ? 'online' : existingObj.status || 'online',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('uid', cleanUid)
+        .select('*')
+        .maybeSingle();
+
+      await client.from('presences').upsert(
+        {
+          user_id: cleanUid,
+          is_online: true,
+          last_seen: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      );
+
+      return mapRawToUserProfile(
+        (updatedRow || existingObj) as Record<string, unknown>,
+        cleanUid
       );
     }
-    if (userRow) {
-      return mapRawToUserProfile(userRow as Record<string, unknown>, params.uid);
+
+    const fallbackTag = generateFallbackTagCode(cleanUid);
+    const { data: insertedRow, error: insertError } = await client
+      .from('users')
+      .upsert(
+        {
+          uid: cleanUid,
+          display_name: cleanName,
+          tag_code: fallbackTag,
+          status: 'online',
+          current_room_code: null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'uid' }
+      )
+      .select('*')
+      .maybeSingle();
+
+    if (insertError) {
+      throw new GameBackendError(
+        insertError.message,
+        'rpc_ensure_user_profile_atomic',
+        insertError.code || 'UPSERT_USER_ERROR'
+      );
+    }
+
+    await client.from('presences').upsert(
+      {
+        user_id: cleanUid,
+        is_online: true,
+        last_seen: new Date().toISOString(),
+      },
+      { onConflict: 'user_id' }
+    );
+
+    if (insertedRow) {
+      return mapRawToUserProfile(insertedRow as Record<string, unknown>, cleanUid);
     }
   }
 
   return {
-    uid: params.uid,
+    uid: cleanUid,
     displayName: cleanName,
-    tagCode: generateFallbackTagCode(params.uid),
+    tagCode: generateFallbackTagCode(cleanUid),
     status: 'online',
     currentRoomCode: '',
     friends: [],
@@ -880,6 +1009,54 @@ export async function rpcEnsureUserProfileAtomic(params: {
 }
 
 /**
+ * Busca diretamente nas tabelas `public.rooms` + `public.room_participants` + `public.users` + `public.matches`
+ * usando `room_code` (TEXT), `host_id` (TEXT) e `user_id` (TEXT).
+ */
+async function queryRoomLobbyFromTables(
+  normalizedCode: string
+): Promise<(MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null> {
+  const client = getSupabaseClient();
+  if (!client || !normalizedCode) return null;
+
+  const { data: roomRow, error: roomErr } = await client
+    .from('rooms')
+    .select('*')
+    .eq('room_code', normalizedCode)
+    .maybeSingle();
+
+  if (roomErr || !roomRow) return null;
+
+  const { data: partRows } = await client
+    .from('room_participants')
+    .select('*, users(uid, display_name, tag_code, avatar_url)')
+    .eq('room_code', normalizedCode);
+
+  const { data: matchRow } = await client
+    .from('matches')
+    .select('match_id, status, home_goals, away_goals')
+    .eq('room_code', normalizedCode)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const rawRoom = roomRow as Record<string, unknown>;
+  const mapped = mapRpcRoomToRoomState(
+    {
+      ...rawRoom,
+      match_id: (matchRow as Record<string, unknown> | null)?.match_id || rawRoom.match_id,
+      participants: (partRows as Record<string, unknown>[] | null) || [],
+    },
+    normalizedCode
+  );
+
+  if (!mapped.roomCode) return null;
+  return {
+    ...mapped,
+    inputs: {},
+  };
+}
+
+/**
  * 5.2. Consulta de Sala Individual: `rpc_get_room_lobby({ p_room_code })`
  * Retorna o estado completo da sala e seus participantes convertidos para os slots do jogo.
  */
@@ -889,13 +1066,21 @@ export async function rpcGetRoomLobby(
   const normalizedCode = roomCode.trim().toUpperCase();
   if (!normalizedCode) return null;
 
-  const data = await invokeSupabaseRpc<unknown>('rpc_get_room_lobby', {
-    p_room_code: normalizedCode,
-  });
+  let data: unknown = null;
+  try {
+    data = await invokeSupabaseRpc<unknown>('rpc_get_room_lobby', {
+      p_room_code: normalizedCode,
+    });
+  } catch (err) {
+    if (isUuidSyntaxError22P02(err)) {
+      clearGameBackendError();
+      return await queryRoomLobbyFromTables(normalizedCode);
+    }
+    throw err;
+  }
 
   if (!data) return null;
 
-  // Caso retorne array vazio (sala não existe ou encerrada)
   if (Array.isArray(data) && data.length === 0) {
     return null;
   }
@@ -903,7 +1088,6 @@ export async function rpcGetRoomLobby(
   let roomState: MultiplayerRoomState | null = null;
 
   if (Array.isArray(data)) {
-    // Se rpc_get_room_lobby retornar linhas de participantes com dados da sala ou apenas a linha da sala
     const first = data[0] as Record<string, unknown>;
     if ('user_id' in first && !('participants' in first)) {
       roomState = mapRpcRoomToRoomState(
@@ -927,12 +1111,15 @@ export async function rpcGetRoomLobby(
     return null;
   }
 
-  // Se o retorno da RPC não trouxe os participantes embutidos, consulta room_participants + users para montar os slots reais
   const client = getSupabaseClient();
   const hasHumanInSlots = Object.values(roomState.slots || {}).some(
     (s) => !s.isBot && Boolean(s.uid)
   );
-  if (client && (!hasHumanInSlots || Object.values(roomState.slots || {}).filter((s) => !s.isBot).length <= 1)) {
+  if (
+    client &&
+    (!hasHumanInSlots ||
+      Object.values(roomState.slots || {}).filter((s) => !s.isBot).length <= 1)
+  ) {
     try {
       const { data: partRows } = await client
         .from('room_participants')
@@ -957,7 +1144,7 @@ export async function rpcGetRoomLobby(
         };
       }
     } catch {
-      // Se RLS ou schema já incluiu na RPC, mantém roomState da RPC
+      // Mantém roomState retornado pela RPC
     }
   }
 
@@ -971,11 +1158,32 @@ export async function rpcGetRoomLobby(
  * 5.3. Consulta de Salas Públicas: `rpc_get_public_lobby({})`
  */
 export async function rpcGetPublicLobby(): Promise<MultiplayerRoomState[]> {
-  const data = await invokeSupabaseRpc<unknown>('rpc_get_public_lobby', {});
-  const items = unwrapRpcArray(data, ['rooms', 'lobby']);
-  return items
-    .map((item) => mapRpcRoomToRoomState(item))
-    .filter((r) => Boolean(r.roomCode) && r.status !== 'finished');
+  try {
+    const data = await invokeSupabaseRpc<unknown>('rpc_get_public_lobby', {});
+    const items = unwrapRpcArray(data, ['rooms', 'lobby']);
+    return items
+      .map((item) => mapRpcRoomToRoomState(item))
+      .filter((r) => Boolean(r.roomCode) && r.status !== 'finished');
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    if (!client) return [];
+    const { data: roomRows } = await client
+      .from('rooms')
+      .select('*, room_participants(*, users(uid, display_name, tag_code, avatar_url))')
+      .eq('visibility', 'public')
+      .neq('status', 'finished')
+      .order('updated_at', { ascending: false })
+      .limit(25);
+
+    if (!roomRows || !Array.isArray(roomRows)) return [];
+    return roomRows
+      .map((r) => mapRpcRoomToRoomState(r as Record<string, unknown>))
+      .filter((r) => Boolean(r.roomCode) && r.status !== 'finished');
+  }
 }
 
 /**
@@ -989,6 +1197,7 @@ export async function rpcCreateRoomAtomic(params: {
   halfDurationSeconds: number;
   options?: Partial<CreateRoomParams>;
 }): Promise<MultiplayerRoomState> {
+  const cleanHostUid = String(params.hostUid || getCurrentFirebaseUid() || '').trim();
   const mode: MatchFormatMode = params.options?.mode === '2v2' ? '2v2' : '4v4';
   const visibility: RoomVisibility =
     params.options?.visibility === 'private' ? 'private' : 'public';
@@ -997,32 +1206,85 @@ export async function rpcCreateRoomAtomic(params: {
     params.options?.roomName?.trim() || `SEM TERRA FC — SALA #${roomNum}`
   ).slice(0, 48);
 
-  const data = await invokeSupabaseRpc<unknown>('rpc_create_room_atomic', {
-    p_room_name: roomName,
-    p_mode: mode,
-    p_visibility: visibility,
-  });
-
+  let data: unknown = null;
   let roomCode = '';
-  if (typeof data === 'string') {
-    roomCode = data.trim().toUpperCase();
-  } else {
-    const unwrapped = unwrapRpcPayload(data);
-    if (unwrapped) {
-      const nestedRoom =
-        unwrapped.room && typeof unwrapped.room === 'object'
-          ? (unwrapped.room as Record<string, unknown>)
-          : unwrapped;
-      roomCode = String(
-        nestedRoom.room_code || nestedRoom.roomCode || unwrapped.room_code || ''
-      )
-        .trim()
-        .toUpperCase();
+
+  try {
+    data = await invokeSupabaseRpc<unknown>('rpc_create_room_atomic', {
+      p_room_name: roomName,
+      p_mode: mode,
+      p_visibility: visibility,
+    });
+
+    if (typeof data === 'string') {
+      roomCode = data.trim().toUpperCase();
+    } else {
+      const unwrapped = unwrapRpcPayload(data);
+      if (unwrapped) {
+        const nestedRoom =
+          unwrapped.room && typeof unwrapped.room === 'object'
+            ? (unwrapped.room as Record<string, unknown>)
+            : unwrapped;
+        roomCode = String(
+          nestedRoom.room_code || nestedRoom.roomCode || unwrapped.room_code || ''
+        )
+          .trim()
+          .toUpperCase();
+      }
     }
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    if (!client || !cleanHostUid) {
+      throw err;
+    }
+
+    await rpcEnsureUserProfileAtomic({
+      uid: cleanHostUid,
+      displayName: params.hostName || 'Anfitrião',
+    });
+
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let generatedCode = 'STF-';
+    for (let i = 0; i < 4; i++) {
+      generatedCode += chars[Math.floor(Math.random() * chars.length)];
+    }
+    roomCode = generatedCode;
+    const maxPlayers = mode === '2v2' ? 4 : 8;
+    const preferredChar = normalizeSlotIdFromCharacterId(
+      params.options?.preferredCharacterId || 'home_1',
+      'home'
+    ) || 'home_1';
+
+    await client.from('room_participants').delete().eq('user_id', cleanHostUid);
+
+    const { error: createErr } = await client.from('rooms').insert({
+      room_code: roomCode,
+      host_id: cleanHostUid,
+      room_name: roomName,
+      mode,
+      visibility,
+      status: 'waiting',
+      max_players: maxPlayers,
+    });
+    if (createErr) {
+      throw new GameBackendError(createErr.message, 'rpc_create_room_atomic', createErr.code);
+    }
+
+    await client.from('room_participants').insert({
+      room_code: roomCode,
+      user_id: cleanHostUid,
+      team: getTeamFromCharacterOrSlot(preferredChar),
+      character_id: preferredChar,
+      is_ready: true,
+      is_loading_ready: false,
+    });
   }
 
   if (roomCode) {
-    // Se o host escolheu um personagem específico na criação, sincroniza via rpc_select_character_atomic
     if (params.options?.preferredCharacterId) {
       try {
         await rpcSelectCharacterAtomic(roomCode, params.options.preferredCharacterId);
@@ -1086,13 +1348,54 @@ export async function rpcJoinRoomAtomic(params: {
     rpcArgs.p_team = params.team;
   }
 
-  const data = await invokeSupabaseRpc<unknown>('rpc_join_room_atomic', rpcArgs);
+  let data: unknown = null;
+  try {
+    data = await invokeSupabaseRpc<unknown>('rpc_join_room_atomic', rpcArgs);
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (!client || !currentUid) {
+      throw err;
+    }
+
+    const existingLobby = await queryRoomLobbyFromTables(normalizedCode);
+    if (!existingLobby) {
+      throw new GameBackendError(
+        `Sala ${normalizedCode} não encontrada ou já encerrada.`,
+        'rpc_join_room_atomic',
+        'ROOM_NOT_FOUND'
+      );
+    }
+
+    const alreadyIn = Object.values(existingLobby.slots || {}).some(
+      (s) => !s.isBot && s.uid === currentUid
+    );
+    if (!alreadyIn) {
+      const freeSlot = Object.values(existingLobby.slots || {}).find((s) => s.isBot);
+      if (!freeSlot) {
+        throw new GameBackendError(
+          `A sala ${normalizedCode} está lotada.`,
+          'rpc_join_room_atomic',
+          'ROOM_FULL'
+        );
+      }
+      await client.from('room_participants').insert({
+        room_code: normalizedCode,
+        user_id: currentUid,
+        team: freeSlot.team,
+        character_id: freeSlot.characterId,
+        is_ready: false,
+        is_loading_ready: false,
+      });
+    }
+  }
 
   const fullLobby = await rpcGetRoomLobby(normalizedCode);
   if (fullLobby) {
-    if (params.expectedMode && fullLobby.mode !== params.expectedMode) {
-      // Se o jogador filtrou uma modalidade diferente, ainda retorna o estado real da sala
-    }
     return fullLobby;
   }
 
@@ -1118,9 +1421,25 @@ export async function rpcLeaveRoomAtomic(roomCode: string): Promise<void> {
   const normalizedCode = roomCode.trim().toUpperCase();
   if (!normalizedCode) return;
 
-  await invokeSupabaseRpc<unknown>('rpc_leave_room_atomic', {
-    p_room_code: normalizedCode,
-  });
+  try {
+    await invokeSupabaseRpc<unknown>('rpc_leave_room_atomic', {
+      p_room_code: normalizedCode,
+    });
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (client && currentUid) {
+      await client
+        .from('room_participants')
+        .delete()
+        .eq('room_code', normalizedCode)
+        .eq('user_id', currentUid);
+    }
+  }
 }
 
 /**
@@ -1140,10 +1459,30 @@ export async function rpcSelectCharacterAtomic(
     );
   }
 
-  await invokeSupabaseRpc<unknown>('rpc_select_character_atomic', {
-    p_room_code: normalizedCode,
-    p_character_id: cleanCharId,
-  });
+  try {
+    await invokeSupabaseRpc<unknown>('rpc_select_character_atomic', {
+      p_room_code: normalizedCode,
+      p_character_id: cleanCharId,
+    });
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    const slotId = normalizeSlotIdFromCharacterId(cleanCharId) || cleanCharId;
+    if (client && currentUid) {
+      await client
+        .from('room_participants')
+        .update({
+          character_id: slotId,
+          team: getTeamFromCharacterOrSlot(slotId),
+        })
+        .eq('room_code', normalizedCode)
+        .eq('user_id', currentUid);
+    }
+  }
 
   return await rpcGetRoomLobby(normalizedCode);
 }
@@ -1164,10 +1503,26 @@ export async function rpcToggleReadyAtomic(
     );
   }
 
-  await invokeSupabaseRpc<unknown>('rpc_toggle_ready_atomic', {
-    p_room_code: normalizedCode,
-    p_is_ready: Boolean(isReady),
-  });
+  try {
+    await invokeSupabaseRpc<unknown>('rpc_toggle_ready_atomic', {
+      p_room_code: normalizedCode,
+      p_is_ready: Boolean(isReady),
+    });
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (client && currentUid) {
+      await client
+        .from('room_participants')
+        .update({ is_ready: Boolean(isReady) })
+        .eq('room_code', normalizedCode)
+        .eq('user_id', currentUid);
+    }
+  }
 
   return await rpcGetRoomLobby(normalizedCode);
 }
@@ -1188,24 +1543,54 @@ export async function rpcStartMatchAtomic(roomCode: string): Promise<{
     );
   }
 
-  const data = await invokeSupabaseRpc<unknown>('rpc_start_match_atomic', {
-    p_room_code: normalizedCode,
-  });
-
   let matchId = '';
-  if (typeof data === 'string' && data.trim()) {
-    matchId = data.trim();
-  } else {
-    const unwrapped = unwrapRpcPayload(data);
-    if (unwrapped) {
-      matchId = String(
-        unwrapped.match_id ||
-          unwrapped.matchId ||
-          unwrapped.id ||
-          (unwrapped.match && typeof unwrapped.match === 'object'
-            ? (unwrapped.match as Record<string, unknown>).match_id || ''
-            : '')
-      ).trim();
+  try {
+    const data = await invokeSupabaseRpc<unknown>('rpc_start_match_atomic', {
+      p_room_code: normalizedCode,
+    });
+
+    if (typeof data === 'string' && data.trim()) {
+      matchId = data.trim();
+    } else {
+      const unwrapped = unwrapRpcPayload(data);
+      if (unwrapped) {
+        matchId = String(
+          unwrapped.match_id ||
+            unwrapped.matchId ||
+            unwrapped.id ||
+            (unwrapped.match && typeof unwrapped.match === 'object'
+              ? (unwrapped.match as Record<string, unknown>).match_id || ''
+              : '')
+        ).trim();
+      }
+    }
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    if (client) {
+      const { data: matchRow } = await client
+        .from('matches')
+        .insert({
+          room_code: normalizedCode,
+          status: 'starting',
+          home_goals: 0,
+          away_goals: 0,
+          started_at: new Date().toISOString(),
+        })
+        .select('match_id')
+        .maybeSingle();
+
+      if (matchRow && typeof (matchRow as Record<string, unknown>).match_id === 'string') {
+        matchId = String((matchRow as Record<string, unknown>).match_id);
+      }
+
+      await client
+        .from('rooms')
+        .update({ status: 'starting', updated_at: new Date().toISOString() })
+        .eq('room_code', normalizedCode);
     }
   }
 
@@ -1248,6 +1633,39 @@ export async function rpcSendFriendRequest(
         : `Solicitação de amizade enviada para ${formattedTag}!`;
     return { ok: true, message: serverMsg };
   } catch (err) {
+    if (isUuidSyntaxError22P02(err)) {
+      clearGameBackendError();
+      const client = getSupabaseClient();
+      const senderUid = getCurrentFirebaseUid();
+      if (client && senderUid) {
+        const { data: targetUser } = await client
+          .from('users')
+          .select('uid, display_name, tag_code')
+          .ilike('tag_code', formattedTag)
+          .maybeSingle();
+
+        const targetObj = targetUser as Record<string, unknown> | null;
+        if (!targetObj || !targetObj.uid) {
+          return { ok: false, message: `Nenhum jogador encontrado com a Tag ${formattedTag}.` };
+        }
+        const receiverUid = String(targetObj.uid);
+        if (receiverUid === senderUid) {
+          return { ok: false, message: 'Você não pode adicionar a si mesmo.' };
+        }
+
+        const { error: reqErr } = await client.from('friend_requests').insert({
+          sender_id: senderUid,
+          receiver_id: receiverUid,
+          status: 'pending',
+        });
+        if (!reqErr) {
+          return {
+            ok: true,
+            message: `Solicitação de amizade enviada para ${targetObj.display_name || formattedTag}!`,
+          };
+        }
+      }
+    }
     const msg =
       err instanceof Error ? err.message : 'Não foi possível enviar a solicitação de amizade.';
     return { ok: false, message: msg };
@@ -1256,12 +1674,13 @@ export async function rpcSendFriendRequest(
 
 /**
  * 5.11. Responder Solicitação de Amizade: `rpc_respond_friend_request({ p_request_id, p_accept })`
+ * Nota: `p_request_id` exige UUID (`friend_requests.id`), enquanto `sender_id` e `receiver_id` são TEXT (UID Firebase).
  */
 export async function rpcRespondFriendRequest(
   requestId: string,
   accept: boolean
 ): Promise<void> {
-  const cleanId = requestId.trim();
+  let cleanId = requestId.trim();
   if (!cleanId) {
     throw new GameBackendError(
       'ID da solicitação de amizade inválido.',
@@ -1270,10 +1689,75 @@ export async function rpcRespondFriendRequest(
     );
   }
 
-  await invokeSupabaseRpc<unknown>('rpc_respond_friend_request', {
-    p_request_id: cleanId,
-    p_accept: Boolean(accept),
-  });
+  // Se `cleanId` não for um UUID válido (por exemplo, se recebeu um UID Firebase `sender_id` TEXT),
+  // resolve o UUID real `friend_requests.id` antes de invocar a RPC para jamais causar 22P02.
+  if (!isValidUuid(cleanId)) {
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (client && currentUid) {
+      const { data: foundReq } = await client
+        .from('friend_requests')
+        .select('id')
+        .eq('receiver_id', currentUid)
+        .eq('sender_id', cleanId)
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const resolvedUuid = (foundReq as Record<string, unknown> | null)?.id;
+      if (typeof resolvedUuid === 'string' && isValidUuid(resolvedUuid)) {
+        cleanId = resolvedUuid.trim();
+      } else {
+        throw new GameBackendError(
+          'Solicitação de amizade pendente não localizada ou ID não é um UUID válido.',
+          'rpc_respond_friend_request',
+          'INVALID_REQUEST_UUID'
+        );
+      }
+    }
+  }
+
+  try {
+    await invokeSupabaseRpc<unknown>('rpc_respond_friend_request', {
+      p_request_id: cleanId,
+      p_accept: Boolean(accept),
+    });
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    if (!client) throw err;
+
+    const { data: reqRow } = await client
+      .from('friend_requests')
+      .select('id, sender_id, receiver_id')
+      .eq('id', cleanId)
+      .maybeSingle();
+
+    const reqObj = reqRow as Record<string, unknown> | null;
+    if (!reqObj) return;
+
+    await client
+      .from('friend_requests')
+      .update({
+        status: accept ? 'accepted' : 'rejected',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', cleanId);
+
+    if (accept && reqObj.sender_id && reqObj.receiver_id) {
+      const sUid = String(reqObj.sender_id);
+      const rUid = String(reqObj.receiver_id);
+      const [u1, u2] = sUid < rUid ? [sUid, rUid] : [rUid, sUid];
+      await client.from('friendships').insert({
+        user_id_1: u1,
+        user_id_2: u2,
+      });
+    }
+  }
 }
 
 /**
@@ -1293,31 +1777,116 @@ export async function rpcRemoveFriend(friendTag: string): Promise<void> {
     ? cleanTag.toUpperCase()
     : `#${cleanTag.toUpperCase()}`;
 
-  await invokeSupabaseRpc<unknown>('rpc_remove_friend', {
-    p_friend_tag: formattedTag,
-  });
+  try {
+    await invokeSupabaseRpc<unknown>('rpc_remove_friend', {
+      p_friend_tag: formattedTag,
+    });
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (client && currentUid) {
+      const { data: friendRow } = await client
+        .from('users')
+        .select('uid')
+        .ilike('tag_code', formattedTag)
+        .maybeSingle();
+      const friendUid = (friendRow as Record<string, unknown> | null)?.uid;
+      if (typeof friendUid === 'string' && friendUid) {
+        await client
+          .from('friendships')
+          .delete()
+          .or(
+            `and(user_id_1.eq.${currentUid},user_id_2.eq.${friendUid}),and(user_id_1.eq.${friendUid},user_id_2.eq.${currentUid})`
+          );
+      }
+    }
+  }
 }
 
 /**
  * 5.13. Consultar Meus Amigos: `rpc_get_my_friends({})`
  */
 export async function rpcGetMyFriends(): Promise<OnlineUserProfile[]> {
-  const data = await invokeSupabaseRpc<unknown>('rpc_get_my_friends', {});
-  const items = unwrapRpcArray(data, ['friends', 'users']);
-  return items
-    .map((item) => mapRawToUserProfile(item))
-    .filter((f) => Boolean(f.uid || f.tagCode));
+  try {
+    const data = await invokeSupabaseRpc<unknown>('rpc_get_my_friends', {});
+    const items = unwrapRpcArray(data, ['friends', 'users']);
+    return items
+      .map((item) => mapRawToUserProfile(item))
+      .filter((f) => Boolean(f.uid || f.tagCode));
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (!client || !currentUid) return [];
+
+    const { data: fRows } = await client
+      .from('friendships')
+      .select('user_id_1, user_id_2')
+      .or(`user_id_1.eq.${currentUid},user_id_2.eq.${currentUid}`);
+
+    if (!fRows || !Array.isArray(fRows) || fRows.length === 0) return [];
+    const friendUids = Array.from(
+      new Set(
+        fRows
+          .map((r) => {
+            const row = r as Record<string, unknown>;
+            return row.user_id_1 === currentUid
+              ? String(row.user_id_2 || '')
+              : String(row.user_id_1 || '');
+          })
+          .filter(Boolean)
+      )
+    );
+    if (friendUids.length === 0) return [];
+
+    const { data: userRows } = await client
+      .from('users')
+      .select('*')
+      .in('uid', friendUids);
+
+    if (!userRows || !Array.isArray(userRows)) return [];
+    return userRows.map((u) => mapRawToUserProfile(u as Record<string, unknown>));
+  }
 }
 
 /**
  * 5.14. Consultar Solicitações de Amizade: `rpc_get_friend_requests({})`
  */
 export async function rpcGetFriendRequests(): Promise<FriendRequestDoc[]> {
-  const data = await invokeSupabaseRpc<unknown>('rpc_get_friend_requests', {});
-  const items = unwrapRpcArray(data, ['requests', 'friend_requests']);
-  return items
-    .map((item) => mapRpcFriendRequestToDoc(item))
-    .filter((req) => Boolean(req.id) && req.status === 'pending');
+  try {
+    const data = await invokeSupabaseRpc<unknown>('rpc_get_friend_requests', {});
+    const items = unwrapRpcArray(data, ['requests', 'friend_requests']);
+    return items
+      .map((item) => mapRpcFriendRequestToDoc(item))
+      .filter((req) => Boolean(req.id) && req.status === 'pending');
+  } catch (err) {
+    if (!isUuidSyntaxError22P02(err)) {
+      throw err;
+    }
+    clearGameBackendError();
+    const client = getSupabaseClient();
+    const currentUid = getCurrentFirebaseUid();
+    if (!client || !currentUid) return [];
+
+    const { data: reqRows } = await client
+      .from('friend_requests')
+      .select('*, sender:users!friend_requests_sender_id_fkey(uid, display_name, tag_code)')
+      .eq('receiver_id', currentUid)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (!reqRows || !Array.isArray(reqRows)) return [];
+    return reqRows
+      .map((item) => mapRpcFriendRequestToDoc(item as Record<string, unknown>))
+      .filter((req) => Boolean(req.id) && req.status === 'pending');
+  }
 }
 
 // ============================================================================

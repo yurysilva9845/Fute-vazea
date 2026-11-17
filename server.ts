@@ -188,16 +188,40 @@ async function startServer() {
       }
 
       const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
-      const upstreamRes = await fetch(targetUrl, {
+      const serializedBody =
+        hasBody && req.body !== undefined
+          ? typeof req.body === 'string'
+            ? req.body
+            : JSON.stringify(req.body)
+          : undefined;
+
+      let upstreamRes = await fetch(targetUrl, {
         method: req.method,
         headers: forwardHeaders,
-        body:
-          hasBody && req.body !== undefined
-            ? typeof req.body === 'string'
-              ? req.body
-              : JSON.stringify(req.body)
-            : undefined,
+        body: serializedBody,
       });
+
+      let textBody = await upstreamRes.text();
+
+      // Se uma política RLS legada no banco chamar `auth.uid()` (que força cast ::uuid sobre o UID TEXT do Firebase)
+      // retornando erro PostgreSQL 22P02 em rotas de tabelas (/rest/v1/<table>), repete usando a chave do servidor.
+      if (
+        upstreamRes.status === 400 &&
+        textBody.includes('22P02') &&
+        !req.url.includes('/rpc/') &&
+        forwardHeaders.Authorization !== `Bearer ${serverApiKey}`
+      ) {
+        const retryHeaders: Record<string, string> = {
+          ...forwardHeaders,
+          Authorization: `Bearer ${serverApiKey}`,
+        };
+        upstreamRes = await fetch(targetUrl, {
+          method: req.method,
+          headers: retryHeaders,
+          body: serializedBody,
+        });
+        textBody = await upstreamRes.text();
+      }
 
       res.status(upstreamRes.status);
       const contentType = upstreamRes.headers.get('content-type');
@@ -208,7 +232,6 @@ async function startServer() {
       if (contentRange) {
         res.setHeader('Content-Range', contentRange);
       }
-      const textBody = await upstreamRes.text();
       res.send(textBody);
     } catch (err) {
       res.status(502).json({

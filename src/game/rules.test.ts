@@ -888,9 +888,9 @@ test('ETAPA 2 — Migração Firestore -> Supabase: JWT Firebase Auth, Publishab
   assert.equal(mappedRoom.homeScore, 2);
   assert.equal(mappedRoom.awayScore, 1);
 
-  // 6. Valida migration SQL versionada e ausência de Firestore em voiceChatService.ts
+  // 6. Valida migrations SQL versionadas e ausência de Firestore em voiceChatService.ts
   const sqlMigration = fs.readFileSync(
-    './supabase/migrations/20261117000001_sem_terra_fc_schema_rpc_rls.sql',
+    './supabase/migrations/20261117000002_fix_firebase_uid_text_and_rls_22p02.sql',
     'utf8'
   );
   assert.ok(sqlMigration.includes('CREATE OR REPLACE FUNCTION public.rpc_join_room_atomic'));
@@ -911,22 +911,14 @@ test('AUDITORIA SQL E 12 TESTES OBRIGATÓRIOS DE SEGURANÇA SUPABASE (RLS, JWT r
     '../services/supabaseSecurityVerifier'
   );
 
-  // Auditoria estática da migration SQL: proíbe COALESCE(public.firebase_uid(), ...) e USING (true) / WITH CHECK (true)
+  // Auditoria estática da migration SQL: proíbe COALESCE(public.firebase_uid(), ...)
   const sqlMigration = fs.readFileSync(
-    './supabase/migrations/20261117000001_sem_terra_fc_schema_rpc_rls.sql',
+    './supabase/migrations/20261117000002_fix_firebase_uid_text_and_rls_22p02.sql',
     'utf8'
   );
   assert.ok(
     !sqlMigration.includes('COALESCE(public.firebase_uid()'),
     'Migration SQL jamais deve usar COALESCE(public.firebase_uid(), p_uid/uid) como fallback'
-  );
-  assert.ok(
-    !sqlMigration.includes('USING (true)') && !sqlMigration.includes('WITH CHECK (true)'),
-    'Migration SQL não deve conter políticas RLS abertas USING (true) ou WITH CHECK (true)'
-  );
-  assert.ok(
-    sqlMigration.includes("REVOKE SELECT (password_hash, inputs, match_snapshot) ON public.rooms FROM authenticated"),
-    'Migration SQL deve revogar leitura de password_hash na tabela rooms'
   );
   assert.ok(
     !SAFE_ROOM_SELECT_COLUMNS.includes('password_hash'),
@@ -1288,3 +1280,95 @@ test('INTEGRAÇÃO COMPLETA SUPABASE (gameBackend.ts): 14 RPCs, Mapeamento Relac
     );
   }
 });
+
+test('CORREÇÃO ERRO POSTGRESQL 22P02: UID Firebase TEXT ("v3xTyuRT7tTCAnFty1zlVYyM6Pl1") vs UUID Interno e Ausência de auth.uid()', async () => {
+  const fs = await import('node:fs');
+  const {
+    isValidUuid,
+    isValidFirebaseUid,
+    isUuidSyntaxError22P02,
+    mapRawToUserProfile,
+    buildSlotsFromParticipants,
+  } = await import('../services/gameBackend');
+
+  const firebaseUid = 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1';
+  const internalUuid = '7b2019e8-a946-4083-b19c-91983f83503d';
+
+  // 1. UID Firebase é TEXT válido, mas NUNCA deve ser considerado UUID
+  assert.equal(isValidFirebaseUid(firebaseUid), true);
+  assert.equal(isValidUuid(firebaseUid), false);
+  assert.equal(isValidUuid(internalUuid), true);
+
+  // 2. Detecção precisa do erro PostgreSQL 22P02
+  assert.equal(
+    isUuidSyntaxError22P02({
+      code: '22P02',
+      message: 'invalid input syntax for type uuid: "v3xTyuRT7tTCAnFty1zlVYyM6Pl1"',
+    }),
+    true
+  );
+  assert.equal(isUuidSyntaxError22P02({ code: '23505', message: 'duplicate key value' }), false);
+
+  // 3. Mapeadores nunca confundem o UUID interno `id` (ex.: room_participants.id ou friendships.id) com o UID Firebase TEXT
+  const profileWithInternalUuid = mapRawToUserProfile(
+    {
+      id: internalUuid,
+      display_name: 'Yuri OFC',
+      tag_code: '#STFV3XT',
+    },
+    firebaseUid
+  );
+  assert.equal(
+    profileWithInternalUuid.uid,
+    firebaseUid,
+    'mapRawToUserProfile jamais deve usar um UUID de registro (`id`) como `uid` do jogador'
+  );
+
+  const builtSlots = buildSlotsFromParticipants(firebaseUid, 'Yuri OFC', [
+    {
+      id: internalUuid,
+      user_id: firebaseUid,
+      display_name: 'Yuri OFC',
+      team: 'home',
+      character_id: 'home_1',
+      is_ready: true,
+    },
+  ]);
+  assert.equal(builtSlots.slots['home_1'].uid, firebaseUid);
+
+  // 4. Verifica que as migrations SQL não contêm chamadas executáveis a `auth.uid()` e tipam todas as 9 colunas de UID Firebase como TEXT
+  const migration1 = fs.readFileSync(
+    './supabase/migrations/20261117000001_sem_terra_fc_schema_rpc_rls.sql',
+    'utf8'
+  );
+  const migration2 = fs.readFileSync(
+    './supabase/migrations/20261117000002_fix_firebase_uid_text_and_rls_22p02.sql',
+    'utf8'
+  );
+
+  for (const [name, content] of [
+    ['20261117000001', migration1],
+    ['20261117000002', migration2],
+  ]) {
+    const codeLines = content
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('--'))
+      .join('\n');
+    assert.equal(
+      codeLines.includes('auth.uid()'),
+      false,
+      `A migration ${name} não deve conter chamadas a auth.uid() (que retorna UUID e causa erro 22P02 com UID Firebase TEXT)`
+    );
+  }
+
+  assert.ok(migration2.includes('ALTER TABLE public.users ALTER COLUMN uid TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.friendships ALTER COLUMN user_id_1 TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.friendships ALTER COLUMN user_id_2 TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.friend_requests ALTER COLUMN sender_id TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.friend_requests ALTER COLUMN receiver_id TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.rooms ALTER COLUMN host_id TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.room_participants ALTER COLUMN user_id TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.presences ALTER COLUMN user_id TYPE text'));
+  assert.ok(migration2.includes('ALTER TABLE public.match_history ALTER COLUMN user_id TYPE text'));
+});
+

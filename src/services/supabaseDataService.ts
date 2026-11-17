@@ -356,7 +356,8 @@ export async function recordSupabaseMatchFinished(params: {
   myTeam: 'home' | 'away';
 }): Promise<boolean> {
   const client = getSupabaseClient();
-  if (!client || !params.roomCode || !params.uid) return false;
+  const cleanUid = String(params.uid || '').trim();
+  if (!client || !params.roomCode || !cleanUid) return false;
 
   try {
     const normalizedCode = params.roomCode.trim().toUpperCase();
@@ -368,7 +369,11 @@ export async function recordSupabaseMatchFinished(params: {
       .limit(1)
       .maybeSingle();
 
-    if (matchRow?.match_id) {
+    const rawMatchId = (matchRow as Record<string, unknown> | null)?.match_id;
+    const matchUuid = typeof rawMatchId === 'string' ? rawMatchId.trim() : '';
+
+    // `matches.match_id` e `match_history.match_id` são UUID no banco, enquanto `match_history.user_id` é TEXT (UID Firebase)
+    if (matchUuid && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(matchUuid)) {
       await client
         .from('matches')
         .update({
@@ -377,15 +382,15 @@ export async function recordSupabaseMatchFinished(params: {
           away_goals: Math.max(0, Math.floor(params.awayGoals)),
           finished_at: new Date().toISOString(),
         })
-        .eq('match_id', matchRow.match_id);
+        .eq('match_id', matchUuid);
 
       const myGoals = params.myTeam === 'home' ? params.homeGoals : params.awayGoals;
       const oppGoals = params.myTeam === 'home' ? params.awayGoals : params.homeGoals;
       const result = myGoals > oppGoals ? 'win' : myGoals < oppGoals ? 'loss' : 'draw';
 
       await client.from('match_history').insert({
-        match_id: matchRow.match_id,
-        user_id: params.uid,
+        match_id: matchUuid,
+        user_id: cleanUid,
         team: params.myTeam,
         goals: Math.max(0, Math.floor(myGoals)),
         result,

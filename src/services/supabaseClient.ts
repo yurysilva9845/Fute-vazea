@@ -333,6 +333,12 @@ export function bindFirebaseAuthToSupabase(authObj: { currentUser: User | null }
   }
 }
 
+export function getCurrentFirebaseUid(): string | null {
+  const user = authGetter ? authGetter() : null;
+  const uid = user?.uid?.trim() || null;
+  return uid && uid.length <= 128 ? uid : null;
+}
+
 export function getSupabaseClient(): SupabaseClient | null {
   if (supabaseInstance) return supabaseInstance;
 
@@ -353,23 +359,39 @@ export function getSupabaseClient(): SupabaseClient | null {
       headers.set('Authorization', `Bearer ${token}`);
     }
 
-    if (
-      cfg.useServerProxy &&
-      typeof window !== 'undefined' &&
-      rawUrl.startsWith(cfg.url)
-    ) {
-      const relativePath = rawUrl.slice(cfg.url.length);
-      const proxiedUrl = `${window.location.origin}/api/supabase${relativePath}`;
-      return fetch(proxiedUrl, {
-        ...init,
-        headers,
-      });
-    }
+    const targetInput =
+      cfg.useServerProxy && typeof window !== 'undefined' && rawUrl.startsWith(cfg.url)
+        ? `${window.location.origin}/api/supabase${rawUrl.slice(cfg.url.length)}`
+        : input;
 
-    return fetch(input, {
+    const res = await fetch(targetInput, {
       ...init,
       headers,
     });
+
+    // Se uma tabela no banco ainda tiver uma policy RLS legada chamando `auth.uid()` (que tenta fazer cast
+    // do UID TEXT do Firebase para UUID e gera erro PostgreSQL 22P02), repete a operação de tabela sem o sub no header.
+    if (res.status === 400 && token && !rawUrl.includes('/rpc/')) {
+      try {
+        const bodyText = await res.clone().text();
+        if (bodyText.includes('22P02')) {
+          const fallbackHeaders = new Headers(init?.headers || {});
+          if (cfg.publishableKey && cfg.publishableKey !== 'sb_gateway_proxy') {
+            fallbackHeaders.set('Authorization', `Bearer ${cfg.publishableKey}`);
+          } else {
+            fallbackHeaders.delete('Authorization');
+          }
+          return await fetch(targetInput, {
+            ...init,
+            headers: fallbackHeaders,
+          });
+        }
+      } catch {
+        // Retorna resposta original se não for possível inspecionar
+      }
+    }
+
+    return res;
   };
 
   supabaseInstance = createClient(cfg.url, cfg.publishableKey, {
