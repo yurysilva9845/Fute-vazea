@@ -117,7 +117,7 @@ RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_raw text;
@@ -137,7 +137,7 @@ RETURNS text
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_claims jsonb;
@@ -175,7 +175,7 @@ CREATE OR REPLACE FUNCTION public.generate_stf_tag_code(p_seed text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_clean text;

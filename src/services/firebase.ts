@@ -234,7 +234,7 @@ const cachedFriendsByKey = new Map<string, OnlineUserProfile[]>();
 
 let lastPresenceWrite: {
   uid: string;
-  status: string;
+  status: 'online' | 'in_room' | 'in_match' | 'offline';
   roomCode: string;
   timestampMs: number;
 } | null = null;
@@ -647,19 +647,27 @@ export async function updateNickname(newName: string): Promise<void> {
 }
 
 export async function updateUserPresence(
-  status: 'online' | 'in_room' | 'playing' | 'offline',
+  status: 'online' | 'in_room' | 'in_match' | 'offline' | 'playing',
   roomCode: string = ''
 ): Promise<void> {
   const user = auth.currentUser;
   if (!user) return;
 
   const cleanRoom = roomCode.trim().toUpperCase().slice(0, 16);
+  const safeStatus: 'online' | 'in_room' | 'in_match' | 'offline' =
+    status === 'playing' || status === 'in_match'
+      ? 'in_match'
+      : status === 'in_room'
+      ? 'in_room'
+      : status === 'offline'
+      ? 'offline'
+      : 'online';
   const nowMs = Date.now();
 
   if (
     lastPresenceWrite &&
     lastPresenceWrite.uid === user.uid &&
-    lastPresenceWrite.status === status &&
+    lastPresenceWrite.status === safeStatus &&
     lastPresenceWrite.roomCode === cleanRoom &&
     nowMs - lastPresenceWrite.timestampMs < 30_000
   ) {
@@ -668,7 +676,7 @@ export async function updateUserPresence(
 
   lastPresenceWrite = {
     uid: user.uid,
-    status,
+    status: safeStatus,
     roomCode: cleanRoom,
     timestampMs: nowMs,
   };
@@ -676,13 +684,13 @@ export async function updateUserPresence(
   if (cachedMyProfile && cachedMyProfile.uid === user.uid) {
     cachedMyProfile = {
       ...cachedMyProfile,
-      status: status === 'offline' ? 'online' : status,
+      status: safeStatus === 'offline' ? 'online' : safeStatus,
       currentRoomCode: cleanRoom,
       updatedAt: nowMs,
     };
   }
 
-  await updateSupabaseUserPresence(user.uid, status, cleanRoom);
+  await updateSupabaseUserPresence(user.uid, safeStatus, cleanRoom);
 }
 
 // Multiplexador de subscribeToMyProfile (exclusivamente via Supabase)
@@ -1157,7 +1165,7 @@ export async function startOnlineMatch(roomCode: string): Promise<string> {
   const normalizedCode = roomCode.trim().toUpperCase();
 
   const { matchId } = await startSupabaseOnlineMatch(normalizedCode, user.uid);
-  void updateUserPresence('playing', normalizedCode);
+  void updateUserPresence('in_match', normalizedCode);
   return matchId;
 }
 

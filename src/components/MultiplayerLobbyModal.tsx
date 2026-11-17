@@ -282,7 +282,7 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
       setCurrentRoom(room);
       presenceService.startRoomPresence(
         room.roomCode,
-        room.status === 'playing' || room.status === 'starting' ? 'playing' : 'in_room'
+        room.status === 'playing' || room.status === 'starting' ? 'in_match' : 'in_room'
       );
       voiceChatService.joinRoomVoice(room.roomCode, room.slots || {});
       onRoomJoined(room);
@@ -1993,10 +1993,12 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                             <div className="text-xs font-bold text-white flex items-center gap-1.5 truncate">
                               <span
                                 className={`w-2 h-2 rounded-full shrink-0 ${
-                                  f.status === 'playing'
+                                  f.status === 'in_match'
                                     ? 'bg-amber-400'
                                     : f.status === 'in_room'
                                     ? 'bg-emerald-400'
+                                    : f.status === 'offline'
+                                    ? 'bg-stone-500'
                                     : 'bg-emerald-500'
                                 }`}
                               />
@@ -2006,7 +2008,13 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                               </span>
                             </div>
                             <div className="text-[10px] text-stone-400">
-                              {f.currentRoomCode ? `Na sala ${f.currentRoomCode}` : 'Online no menu'}
+                              {f.status === 'in_match'
+                                ? `Em partida${f.currentRoomCode ? ` (${f.currentRoomCode})` : ''}`
+                                : f.currentRoomCode
+                                ? `Na sala ${f.currentRoomCode}`
+                                : f.status === 'offline'
+                                ? 'Offline'
+                                : 'Online no menu'}
                             </div>
                           </div>
 

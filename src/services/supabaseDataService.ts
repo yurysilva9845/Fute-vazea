@@ -2,6 +2,7 @@ import {
   MatchFormatMode,
   MultiplayerRoomState,
   OnlineUserProfile,
+  UserPresenceStatus,
 } from '../types/game';
 import type { ClientInputState, FriendRequestDoc } from './firebase';
 import {
@@ -9,6 +10,7 @@ import {
   getGameBackendState,
   mapRawToUserProfile,
   mapRpcRoomToRoomState,
+  normalizeUserStatus,
   rpcCreateRoomAtomic,
   rpcEnsureUserProfileAtomic,
   rpcGetFriendRequests,
@@ -117,11 +119,14 @@ export async function ensureSupabaseUserProfile(params: {
 
 export async function updateSupabaseUserPresence(
   uid: string,
-  status: 'online' | 'in_room' | 'playing' | 'offline',
+  status: UserPresenceStatus | 'playing',
   roomCode: string
 ): Promise<boolean> {
   const client = getSupabaseClient();
   if (!client || !uid) return false;
+
+  const cleanRoomCode = roomCode ? roomCode.trim().toUpperCase() : '';
+  const safeStatus: UserPresenceStatus = normalizeUserStatus(status, Boolean(cleanRoomCode));
 
   try {
     await client
@@ -129,7 +134,7 @@ export async function updateSupabaseUserPresence(
       .upsert(
         {
           user_id: uid,
-          is_online: status !== 'offline',
+          is_online: safeStatus !== 'offline',
           last_seen: new Date().toISOString(),
         },
         { onConflict: 'user_id' }
@@ -138,8 +143,8 @@ export async function updateSupabaseUserPresence(
     await client
       .from('users')
       .update({
-        status,
-        current_room_code: roomCode || null,
+        status: safeStatus,
+        current_room_code: safeStatus === 'online' || safeStatus === 'offline' ? null : cleanRoomCode || null,
         updated_at: new Date().toISOString(),
       })
       .eq('uid', uid);

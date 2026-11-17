@@ -1370,5 +1370,132 @@ test('CORREÇÃO ERRO POSTGRESQL 22P02: UID Firebase TEXT ("v3xTyuRT7tTCAnFty1zl
   assert.ok(migration2.includes('ALTER TABLE public.room_participants ALTER COLUMN user_id TYPE text'));
   assert.ok(migration2.includes('ALTER TABLE public.presences ALTER COLUMN user_id TYPE text'));
   assert.ok(migration2.includes('ALTER TABLE public.match_history ALTER COLUMN user_id TYPE text'));
+
+  // 5. Verifica validação obrigatória de iss, aud e sub em public.firebase_uid()
+  assert.ok(
+    migration2.includes("v_iss <> 'https://securetoken.google.com/gen-lang-client-0384619138'"),
+    'public.firebase_uid() deve validar iss = https://securetoken.google.com/gen-lang-client-0384619138'
+  );
+  assert.ok(
+    migration2.includes("v_aud <> 'gen-lang-client-0384619138'"),
+    'public.firebase_uid() deve validar aud = gen-lang-client-0384619138'
+  );
+  assert.ok(
+    migration2.includes('v_sub IS NULL OR char_length(v_sub) < 1 OR char_length(v_sub) > 128'),
+    'public.firebase_uid() deve validar que sub não é vazio'
+  );
+
+  // 6. Verifica que nenhuma policy RLS usa USING (true) ou WITH CHECK (true) irrestrito, nem DROP TABLE
+  const migration2CodeOnly = migration2
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n');
+  assert.equal(
+    /USING\s*\(\s*true\s*\)/i.test(migration2CodeOnly),
+    false,
+    'Nenhuma policy RLS deve usar USING (true) irrestrito'
+  );
+  assert.equal(
+    /WITH\s+CHECK\s*\(\s*true\s*\)/i.test(migration2CodeOnly),
+    false,
+    'Nenhuma policy RLS deve usar WITH CHECK (true) irrestrito'
+  );
+  assert.equal(
+    /DROP\s+TABLE/i.test(migration2CodeOnly),
+    false,
+    'A migration jamais deve usar DROP TABLE'
+  );
+
+  // 7. Verifica search_path = pg_catalog, public nas funções SECURITY DEFINER
+  assert.ok(
+    migration2CodeOnly.includes('SET search_path = pg_catalog, public'),
+    'As funções SECURITY DEFINER devem usar SET search_path = pg_catalog, public'
+  );
+  assert.equal(
+    migration2CodeOnly.includes('SET search_path = public'),
+    false,
+    'Nenhuma função deve usar SET search_path = public sem pg_catalog'
+  );
+
+  // 8. Verifica validações em rpc_get_room_lobby e rpc_start_match_atomic e GRANT SELECT em users/presences
+  assert.ok(
+    migration2CodeOnly.includes('Acesso negado: você não é participante nem anfitrião desta sala privada.'),
+    'rpc_get_room_lobby deve bloquear consulta a salas privadas por não-participantes'
+  );
+  assert.ok(
+    migration2CodeOnly.includes("SET status = 'loading', updated_at = now()"),
+    'rpc_start_match_atomic deve atualizar rooms.status para loading'
+  );
+  assert.equal(
+    migration2CodeOnly.includes("SET status = 'starting'"),
+    false,
+    'rpc_start_match_atomic não deve usar status = starting na tabela rooms'
+  );
+  assert.ok(
+    migration2CodeOnly.includes('Todos os participantes devem estar prontos antes de iniciar a partida.'),
+    'rpc_start_match_atomic deve validar se todos os participantes estão prontos'
+  );
+  assert.ok(
+    migration2CodeOnly.includes('GRANT SELECT, INSERT, UPDATE ON TABLE public.users TO anon, authenticated;'),
+    'Deve conceder SELECT em public.users para anon e authenticated'
+  );
+  assert.ok(
+    migration2CodeOnly.includes('GRANT SELECT, INSERT, UPDATE ON TABLE public.presences TO anon, authenticated;'),
+    'Deve conceder SELECT em public.presences para anon e authenticated'
+  );
 });
+
+test('CORREÇÃO CONSTRAINT users_status_check: Apenas online, offline, in_room e in_match em public.users.status (sem "playing")', async () => {
+  const fs = await import('node:fs');
+  const {
+    VALID_SUPABASE_USER_STATUSES,
+    normalizeUserStatus,
+    mapRawToUserProfile,
+  } = await import('../services/gameBackend');
+
+  // 1. Confirma os 4 únicos valores permitidos pela constraint users_status_check
+  assert.deepEqual(VALID_SUPABASE_USER_STATUSES, ['online', 'offline', 'in_room', 'in_match']);
+
+  // 2. normalizeUserStatus converte o valor legado 'playing' para 'in_match' e rejeita valores arbitrários
+  assert.equal(normalizeUserStatus('playing'), 'in_match');
+  assert.equal(normalizeUserStatus('in_match'), 'in_match');
+  assert.equal(normalizeUserStatus('in_room'), 'in_room');
+  assert.equal(normalizeUserStatus('offline'), 'offline');
+  assert.equal(normalizeUserStatus('online'), 'online');
+  assert.equal(normalizeUserStatus('invalid_status_xyz', false), 'online');
+  assert.equal(normalizeUserStatus('invalid_status_xyz', true), 'in_room');
+
+  // 3. mapRawToUserProfile preserva 'in_match' e normaliza 'playing' -> 'in_match'
+  const profileFromPlaying = mapRawToUserProfile({
+    uid: 'v3xTyuRT7tTCAnFty1zlVYyM6Pl1',
+    display_name: 'Yuri',
+    status: 'playing',
+  });
+  assert.equal(profileFromPlaying.status, 'in_match');
+
+  // 4. Verifica que nenhum arquivo do frontend envia 'playing' para updateUserPresence ou startRoomPresence
+  const filesToAudit = [
+    './src/App.tsx',
+    './src/components/MultiplayerLobbyModal.tsx',
+    './src/services/firebase.ts',
+    './src/services/presenceService.ts',
+    './src/services/supabaseDataService.ts',
+    './src/services/gameBackend.ts',
+  ];
+
+  for (const file of filesToAudit) {
+    const content = fs.readFileSync(file, 'utf8');
+    assert.equal(
+      /updateUserPresence\s*\(\s*['"]playing['"]/i.test(content),
+      false,
+      `O arquivo ${file} não deve chamar updateUserPresence('playing')`
+    );
+    assert.equal(
+      /startRoomPresence\s*\([^)]*['"]playing['"]\s*\)/i.test(content),
+      false,
+      `O arquivo ${file} não deve chamar startRoomPresence(..., 'playing')`
+    );
+  }
+});
+
 

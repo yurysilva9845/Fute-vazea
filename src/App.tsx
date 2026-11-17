@@ -206,7 +206,7 @@ export default function App() {
       if (room.status === 'starting') {
         setMultiplayerModalOpen(false);
         setShowMatchLoadingOverlay(true);
-        presenceService.startRoomPresence(room.roomCode, 'playing');
+        presenceService.startRoomPresence(room.roomCode, 'in_match');
         const readyKey = `${room.roomCode}:${room.matchId || 'default'}`;
         const alreadyReady = Boolean(myUid && (room.loadingReadyUids || []).includes(myUid));
         if (!alreadyReady && lastMarkedReadyKeyRef.current !== readyKey) {
@@ -216,7 +216,7 @@ export default function App() {
       } else if (room.status === 'playing') {
         setMultiplayerModalOpen(false);
         setShowMatchLoadingOverlay(false);
-        presenceService.startRoomPresence(room.roomCode, 'playing');
+        presenceService.startRoomPresence(room.roomCode, 'in_match');
         if (
           screenStateRef.current !== 'playing' &&
           screenStateRef.current !== 'paused' &&
@@ -512,7 +512,7 @@ export default function App() {
       setActiveRoomCode(room.roomCode);
       setMultiplayerModalOpen(false);
       setShowMatchLoadingOverlay(true);
-      presenceService.startRoomPresence(room.roomCode, 'playing');
+      presenceService.startRoomPresence(room.roomCode, 'in_match');
       markPlayerMatchLoadingReady(room.roomCode).catch(() => {});
     },
     []

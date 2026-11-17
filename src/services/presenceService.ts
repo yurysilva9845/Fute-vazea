@@ -7,17 +7,23 @@ import { leaveOnlineRoom, sendRoomHeartbeat, updateUserPresence } from './fireba
  */
 class PresenceManager {
   private activeRoomCode: string | null = null;
-  private activeStatus: 'in_room' | 'playing' | null = null;
+  private activeStatus: 'in_room' | 'in_match' | null = null;
   private heartbeatTimer: number | null = null;
   private listenersBound = false;
 
-  public startRoomPresence(roomCode: string, status: 'in_room' | 'playing' = 'in_room') {
+  public startRoomPresence(
+    roomCode: string,
+    rawStatus: 'in_room' | 'in_match' | 'playing' = 'in_room'
+  ) {
     const normalized = roomCode.trim().toUpperCase();
     if (!normalized) return;
 
+    const status: 'in_room' | 'in_match' =
+      rawStatus === 'playing' || rawStatus === 'in_match' ? 'in_match' : 'in_room';
+
     this.bindUnloadListeners();
 
-    // Evita loop infinito: se já estamos monitorando a mesma sala com o mesmo status, não reescreve no Firestore!
+    // Evita loop infinito: se já estamos monitorando a mesma sala com o mesmo status, não reescreve no banco!
     if (
       this.activeRoomCode === normalized &&
       this.activeStatus === status &&

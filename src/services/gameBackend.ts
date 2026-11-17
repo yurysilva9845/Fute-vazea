@@ -5,6 +5,7 @@ import {
   MultiplayerSlot,
   OnlineUserProfile,
   RoomVisibility,
+  UserPresenceStatus,
 } from '../types/game';
 import {
   ALL_CHARACTERS,
@@ -39,6 +40,38 @@ export function isValidFirebaseUid(value: unknown): boolean {
   if (typeof value !== 'string') return false;
   const clean = value.trim();
   return clean.length >= 1 && clean.length <= 128;
+}
+
+export const VALID_SUPABASE_USER_STATUSES: readonly UserPresenceStatus[] = [
+  'online',
+  'offline',
+  'in_room',
+  'in_match',
+] as const;
+
+/**
+ * Normaliza qualquer status de presença para os 4 valores permitidos pela constraint
+ * `users_status_check` da tabela `public.users`: `'online' | 'offline' | 'in_room' | 'in_match'`.
+ * Converte automaticamente `'playing'` -> `'in_match'`.
+ */
+export function normalizeUserStatus(
+  rawStatus: unknown,
+  hasActiveRoom = false
+): UserPresenceStatus {
+  const clean = typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : '';
+  if (clean === 'in_match' || clean === 'playing') {
+    return 'in_match';
+  }
+  if (clean === 'in_room') {
+    return 'in_room';
+  }
+  if (clean === 'offline') {
+    return 'offline';
+  }
+  if (clean === 'online') {
+    return hasActiveRoom ? 'in_room' : 'online';
+  }
+  return hasActiveRoom ? 'in_room' : 'online';
 }
 
 /**
@@ -363,13 +396,9 @@ export function mapRawToUserProfile(
     nestedUser.current_room_code || nestedUser.currentRoomCode || nestedUser.room_code || ''
   ).trim();
 
-  let status: 'online' | 'in_room' | 'playing' = 'online';
-  if (rawStatus === 'playing' || rawStatus === 'in_match') {
-    status = 'playing';
-  } else if (rawStatus === 'in_room' || currentRoomCode) {
-    status = 'in_room';
-  } else if (isOnlineBool) {
-    status = 'online';
+  let status: UserPresenceStatus = normalizeUserStatus(rawStatus, Boolean(currentRoomCode));
+  if (status === 'offline' && isOnlineBool) {
+    status = currentRoomCode ? 'in_room' : 'online';
   }
 
   const createdMs =
@@ -925,11 +954,17 @@ export async function rpcEnsureUserProfileAtomic(params: {
       const existingObj = existingRow as Record<string, unknown>;
       const updatedName =
         params.displayName?.trim() ? cleanName : String(existingObj.display_name || cleanName);
+      const normalizedExistingStatus = normalizeUserStatus(
+        existingObj.status,
+        Boolean(existingObj.current_room_code)
+      );
+      const nextSafeStatus: UserPresenceStatus =
+        normalizedExistingStatus === 'offline' ? 'online' : normalizedExistingStatus;
       const { data: updatedRow } = await client
         .from('users')
         .update({
           display_name: updatedName,
-          status: existingObj.status === 'offline' ? 'online' : existingObj.status || 'online',
+          status: nextSafeStatus,
           updated_at: new Date().toISOString(),
         })
         .eq('uid', cleanUid)
@@ -1115,11 +1150,7 @@ export async function rpcGetRoomLobby(
   const hasHumanInSlots = Object.values(roomState.slots || {}).some(
     (s) => !s.isBot && Boolean(s.uid)
   );
-  if (
-    client &&
-    (!hasHumanInSlots ||
-      Object.values(roomState.slots || {}).filter((s) => !s.isBot).length <= 1)
-  ) {
+  if (client && !hasHumanInSlots) {
     try {
       const { data: partRows } = await client
         .from('room_participants')
@@ -1575,7 +1606,7 @@ export async function rpcStartMatchAtomic(roomCode: string): Promise<{
         .from('matches')
         .insert({
           room_code: normalizedCode,
-          status: 'starting',
+          status: 'playing',
           home_goals: 0,
           away_goals: 0,
           started_at: new Date().toISOString(),
@@ -1589,7 +1620,7 @@ export async function rpcStartMatchAtomic(roomCode: string): Promise<{
 
       await client
         .from('rooms')
-        .update({ status: 'starting', updated_at: new Date().toISOString() })
+        .update({ status: 'loading', updated_at: new Date().toISOString() })
         .eq('room_code', normalizedCode);
     }
   }
@@ -2323,7 +2354,8 @@ export function subscribeToMyProfileRealtime(
 }
 
 /**
- * Acompanha jogadores online em `public.users` + `public.presences`.
+ * Acompanha jogadores online respeitando a política RLS restrita de `public.users`
+ * (leitura direta apenas do próprio perfil + amigos via `rpc_get_my_friends` + salas públicas via `rpc_get_public_lobby`).
  */
 export function subscribeToOnlinePlayersRealtime(
   cb: (players: OnlineUserProfile[]) => void
@@ -2338,13 +2370,62 @@ export function subscribeToOnlinePlayersRealtime(
   const fetchOnlinePlayers = async () => {
     if (!active) return;
     try {
-      const { data } = await client
-        .from('users')
-        .select('*')
-        .order('updated_at', { ascending: false })
-        .limit(20);
-      if (!active || !data) return;
-      cb(data.map((r) => mapRawToUserProfile(r as Record<string, unknown>)));
+      const mergedByUid = new Map<string, OnlineUserProfile>();
+      const currentUid = getCurrentFirebaseUid();
+
+      if (currentUid) {
+        const { data: ownRow } = await client
+          .from('users')
+          .select('*')
+          .eq('uid', currentUid)
+          .maybeSingle();
+        if (ownRow) {
+          const ownProfile = mapRawToUserProfile(ownRow as Record<string, unknown>, currentUid);
+          if (ownProfile.uid) {
+            mergedByUid.set(ownProfile.uid, ownProfile);
+          }
+        }
+      }
+
+      const [friendsRes, lobbyRes] = await Promise.allSettled([
+        rpcGetMyFriends(),
+        rpcGetPublicLobby(),
+      ]);
+
+      if (friendsRes.status === 'fulfilled') {
+        for (const f of friendsRes.value) {
+          if (f.uid) {
+            mergedByUid.set(f.uid, f);
+          }
+        }
+      }
+
+      if (lobbyRes.status === 'fulfilled') {
+        for (const room of lobbyRes.value) {
+          for (const slot of Object.values(room.slots || {})) {
+            if (slot && !slot.isBot && slot.uid && !mergedByUid.has(slot.uid)) {
+              mergedByUid.set(slot.uid, {
+                uid: slot.uid,
+                displayName: slot.displayName || 'Jogador',
+                tagCode: generateFallbackTagCode(slot.uid),
+                status: room.status === 'playing' ? 'in_match' : 'in_room',
+                currentRoomCode: room.roomCode,
+                wins: 0,
+                losses: 0,
+                draws: 0,
+                goalsScored: 0,
+                goalsConceded: 0,
+                matchesPlayed: 0,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+              });
+            }
+          }
+        }
+      }
+
+      if (!active) return;
+      cb(Array.from(mergedByUid.values()));
     } catch {
       // Ignora erro transitório se RLS restringir listagem geral de users
     }
@@ -2359,7 +2440,14 @@ export function subscribeToOnlinePlayersRealtime(
       .channel(channelName)
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'users' },
+        { event: '*', schema: 'public', table: 'rooms' },
+        () => {
+          if (active) void fetchOnlinePlayers();
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'friendships' },
         () => {
           if (active) void fetchOnlinePlayers();
         }

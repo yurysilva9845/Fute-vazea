@@ -311,11 +311,13 @@ export interface NetworkSyncSnapshot {
   }>;
 }
 
+export type UserPresenceStatus = 'online' | 'offline' | 'in_room' | 'in_match';
+
 export interface OnlineUserProfile {
   uid: string;
   displayName: string;
   tagCode: string;
-  status: 'online' | 'in_room' | 'playing';
+  status: UserPresenceStatus;
   currentRoomCode: string;
   wins?: number;
   losses?: number;

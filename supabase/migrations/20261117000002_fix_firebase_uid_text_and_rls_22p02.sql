@@ -1,45 +1,35 @@
 -- ============================================================================
--- SEM TERRA FC — CORREÇÃO DEFINITIVA DO ERRO POSTGRESQL 22P02 (FIREBASE UID TEXT vs UUID)
+-- SEM TERRA FC — MIGRATION CORRETIVA FINAL (FIREBASE UID TEXT, RLS, RPCs E REALTIME)
 -- Projeto Supabase: https://etlvzqrfsvvpzltimxaj.supabase.co
 -- Projeto Firebase Auth: gen-lang-client-0384619138
 --
--- CAUSA RAIZ DO ERRO `22P02: invalid input syntax for type uuid: "v3xTyuRT7tTCAnFty1zlVYyM6Pl1"`:
--- 1. A função nativa `auth.uid()` do Supabase retorna o tipo `uuid`
---    (`CAST(current_setting('request.jwt.claims', true)::jsonb ->> 'sub' AS uuid)`).
---    Mesmo quando uma policy RLS ou função RPC escreve `auth.uid()::text`, o PostgreSQL
---    avalia `auth.uid()` PRIMEIRO, tentando converter o claim `sub` do Firebase Auth
---    (ex.: "v3xTyuRT7tTCAnFty1zlVYyM6Pl1", string de até 128 caracteres) para `uuid`
---    antes do cast para `text`, disparando imediatamente o erro 22P02.
--- 2. Variáveis locais ou parâmetros declarados como `uuid` em funções PL/pgSQL ou defaults
---    `DEFAULT auth.uid()` nas colunas de UID também disparam 22P02 ao receberem o UID Firebase.
---
--- O QUE ESTA MIGRATION FAZ (SEM APAGAR DADOS, SEM DROP TABLE E SEM REMOVER FKs DESNECESSARIAMENTE):
--- 1. Em `public.firebase_uid()`, valida obrigatoriamente:
---    - `iss = 'https://securetoken.google.com/gen-lang-client-0384619138'`
---    - `aud = 'gen-lang-client-0384619138'`
---    - `sub` não vazio (1 a 128 caracteres).
---    - Nunca utiliza `auth.uid()` nem converte Firebase UID para `UUID`.
--- 2. Verifica individualmente a existência de cada tabela, coluna e constraint antes de alterar:
---    - Garante que as 9 colunas de UID Firebase sejam `TEXT` (nunca `UUID`):
---      * public.users.uid (TEXT PK)
---      * public.friendships.user_id_1 e user_id_2 (TEXT FK -> users.uid)
---      * public.friend_requests.sender_id e receiver_id (TEXT FK -> users.uid)
---      * public.rooms.host_id (TEXT FK -> users.uid)
---      * public.room_participants.user_id (TEXT FK -> users.uid)
---      * public.presences.user_id (TEXT PK, FK -> users.uid)
---      * public.match_history.user_id (TEXT FK -> users.uid)
---    - Só remove/recria uma FK específica se aquela coluna específica não for `TEXT`.
--- 3. Preserva todos os UUIDs internos de registros:
---    - public.friendships.id (UUID)
---    - public.friend_requests.id (UUID)
---    - public.room_participants.id (UUID)
---    - public.matches.match_id (UUID)
---    - public.match_history.id e match_history.match_id (UUID)
--- 4. Aplica políticas RLS de privilégio mínimo (sem `USING (true)` irrestrito):
---    - Leitura direta de `users` e `presences` restrita ao próprio usuário autenticado;
---      demais leituras ocorrem de forma controlada pelas 14 RPCs `SECURITY DEFINER`.
---    - Respeita os status permitidos na constraint CHECK de `public.rooms`:
---      `'waiting'`, `'loading'`, `'playing'`, `'finished'` (sem usar `'starting'` na tabela `rooms`).
+-- RESUMO TÉCNICO:
+-- 1. Identidade Firebase (`public.firebase_jwt_claims()` e `public.firebase_uid()`):
+--    - Valida obrigatoriamente:
+--      * iss = 'https://securetoken.google.com/gen-lang-client-0384619138'
+--      * aud = 'gen-lang-client-0384619138'
+--      * sub não vazio (1..128 caracteres, TEXT).
+--    - Jamais utiliza `auth.uid()` nem converte UID Firebase para `UUID` (elimina o erro 22P02).
+-- 2. Segurança de Funções (`SECURITY DEFINER`):
+--    - Todas as funções `SECURITY DEFINER` utilizam `SET search_path = pg_catalog, public`.
+-- 3. Proteção de Salas e Partidas nas RPCs:
+--    - `rpc_get_room_lobby(p_room_code)`: exige que o usuário autenticado seja participante
+--      ou anfitrião da sala, ou que a sala seja pública e ativa (`status IN ('waiting', 'loading', 'playing')`).
+--      Bloqueia consulta a salas privadas por usuários que não pertencem à sala.
+--    - `rpc_start_match_atomic(p_room_code)`: valida que a sala existe, está em `status = 'waiting'`,
+--      o chamador é o anfitrião (`host_id`), há quantidade mínima de jogadores (>= 1 participante),
+--      todos os participantes estão prontos (`is_ready = true`) e não há partida ativa em andamento
+--      para aquela sala. Atualiza `rooms.status = 'loading'` (nunca `'starting'`).
+-- 4. Permissões SQL, RLS e Supabase Realtime:
+--    - `GRANT SELECT` (e `INSERT, UPDATE` apenas do próprio registro via RLS) em `public.users`
+--      e `public.presences` para `anon, authenticated`, com RLS restrita exclusivamente ao próprio
+--      usuário (`uid = public.firebase_uid()` / `user_id = public.firebase_uid()`).
+--    - Sem leitura irrestrita (`USING (true)`) em nenhuma tabela.
+--    - Permissões mínimas para funcionamento das assinaturas Supabase Realtime e RPCs `SECURITY DEFINER`.
+-- 5. Preservação Total de Estrutura e Dados:
+--    - Verifica a existência de cada tabela, coluna e constraint antes de alterar.
+--    - Não usa `DROP TABLE`, não apaga dados e não remove FKs desnecessariamente.
+--    - Preserva IDs internos `UUID` e UIDs Firebase `TEXT`.
 -- ============================================================================
 
 BEGIN;
@@ -54,7 +44,7 @@ RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_raw text;
@@ -74,7 +64,7 @@ RETURNS text
 LANGUAGE plpgsql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_claims jsonb;
@@ -116,7 +106,7 @@ CREATE OR REPLACE FUNCTION public.generate_stf_tag_code(p_seed text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_clean text;
@@ -401,7 +391,7 @@ RETURNS boolean
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
   SELECT CASE
     WHEN public.firebase_uid() IS NULL OR p_room_code IS NULL THEN false
@@ -425,7 +415,7 @@ RETURNS boolean
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
   SELECT CASE
     WHEN public.firebase_uid() IS NULL OR p_room_code IS NULL THEN false
@@ -713,7 +703,7 @@ $$;
 
 -- ============================================================================
 -- 6. RECRIAÇÃO DAS 14 RPCs SEM NENHUM CAST ::uuid PARA FIREBASE UID
---    E COMPATÍVEIS COM OS STATUS PERMITIDOS ('waiting', 'loading', 'playing', 'finished')
+--    E COM SET search_path = pg_catalog, public
 -- ============================================================================
 
 DROP FUNCTION IF EXISTS public.rpc_ensure_user_profile_atomic(text);
@@ -738,7 +728,7 @@ CREATE OR REPLACE FUNCTION public.rpc_ensure_user_profile_atomic(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -815,13 +805,15 @@ END;
 $$;
 
 -- 6.2. rpc_get_room_lobby(p_room_code text)
+-- Exige que o usuário seja participante ou anfitrião da sala, ou que a sala seja pública e ativa.
+-- Impede que qualquer usuário autenticado consulte salas privadas apenas conhecendo o código.
 CREATE OR REPLACE FUNCTION public.rpc_get_room_lobby(
   p_room_code text
 )
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -847,6 +839,22 @@ BEGIN
 
   IF NOT FOUND THEN
     RETURN NULL;
+  END IF;
+
+  -- Validação de autorização de leitura do lobby da sala:
+  -- 1. Salas públicas ativas ('waiting', 'loading', 'playing') podem ser consultadas conforme a regra de acesso do lobby;
+  -- 2. Salas privadas (ou encerradas) exigem que o usuário seja o anfitrião (host_id) ou participante registrado em room_participants.
+  IF NOT (
+    (v_room.visibility = 'public' AND v_room.status IN ('waiting', 'loading', 'playing'))
+    OR v_room.host_id = v_uid
+    OR EXISTS (
+      SELECT 1
+      FROM public.room_participants rp
+      WHERE rp.room_code = v_code
+        AND rp.user_id = v_uid
+    )
+  ) THEN
+    RAISE EXCEPTION 'Acesso negado: você não é participante nem anfitrião desta sala privada.' USING ERRCODE = '42501';
   END IF;
 
   SELECT u.display_name INTO v_host_name
@@ -905,7 +913,7 @@ CREATE OR REPLACE FUNCTION public.rpc_get_public_lobby()
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -946,7 +954,7 @@ CREATE OR REPLACE FUNCTION public.rpc_create_room_atomic(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1043,7 +1051,7 @@ CREATE OR REPLACE FUNCTION public.rpc_join_room_atomic(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1170,7 +1178,7 @@ CREATE OR REPLACE FUNCTION public.rpc_leave_room_atomic(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1232,7 +1240,7 @@ CREATE OR REPLACE FUNCTION public.rpc_select_character_atomic(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1250,6 +1258,13 @@ BEGIN
 
   IF v_code = '' OR v_char = '' THEN
     RAISE EXCEPTION 'Sala e personagem são obrigatórios.';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.room_participants
+    WHERE room_code = v_code AND user_id = v_uid
+  ) THEN
+    RAISE EXCEPTION 'Você não é participante da sala %.', v_code USING ERRCODE = '42501';
   END IF;
 
   v_char := CASE v_char
@@ -1293,7 +1308,7 @@ CREATE OR REPLACE FUNCTION public.rpc_toggle_ready_atomic(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1305,6 +1320,14 @@ BEGIN
   END IF;
 
   v_code := upper(btrim(COALESCE(p_room_code, '')));
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.room_participants
+    WHERE room_code = v_code AND user_id = v_uid
+  ) THEN
+    RAISE EXCEPTION 'Você não é participante da sala %.', v_code USING ERRCODE = '42501';
+  END IF;
+
   UPDATE public.room_participants
   SET is_ready = COALESCE(p_is_ready, true)
   WHERE room_code = v_code AND user_id = v_uid;
@@ -1316,20 +1339,27 @@ END;
 $$;
 
 -- 6.9. rpc_start_match_atomic(p_room_code text)
--- Importante: Atualiza `public.rooms.status` para `'loading'` (compatível com o CHECK constraint
--- `'waiting', 'loading', 'playing', 'finished'`), nunca `'starting'`.
+-- Valida obrigatoriamente:
+-- 1. A sala existe e está com status = 'waiting';
+-- 2. O usuário autenticado é o anfitrião (host_id);
+-- 3. Existe quantidade mínima de jogadores na sala (>= 1 participante);
+-- 4. Todos os participantes estão prontos (is_ready = true);
+-- 5. Não existe partida já iniciada/ativa para aquela sala;
+-- 6. Mantém rooms.status = 'loading' (sem utilizar 'starting').
 CREATE OR REPLACE FUNCTION public.rpc_start_match_atomic(
   p_room_code text
 )
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
   v_code text;
   v_room public.rooms%ROWTYPE;
+  v_participant_count int;
+  v_unready_count int;
   v_match_id uuid;
 BEGIN
   v_uid := public.firebase_uid();
@@ -1338,6 +1368,11 @@ BEGIN
   END IF;
 
   v_code := upper(btrim(COALESCE(p_room_code, '')));
+  IF v_code = '' THEN
+    RAISE EXCEPTION 'Código da sala inválido para iniciar partida.';
+  END IF;
+
+  -- 1. Verifica se a sala existe (com bloqueio pessimista FOR UPDATE)
   SELECT * INTO v_room
   FROM public.rooms
   WHERE room_code = v_code
@@ -1347,10 +1382,44 @@ BEGIN
     RAISE EXCEPTION 'Sala % não encontrada.', v_code;
   END IF;
 
+  -- 2. Verifica se o usuário autenticado é o anfitrião da sala
   IF v_room.host_id <> v_uid THEN
-    RAISE EXCEPTION 'Apenas o anfitrião da sala pode iniciar a partida.';
+    RAISE EXCEPTION 'Apenas o anfitrião da sala pode iniciar a partida.' USING ERRCODE = '42501';
   END IF;
 
+  -- 3. Verifica se a sala está com status = 'waiting'
+  IF v_room.status <> 'waiting' THEN
+    RAISE EXCEPTION 'A partida da sala % não pode ser iniciada porque o status atual é % (esperado: waiting).', v_code, v_room.status;
+  END IF;
+
+  -- 4. Verifica se já não existe partida ativa para esta sala
+  IF EXISTS (
+    SELECT 1
+    FROM public.matches m
+    WHERE m.room_code = v_code
+      AND m.status IN ('waiting', 'loading', 'playing')
+      AND m.finished_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Já existe uma partida iniciada para a sala %.', v_code;
+  END IF;
+
+  -- 5. Verifica quantidade mínima de jogadores e se todos os participantes estão prontos
+  SELECT
+    count(*),
+    count(*) FILTER (WHERE NOT COALESCE(is_ready, false))
+  INTO v_participant_count, v_unready_count
+  FROM public.room_participants
+  WHERE room_code = v_code;
+
+  IF v_participant_count < 1 THEN
+    RAISE EXCEPTION 'Quantidade mínima de jogadores não atingida na sala %.', v_code;
+  END IF;
+
+  IF v_unready_count > 0 THEN
+    RAISE EXCEPTION 'Todos os participantes devem estar prontos antes de iniciar a partida.';
+  END IF;
+
+  -- 6. Cria o registro da partida e atualiza rooms.status para 'loading' (compatível com CHECK constraint)
   INSERT INTO public.matches (
     room_code,
     status,
@@ -1391,7 +1460,7 @@ CREATE OR REPLACE FUNCTION public.rpc_send_friend_request(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1477,7 +1546,7 @@ CREATE OR REPLACE FUNCTION public.rpc_respond_friend_request(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1500,7 +1569,7 @@ BEGIN
   END IF;
 
   IF v_req.receiver_id <> v_uid THEN
-    RAISE EXCEPTION 'Apenas o destinatário pode responder a esta solicitação.';
+    RAISE EXCEPTION 'Apenas o destinatário pode responder a esta solicitação.' USING ERRCODE = '42501';
   END IF;
 
   IF COALESCE(p_accept, false) THEN
@@ -1540,7 +1609,7 @@ CREATE OR REPLACE FUNCTION public.rpc_remove_friend(
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1577,7 +1646,7 @@ CREATE OR REPLACE FUNCTION public.rpc_get_my_friends()
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1622,7 +1691,7 @@ CREATE OR REPLACE FUNCTION public.rpc_get_friend_requests()
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
   v_uid text;
@@ -1659,8 +1728,82 @@ END;
 $$;
 
 -- ============================================================================
--- 7. PERMISSÕES DE EXECUÇÃO DAS FUNÇÕES E RPCs
+-- 7. PERMISSÕES SQL DE TABELAS, FUNÇÕES E SUPABASE REALTIME
+--    - Concede SELECT em users e presences para anon e authenticated (protegidos por RLS ao próprio usuário).
+--    - Concede apenas os privilégios mínimos necessários nas demais tabelas para Realtime e operações legítimas,
+--      sem leitura irrestrita (todas protegidas por RLS).
 -- ============================================================================
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+
+DO $$
+BEGIN
+  -- 7.1. public.users e public.presences: SELECT (e atualização da própria presença/perfil via RLS)
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'users') THEN
+    REVOKE ALL ON TABLE public.users FROM PUBLIC, anon, authenticated;
+    GRANT SELECT, INSERT, UPDATE ON TABLE public.users TO anon, authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'presences') THEN
+    REVOKE ALL ON TABLE public.presences FROM PUBLIC, anon, authenticated;
+    GRANT SELECT, INSERT, UPDATE ON TABLE public.presences TO anon, authenticated;
+  END IF;
+
+  -- 7.2. Demais tabelas: privilégios mínimos necessários para Realtime (postgres_changes exige SELECT sob RLS)
+  --      e para marcação de carregamento / encerramento de partida, sempre filtrados pelas policies RLS restritas.
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'friendships') THEN
+    REVOKE ALL ON TABLE public.friendships FROM PUBLIC, anon, authenticated;
+    GRANT SELECT ON TABLE public.friendships TO anon, authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'friend_requests') THEN
+    REVOKE ALL ON TABLE public.friend_requests FROM PUBLIC, anon, authenticated;
+    GRANT SELECT ON TABLE public.friend_requests TO anon, authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'rooms') THEN
+    REVOKE ALL ON TABLE public.rooms FROM PUBLIC, anon, authenticated;
+    GRANT SELECT, UPDATE ON TABLE public.rooms TO anon, authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'room_participants') THEN
+    REVOKE ALL ON TABLE public.room_participants FROM PUBLIC, anon, authenticated;
+    GRANT SELECT, UPDATE ON TABLE public.room_participants TO anon, authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'matches') THEN
+    REVOKE ALL ON TABLE public.matches FROM PUBLIC, anon, authenticated;
+    GRANT SELECT, UPDATE ON TABLE public.matches TO anon, authenticated;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'match_history') THEN
+    REVOKE ALL ON TABLE public.match_history FROM PUBLIC, anon, authenticated;
+    GRANT SELECT, INSERT ON TABLE public.match_history TO anon, authenticated;
+  END IF;
+END;
+$$;
+
+-- 7.3. Garante que as tabelas monitoradas via Supabase Realtime (postgres_changes) estejam na publicação supabase_realtime
+DO $$
+DECLARE
+  v_table text;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+    FOREACH v_table IN ARRAY ARRAY['users', 'presences', 'friendships', 'friend_requests', 'rooms', 'room_participants', 'matches'] LOOP
+      IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = v_table
+      ) AND NOT EXISTS (
+        SELECT 1 FROM pg_publication_tables
+        WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = v_table
+      ) THEN
+        EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I', v_table);
+      END IF;
+    END LOOP;
+  END IF;
+END;
+$$;
+
+-- 7.4. Permissões de execução nas funções auxiliares e nas 14 RPCs
 GRANT EXECUTE ON FUNCTION public.firebase_jwt_claims() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.firebase_uid() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.generate_stf_tag_code(text) TO anon, authenticated;
