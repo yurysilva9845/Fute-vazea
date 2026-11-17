@@ -6,6 +6,7 @@ import {
 } from '../types/game';
 import type { ClientInputState, FriendRequestDoc } from './firebase';
 import {
+  broadcastRoomSyncEvent,
   clearGameBackendError,
   getGameBackendState,
   mapRawToUserProfile,

@@ -2016,14 +2016,36 @@ export function subscribeToRoomLobbyRealtime(
 
   let active = true;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastKnownRoom: (MultiplayerRoomState & { inputs?: Record<string, ClientInputState> }) | null =
+    null;
+  let broadcastedMatchId = '';
+  let broadcastedStatus: 'starting' | 'playing' | null = null;
 
   const refreshRoom = async () => {
     if (!active) return;
     try {
       const room = await rpcGetRoomLobby(normalizedCode);
-      if (active) {
-        cb(room);
+      if (!active) return;
+      if (!room) {
+        cb(null);
+        return;
       }
+
+      const mergedMatchId =
+        (room.matchId && !room.matchId.startsWith('MTC-') ? room.matchId : '') ||
+        broadcastedMatchId ||
+        room.matchId;
+
+      const mergedStatus =
+        room.status === 'waiting' && broadcastedStatus ? broadcastedStatus : room.status;
+
+      const mergedRoom: MultiplayerRoomState & { inputs?: Record<string, ClientInputState> } = {
+        ...room,
+        matchId: mergedMatchId || undefined,
+        status: mergedStatus,
+      };
+      lastKnownRoom = mergedRoom;
+      cb(mergedRoom);
     } catch {
       // Evita derrubar a sala ativa em caso de oscilação momentânea de rede
     }
@@ -2034,13 +2056,15 @@ export function subscribeToRoomLobbyRealtime(
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       void refreshRoom();
-    }, 180);
+    }, 120);
   };
 
   void refreshRoom();
 
   const channelName = `stf_room_${normalizedCode}_${Math.random().toString(36).slice(2, 8)}`;
   let channel: RealtimeChannel | null = null;
+  let syncBroadcastChannel: RealtimeChannel | null = null;
+
   try {
     channel = client
       .channel(channelName)
@@ -2086,12 +2110,70 @@ export function subscribeToRoomLobbyRealtime(
     channel = null;
   }
 
-  // Sincronização de segurança (3.5s) para propagar prontidão, escolha de personagem e início da partida
+  try {
+    syncBroadcastChannel = client
+      .channel(`stf_room_sync_${normalizedCode}`, {
+        config: {
+          broadcast: { self: false },
+        },
+      })
+      .on('broadcast', { event: 'match_started' }, (event) => {
+        if (!active) return;
+        const p = (event?.payload || {}) as Record<string, unknown>;
+        const incomingMatchId = typeof p.matchId === 'string' ? p.matchId.trim() : '';
+        if (incomingMatchId) {
+          broadcastedMatchId = incomingMatchId;
+        }
+        broadcastedStatus = p.status === 'playing' ? 'playing' : 'starting';
+
+        if (lastKnownRoom) {
+          const immediateRoom: MultiplayerRoomState & { inputs?: Record<string, ClientInputState> } =
+            {
+              ...lastKnownRoom,
+              matchId: broadcastedMatchId || lastKnownRoom.matchId,
+              status: broadcastedStatus,
+            };
+          lastKnownRoom = immediateRoom;
+          cb(immediateRoom);
+        }
+        void refreshRoom();
+      })
+      .on('broadcast', { event: 'match_playing' }, (event) => {
+        if (!active) return;
+        const p = (event?.payload || {}) as Record<string, unknown>;
+        const incomingMatchId = typeof p.matchId === 'string' ? p.matchId.trim() : '';
+        if (incomingMatchId) {
+          broadcastedMatchId = incomingMatchId;
+        }
+        broadcastedStatus = 'playing';
+
+        if (lastKnownRoom) {
+          const immediateRoom: MultiplayerRoomState & { inputs?: Record<string, ClientInputState> } =
+            {
+              ...lastKnownRoom,
+              matchId: broadcastedMatchId || lastKnownRoom.matchId,
+              status: 'playing',
+            };
+          lastKnownRoom = immediateRoom;
+          cb(immediateRoom);
+        }
+        void refreshRoom();
+      })
+      .on('broadcast', { event: 'room_updated' }, () => {
+        if (!active) return;
+        scheduleRefresh();
+      })
+      .subscribe();
+  } catch {
+    syncBroadcastChannel = null;
+  }
+
+  // Sincronização rápida (1.5s) para propagar prontidão, escolha de personagem e início da partida
   const pollTimer = setInterval(() => {
     if (!active) return;
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     void refreshRoom();
-  }, 3500);
+  }, 1500);
 
   return () => {
     active = false;
@@ -2099,6 +2181,9 @@ export function subscribeToRoomLobbyRealtime(
     clearInterval(pollTimer);
     if (channel) {
       void client.removeChannel(channel);
+    }
+    if (syncBroadcastChannel) {
+      void client.removeChannel(syncBroadcastChannel);
     }
   };
 }

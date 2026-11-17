@@ -117,12 +117,47 @@ function broadcastToRoom(roomCode: string, payload: unknown): void {
   }
 }
 
+function isAllowedCorsOrigin(originHeader: string | undefined): string | null {
+  if (!originHeader) return null;
+  const cleanOrigin = originHeader.trim();
+  if (!cleanOrigin) return null;
+
+  const extraAllowed = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (extraAllowed.includes(cleanOrigin)) {
+    return cleanOrigin;
+  }
+
+  try {
+    const parsed = new URL(cleanOrigin);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.vercel.app') ||
+      host.endsWith('.run.app')
+    ) {
+      return cleanOrigin;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
 async function startServer() {
   const app = express();
 
-  // CORS para permitir conexões de clientes hospedados na Vercel (fute-vazea.vercel.app) ou outros domínios
+  // CORS com validação explícita de origem (sem utilizar Access-Control-Allow-Origin: *)
   app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const allowedOrigin = isAllowedCorsOrigin(req.headers.origin);
+    if (allowedOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
@@ -435,7 +470,7 @@ async function startServer() {
           const uid = String(msg.uid || '').trim().slice(0, 128);
           const displayName = String(msg.displayName || 'Jogador').trim().slice(0, 28);
           const slotId = String(msg.slotId || 'home_1').trim().slice(0, 24);
-          const matchId = String(msg.matchId || `MTC-${roomCode}`).trim().slice(0, 32);
+          const matchId = String(msg.matchId || `MTC-${roomCode}`).trim().slice(0, 48);
           if (!roomCode || !uid) return;
 
           // Cancel pending disconnect-to-bot timer if player reconnected within grace window
@@ -482,6 +517,26 @@ async function startServer() {
               ? (msg.activeCharacterIds as string[])
               : undefined,
           });
+
+          // Se a sessão existia com fallback MTC-* e o cliente trouxe o match_id oficial de public.matches, sincroniza
+          if (matchId && !matchId.startsWith('MTC-') && session.matchId !== matchId) {
+            session.matchId = matchId;
+          }
+          // Sincroniza slots humanos da sala recebidos no join_match
+          if (msg.slots && typeof msg.slots === 'object') {
+            const incomingSlots = msg.slots as Record<string, any>;
+            for (const [k, s] of Object.entries(incomingSlots)) {
+              if (s && !s.isBot && s.uid && session.slots[k]) {
+                session.slots[k] = {
+                  ...session.slots[k],
+                  uid: String(s.uid),
+                  displayName: String(s.displayName || 'Jogador'),
+                  isBot: false,
+                  isReady: true,
+                };
+              }
+            }
+          }
 
           session.handlePlayerReconnect(uid, displayName, slotId);
 
